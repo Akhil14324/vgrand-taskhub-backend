@@ -4,7 +4,15 @@ const { authenticate, requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
 
-const VALID_TYPES = ['restaurant', 'hospital', 'construction', 'mines', 'it', 'other'];
+// GET /api/businesses/types — existing distinct business types
+router.get('/types', authenticate, requireAdmin, async (req, res, next) => {
+  try {
+    const result = await db.query('SELECT DISTINCT type FROM businesses ORDER BY type');
+    res.json({ types: result.rows.map((r) => r.type) });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // GET /api/businesses (admin only) — with task counts
 router.get('/', authenticate, requireAdmin, async (req, res, next) => {
@@ -15,7 +23,7 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
          COUNT(CASE WHEN t.status = 'completed' THEN 1 END) AS completed_count,
          COUNT(CASE WHEN t.status = 'pending' THEN 1 END) AS pending_count,
          COUNT(CASE WHEN t.is_warned = true THEN 1 END) AS warned_count,
-         (SELECT COUNT(*) FROM users u WHERE u.business_id = b.id) AS user_count
+         (SELECT COUNT(*) FROM user_businesses ub WHERE ub.business_id = b.id) AS user_count
        FROM businesses b
        LEFT JOIN tasks t ON t.business_id = b.id
        GROUP BY b.id
@@ -34,9 +42,6 @@ router.post('/', authenticate, requireAdmin, async (req, res, next) => {
 
     if (!name || !type) {
       return res.status(400).json({ error: 'Name and type are required' });
-    }
-    if (!VALID_TYPES.includes(type)) {
-      return res.status(400).json({ error: 'Invalid business type' });
     }
 
     const result = await db.query(
@@ -60,9 +65,6 @@ router.put('/:id', authenticate, requireAdmin, async (req, res, next) => {
 
     if (!name || !type) {
       return res.status(400).json({ error: 'Name and type are required' });
-    }
-    if (!VALID_TYPES.includes(type)) {
-      return res.status(400).json({ error: 'Invalid business type' });
     }
 
     const result = await db.query(

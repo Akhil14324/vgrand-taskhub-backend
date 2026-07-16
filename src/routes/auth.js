@@ -38,6 +38,18 @@ router.post('/signup', async (req, res, next) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
 
+    // Notify all admins and super_admins about the new user
+    const admins = await db.query(
+      `SELECT id FROM users WHERE role IN ('admin', 'super_admin')`
+    );
+    for (const admin of admins.rows) {
+      await db.query(
+        `INSERT INTO notifications (user_id, type, message)
+         VALUES ($1, 'user_joined', $2)`,
+        [admin.id, `New user joined: ${name} (${email})`]
+      );
+    }
+
     res.status(201).json({ token, user });
   } catch (err) {
     next(err);

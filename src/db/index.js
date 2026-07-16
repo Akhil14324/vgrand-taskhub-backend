@@ -7,12 +7,22 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
+const directPool = new Pool({
+  connectionString: process.env.DIRECT_URL || process.env.DATABASE_URL,
+});
+
 pool.on('error', (err) => {
   console.error('Unexpected error on idle PostgreSQL client', err);
+  process.exit(-1);
+});
+
+directPool.on('error', (err) => {
+  console.error('Unexpected error on idle direct PostgreSQL client', err);
   process.exit(-1);
 });
 
 module.exports = {
   query: (text, params) => pool.query(text, params),
   pool,
+  directPool,
 };
