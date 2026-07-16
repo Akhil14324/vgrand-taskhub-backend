@@ -1,0 +1,16 @@
+[
+  {
+    "id": 1,
+    "created_at": "2026-07-16T13:35:01.602Z",
+    "updated_at": "2026-07-16T13:37:02.358Z",
+    "business_id": 1,
+    "created_by": 2,
+    "title": "Clean the Kitchen",
+    "description": "There are so many stains in kitchen, so clean them",
+    "status": "pending",
+    "completed_by": null,
+    "completed_at": null,
+    "due_date": "2026-07-17",
+    "is_warned": false
+  }
+]

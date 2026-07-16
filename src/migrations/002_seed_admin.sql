@@ -1,0 +1,5 @@
+-- Migration: 002_seed_admin.sql
+-- Admin user is seeded by the Node migration runner (run.js)
+-- with a properly bcrypt-hashed password.
+-- Default credentials: admin@taskhub.com / admin123
+-- This file is intentionally empty — seeding happens in run.js
