@@ -21,9 +21,16 @@ router.get('/unassigned', authenticate, requireAdmin, async (req, res, next) => 
   }
 });
 
-// GET /api/users (admin only) — all users with business info
+// GET /api/users (admin only) — all users with business info (paginated)
 router.get('/', authenticate, requireAdmin, async (req, res, next) => {
   try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const offset = (page - 1) * limit;
+
+    const countResult = await db.query("SELECT COUNT(*) FROM users WHERE role != 'super_admin'");
+    const total = parseInt(countResult.rows[0].count);
+
     const result = await db.query(
       `SELECT u.id, u.name, u.email, u.role, u.status, u.business_id, u.created_at,
               COALESCE(
@@ -36,9 +43,19 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
        LEFT JOIN businesses b ON b.id = ub.business_id
        WHERE u.role != 'super_admin'
        GROUP BY u.id, u.name, u.email, u.role, u.status, u.business_id, u.created_at
-       ORDER BY u.created_at DESC`
+       ORDER BY u.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
     );
-    res.json({ users: result.rows });
+    res.json({
+      users: result.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        total_pages: Math.ceil(total / limit),
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -193,7 +210,8 @@ router.get('/me/stats', authenticate, async (req, res, next) => {
         `SELECT
            COUNT(*) AS tasks_created,
            COUNT(*) FILTER (WHERE status = 'completed') AS tasks_completed,
-           COUNT(*) FILTER (WHERE status = 'pending') AS tasks_pending
+           COUNT(*) FILTER (WHERE status = 'pending') AS tasks_pending,
+           COUNT(*) FILTER (WHERE status = 'on_hold') AS tasks_on_hold
          FROM tasks
          WHERE created_by = $1 OR assigned_user_id = $1`,
         [req.user.id]
@@ -210,6 +228,7 @@ router.get('/me/stats', authenticate, async (req, res, next) => {
         tasks_created: created,
         tasks_completed: completed,
         tasks_pending: parseInt(taskStats.rows[0].tasks_pending) || 0,
+        tasks_on_hold: parseInt(taskStats.rows[0].tasks_on_hold) || 0,
         completion_rate: completionRate,
         warnings_count: parseInt(warningCount.rows[0].cnt) || 0,
       });

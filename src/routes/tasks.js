@@ -4,10 +4,13 @@ const { authenticate, requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
 
-// GET /api/tasks?business_id=X&status=pending
+// GET /api/tasks?business_id=X&status=pending&page=1&limit=20
 router.get('/', authenticate, async (req, res, next) => {
   try {
     const { business_id, status } = req.query;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const offset = (page - 1) * limit;
     const conditions = [];
     const params = [];
     let paramIdx = 1;
@@ -17,7 +20,7 @@ router.get('/', authenticate, async (req, res, next) => {
       params.push(business_id);
     }
 
-    if (status && ['pending', 'completed'].includes(status)) {
+    if (status && ['pending', 'completed', 'on_hold'].includes(status)) {
       conditions.push(`t.status = $${paramIdx++}`);
       params.push(status);
     }
@@ -32,6 +35,15 @@ router.get('/', authenticate, async (req, res, next) => {
     }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countResult = await db.query(
+      `SELECT COUNT(*) FROM tasks t ${whereClause}`,
+      params
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    params.push(limit);
+    params.push(offset);
 
     const result = await db.query(
       `SELECT t.*,
@@ -53,11 +65,20 @@ router.get('/', authenticate, async (req, res, next) => {
          ORDER BY created_at DESC LIMIT 1
        ) w ON true
        ${whereClause}
-       ORDER BY t.created_at DESC`,
+       ORDER BY t.created_at DESC
+       LIMIT $${paramIdx++} OFFSET $${paramIdx++}`,
       params
     );
 
-    res.json({ tasks: result.rows });
+    res.json({
+      tasks: result.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        total_pages: Math.ceil(total / limit),
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -241,6 +262,9 @@ router.put('/:id/complete', authenticate, async (req, res, next) => {
       }
     }
 
+    // If task is on_hold, completing it should set it to completed
+    // If task is completed, un-completing sets it back to pending
+    // If task is pending, completing it sets it to completed
     const newStatus = task.status === 'completed' ? 'pending' : 'completed';
     const completedBy = newStatus === 'completed' ? req.user.id : null;
     const completedAt = newStatus === 'completed' ? new Date() : null;
@@ -350,6 +374,9 @@ router.put('/:id/warn', authenticate, requireAdmin, async (req, res, next) => {
     if (task.status === 'completed') {
       return res.status(400).json({ error: 'Cannot warn on a completed task' });
     }
+    if (task.status === 'on_hold') {
+      return res.status(400).json({ error: 'Cannot warn on a task that is on hold' });
+    }
 
     // Determine who to warn:
     // - If task has assigned_user_id, warn that specific user only
@@ -445,6 +472,61 @@ router.delete('/:id', authenticate, async (req, res, next) => {
 
     await db.query('DELETE FROM tasks WHERE id = $1', [id]);
     res.json({ message: 'Task deleted successfully' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/tasks/:id/hold — toggle on_hold status (admin only)
+router.put('/:id/hold', authenticate, requireAdmin, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const taskResult = await db.query('SELECT * FROM tasks WHERE id = $1', [id]);
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    const task = taskResult.rows[0];
+
+    if (task.status === 'completed') {
+      return res.status(400).json({ error: 'Cannot put a completed task on hold' });
+    }
+
+    const newStatus = task.status === 'on_hold' ? 'pending' : 'on_hold';
+
+    const result = await db.query(
+      `UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [newStatus, id]
+    );
+
+    // Notify assigned user(s) about the hold status change
+    const actorName = await db.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const adminName = actorName.rows[0]?.name || 'Admin';
+
+    let notifyUserIds = [];
+    if (task.assigned_user_id) {
+      notifyUserIds = [task.assigned_user_id];
+    } else {
+      const bizUsers = await db.query(
+        `SELECT u.id FROM users u
+         JOIN user_businesses ub ON ub.user_id = u.id
+         WHERE ub.business_id = $1 AND u.role = 'user'`,
+        [task.business_id]
+      );
+      notifyUserIds = bizUsers.rows.map((r) => r.id);
+    }
+
+    const action = newStatus === 'on_hold' ? 'put on hold' : 'resumed from hold';
+    for (const uid of notifyUserIds) {
+      await db.query(
+        `INSERT INTO notifications (user_id, type, message)
+         VALUES ($1, 'assignment', $2)`,
+        [uid, `Task "${task.title}" has been ${action} by ${adminName}`]
+      );
+    }
+
+    res.json({ task: result.rows[0] });
   } catch (err) {
     next(err);
   }

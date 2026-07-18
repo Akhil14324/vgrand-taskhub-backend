@@ -4,15 +4,19 @@ const { authenticate } = require('../middleware/auth');
 
 const router = express.Router();
 
-// GET /api/notifications — current user's notifications
+// GET /api/notifications — current user's notifications (paginated)
 router.get('/', authenticate, async (req, res, next) => {
   try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const offset = (page - 1) * limit;
+
     const result = await db.query(
       `SELECT * FROM notifications
        WHERE user_id = $1
        ORDER BY created_at DESC
-       LIMIT 50`,
-      [req.user.id]
+       LIMIT $2 OFFSET $3`,
+      [req.user.id, limit, offset]
     );
 
     const unreadResult = await db.query(
@@ -20,9 +24,21 @@ router.get('/', authenticate, async (req, res, next) => {
       [req.user.id]
     );
 
+    const totalResult = await db.query(
+      'SELECT COUNT(*) FROM notifications WHERE user_id = $1',
+      [req.user.id]
+    );
+    const total = parseInt(totalResult.rows[0].count);
+
     res.json({
       notifications: result.rows,
       unread_count: parseInt(unreadResult.rows[0].count),
+      pagination: {
+        page,
+        limit,
+        total,
+        total_pages: Math.ceil(total / limit),
+      },
     });
   } catch (err) {
     next(err);

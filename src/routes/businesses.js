@@ -14,22 +14,40 @@ router.get('/types', authenticate, requireAdmin, async (req, res, next) => {
   }
 });
 
-// GET /api/businesses (admin only) — with task counts
+// GET /api/businesses (admin only) — with task counts (paginated)
 router.get('/', authenticate, requireAdmin, async (req, res, next) => {
   try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const offset = (page - 1) * limit;
+
+    const countResult = await db.query('SELECT COUNT(*) FROM businesses');
+    const total = parseInt(countResult.rows[0].count);
+
     const result = await db.query(
       `SELECT b.*,
          COUNT(t.id) AS task_count,
          COUNT(CASE WHEN t.status = 'completed' THEN 1 END) AS completed_count,
          COUNT(CASE WHEN t.status = 'pending' THEN 1 END) AS pending_count,
+         COUNT(CASE WHEN t.status = 'on_hold' THEN 1 END) AS on_hold_count,
          COUNT(CASE WHEN t.is_warned = true THEN 1 END) AS warned_count,
          (SELECT COUNT(*) FROM user_businesses ub WHERE ub.business_id = b.id) AS user_count
        FROM businesses b
        LEFT JOIN tasks t ON t.business_id = b.id
        GROUP BY b.id
-       ORDER BY b.created_at DESC`
+       ORDER BY b.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
     );
-    res.json({ businesses: result.rows });
+    res.json({
+      businesses: result.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        total_pages: Math.ceil(total / limit),
+      },
+    });
   } catch (err) {
     next(err);
   }
