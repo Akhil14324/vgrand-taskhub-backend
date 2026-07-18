@@ -271,6 +271,25 @@ router.put('/:id/complete', authenticate, async (req, res, next) => {
         );
       }
 
+      // Remove warnings for this task and reset user status if no remaining warnings
+      if (task.is_warned) {
+        const warnedUsers = await db.query(
+          'SELECT DISTINCT user_id FROM warnings WHERE task_id = $1',
+          [id]
+        );
+        await db.query('DELETE FROM warnings WHERE task_id = $1', [id]);
+        await db.query('UPDATE tasks SET is_warned = false WHERE id = $1', [id]);
+        for (const w of warnedUsers.rows) {
+          const remaining = await db.query(
+            'SELECT 1 FROM warnings WHERE user_id = $1 LIMIT 1',
+            [w.user_id]
+          );
+          if (remaining.rows.length === 0) {
+            await db.query("UPDATE users SET status = 'active' WHERE id = $1 AND status = 'warned'", [w.user_id]);
+          }
+        }
+      }
+
       // Notify users based on assignment
       if (task.assigned_user_id) {
         // Task assigned to a specific user — notify only them (if they didn't complete it themselves)
@@ -403,6 +422,24 @@ router.delete('/:id', authenticate, async (req, res, next) => {
       }
       if (task.assigned_user_id && task.assigned_user_id !== req.user.id) {
         return res.status(403).json({ error: 'You can only delete tasks assigned to you' });
+      }
+    }
+
+    // Remove warnings for this task and reset user status if no remaining warnings
+    if (task.is_warned) {
+      const warnedUsers = await db.query(
+        'SELECT DISTINCT user_id FROM warnings WHERE task_id = $1',
+        [id]
+      );
+      await db.query('DELETE FROM warnings WHERE task_id = $1', [id]);
+      for (const w of warnedUsers.rows) {
+        const remaining = await db.query(
+          'SELECT 1 FROM warnings WHERE user_id = $1 LIMIT 1',
+          [w.user_id]
+        );
+        if (remaining.rows.length === 0) {
+          await db.query("UPDATE users SET status = 'active' WHERE id = $1 AND status = 'warned'", [w.user_id]);
+        }
       }
     }
 
