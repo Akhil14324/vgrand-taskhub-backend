@@ -10,6 +10,8 @@ const userRoutes = require('./routes/users');
 const taskRoutes = require('./routes/tasks');
 const notificationRoutes = require('./routes/notifications');
 const db = require('./db');
+const { runMigrations } = require('./migrations/run');
+const { scheduleOverdueNotifications } = require('./jobs/overdueNotifications');
 
 dotenv.config();
 
@@ -97,9 +99,18 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 5000;
 
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`TaskHub backend running on port ${PORT}`);
-  });
+  (async () => {
+    try {
+      await runMigrations({ autoClose: false });
+      app.listen(PORT, () => {
+        console.log(`TaskHub backend running on port ${PORT}`);
+      });
+      scheduleOverdueNotifications();
+    } catch (err) {
+      console.error('Failed to start server:', err);
+      process.exit(1);
+    }
+  })();
+} else {
+  module.exports = app;
 }
-
-module.exports = app;

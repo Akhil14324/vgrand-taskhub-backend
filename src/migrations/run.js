@@ -3,7 +3,16 @@ const path = require('path');
 const bcrypt = require('bcryptjs');
 const db = require('../db');
 
-async function runMigrations() {
+async function ensureMigrationsTable(directQuery) {
+  await directQuery(`
+    CREATE TABLE IF NOT EXISTS migrations (
+      filename VARCHAR(255) PRIMARY KEY,
+      applied_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+}
+
+async function runMigrations({ autoClose = true } = {}) {
   const migrationsDir = __dirname;
   const files = fs
     .readdirSync(migrationsDir)
@@ -14,12 +23,22 @@ async function runMigrations() {
   // PgBouncer transaction mode doesn't support DDL like CREATE FUNCTION / CREATE TRIGGER
   const directQuery = (text, params) => db.directPool.query(text, params);
 
+  await ensureMigrationsTable(directQuery);
+
+  const appliedResult = await directQuery('SELECT filename FROM migrations');
+  const applied = new Set(appliedResult.rows.map((r) => r.filename));
+
   for (const file of files) {
+    if (applied.has(file)) {
+      console.log(`Skipping already applied migration: ${file}`);
+      continue;
+    }
     const filePath = path.join(migrationsDir, file);
     const sql = fs.readFileSync(filePath, 'utf8');
     console.log(`Running migration: ${file}`);
     try {
       await directQuery(sql);
+      await directQuery('INSERT INTO migrations (filename) VALUES ($1)', [file]);
       console.log(`  ✓ ${file} executed successfully`);
     } catch (err) {
       console.error(`  ✗ ${file} failed:`, err.message);
@@ -47,12 +66,21 @@ async function runMigrations() {
     console.log('  ✓ Admin user already exists (upgraded to super_admin if needed)');
   }
 
-  await db.directPool.end();
-  console.log('\nAll migrations complete.');
-  process.exit(0);
+  if (autoClose) {
+    await db.directPool.end();
+    console.log('\nAll migrations complete.');
+  } else {
+    console.log('Migrations applied, keeping pool open for app server.');
+  }
 }
 
-runMigrations().catch((err) => {
-  console.error('Migration failed:', err);
-  process.exit(1);
-});
+module.exports = { runMigrations };
+
+if (require.main === module) {
+  runMigrations()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error('Migration failed:', err);
+      process.exit(1);
+    });
+}

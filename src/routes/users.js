@@ -162,6 +162,15 @@ router.put('/:id/role', authenticate, requireSuperAdmin, async (req, res, next) 
       [role, id]
     );
 
+    const notifMsg = role === 'admin'
+      ? 'You have been promoted to Admin. Please log out and log back in to access admin features.'
+      : 'Your role has been changed to User.';
+    await db.query(
+      `INSERT INTO notifications (user_id, type, message)
+       VALUES ($1, 'assignment', $2)`,
+      [id, notifMsg]
+    );
+
     res.json({ user: result.rows[0] });
   } catch (err) {
     next(err);
