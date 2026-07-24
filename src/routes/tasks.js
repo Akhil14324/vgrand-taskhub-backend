@@ -20,7 +20,9 @@ router.get('/', authenticate, async (req, res, next) => {
       params.push(business_id);
     }
 
-    if (status && ['pending', 'completed', 'on_hold'].includes(status)) {
+    if (status === 'warned') {
+      conditions.push('t.is_warned = true');
+    } else if (status && ['pending', 'completed', 'on_hold'].includes(status)) {
       conditions.push(`t.status = $${paramIdx++}`);
       params.push(status);
     }
