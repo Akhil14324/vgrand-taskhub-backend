@@ -1,6 +1,7 @@
 const express = require('express');
 const db = require('../db');
 const { authenticate, requireAdmin } = require('../middleware/auth');
+const { sanitizeText } = require('../middleware/sanitize');
 
 const router = express.Router();
 
@@ -56,7 +57,9 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
 // POST /api/businesses (admin only)
 router.post('/', authenticate, requireAdmin, async (req, res, next) => {
   try {
-    const { name, type, description } = req.body;
+    const name = sanitizeText(req.body.name, 100);
+    const type = sanitizeText(req.body.type, 50);
+    const description = sanitizeText(req.body.description, 1000);
 
     if (!name || !type) {
       return res.status(400).json({ error: 'Name and type are required' });
@@ -79,7 +82,9 @@ router.post('/', authenticate, requireAdmin, async (req, res, next) => {
 router.put('/:id', authenticate, requireAdmin, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { name, type, description } = req.body;
+    const name = sanitizeText(req.body.name, 100);
+    const type = sanitizeText(req.body.type, 50);
+    const description = sanitizeText(req.body.description, 1000);
 
     if (!name || !type) {
       return res.status(400).json({ error: 'Name and type are required' });

@@ -17,10 +17,23 @@ const db = require('./db');
 const { runMigrations } = require('./migrations/run');
 const { scheduleOverdueNotifications } = require('./jobs/overdueNotifications');
 const { setupSocketIO } = require('./socket');
+const { requestId } = require('./middleware/requestId');
+const { waitForConnection } = db;
 
 dotenv.config();
 
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET.length < 32 || JWT_SECRET === 'change-this-to-a-strong-secret-key') {
+  console.error('[startup] FATAL: JWT_SECRET must be set to a strong secret of at least 32 characters.');
+  if (process.env.NODE_ENV === 'production') {
+    process.exit(1);
+  } else {
+    console.warn('[startup] WARNING: Running with weak JWT_SECRET in development. Fix this before production!');
+  }
+}
+
 const app = express();
+app.set('trust proxy', 1);
 
 const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173')
   .split(',')
@@ -29,9 +42,11 @@ const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173')
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
   contentSecurityPolicy: false,
+  hsts: process.env.NODE_ENV === 'production' ? { maxAge: 31536000, includeSubDomains: true } : false,
 }));
 
 app.use(compression());
+app.use(requestId);
 
 app.use(cors({
   origin(origin, cb) {
@@ -104,7 +119,7 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  console.error(`[${new Date().toISOString()}] Error:`, err.message);
+  console.error(`[${new Date().toISOString()}] [${req.id || '-'}] Error:`, err.message);
   if (err.type === 'entity.parse.failed') {
     return res.status(400).json({ error: 'Invalid JSON payload' });
   }
@@ -130,6 +145,7 @@ setupSocketIO(io);
 if (require.main === module) {
   (async () => {
     try {
+      await waitForConnection();
       await runMigrations({ autoClose: false });
       server.listen(PORT, () => {
         console.log(`TaskHub backend running on port ${PORT}`);

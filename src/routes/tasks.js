@@ -1,6 +1,7 @@
 const express = require('express');
 const db = require('../db');
 const { authenticate, requireAdmin } = require('../middleware/auth');
+const { sanitizeText } = require('../middleware/sanitize');
 
 const router = express.Router();
 
@@ -89,9 +90,11 @@ router.get('/', authenticate, async (req, res, next) => {
 // POST /api/tasks
 router.post('/', authenticate, async (req, res, next) => {
   try {
-    const { title, description, due_date, business_id, assigned_user_id } = req.body;
+    const title = sanitizeText(req.body.title, 200);
+    const description = sanitizeText(req.body.description, 5000);
+    const { due_date, business_id, assigned_user_id } = req.body;
 
-    if (!title || !title.trim()) {
+    if (!title) {
       return res.status(400).json({ error: 'Task title is required' });
     }
 
@@ -144,52 +147,59 @@ router.post('/', authenticate, async (req, res, next) => {
       assignedUserId = assigned_user_id;
     }
 
-    const result = await db.query(
-      `INSERT INTO tasks (business_id, created_by, title, description, due_date, assigned_user_id)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [taskBusinessId, req.user.id, title.trim(), description || '', due_date || null, assignedUserId]
-    );
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    // Create notifications:
-    // - Admins/super_admins always get notified when a task is created
-    // - If assigned to a specific user, notify only that user
-    // - If unassigned, notify all regular users in the business
-    const admins = await db.query(
-      `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND id != $1`,
-      [req.user.id]
-    );
-    for (const admin of admins.rows) {
-      await db.query(
-        `INSERT INTO notifications (user_id, type, message)
-         VALUES ($1, 'task_added', $2)`,
-        [admin.id, `New task created: "${title.trim()}"`]
+      const result = await client.query(
+        `INSERT INTO tasks (business_id, created_by, title, description, due_date, assigned_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING *`,
+        [taskBusinessId, req.user.id, title, description || '', due_date || null, assignedUserId]
       );
-    }
 
-    if (assignedUserId) {
-      await db.query(
-        `INSERT INTO notifications (user_id, type, message)
-         VALUES ($1, 'task_added', $2)`,
-        [assignedUserId, `New task assigned to you: "${title.trim()}"`]
+      const admins = await client.query(
+        `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND id != $1`,
+        [req.user.id]
       );
-    } else {
-      const usersInBiz = await db.query(
-        `SELECT u.id FROM users u
-         JOIN user_businesses ub ON ub.user_id = u.id
-         WHERE ub.business_id = $1 AND u.role = $2 AND u.id != $3`,
-        [taskBusinessId, 'user', req.user.id]
-      );
-      for (const u of usersInBiz.rows) {
-        await db.query(
+      for (const admin of admins.rows) {
+        await client.query(
           `INSERT INTO notifications (user_id, type, message)
            VALUES ($1, 'task_added', $2)`,
-          [u.id, `New task added: "${title.trim()}"`]
+          [admin.id, `New task created: "${title}"`]
         );
       }
-    }
 
-    res.status(201).json({ task: result.rows[0] });
+      if (assignedUserId) {
+        await client.query(
+          `INSERT INTO notifications (user_id, type, message)
+           VALUES ($1, 'task_added', $2)`,
+          [assignedUserId, `New task assigned to you: "${title}"`]
+        );
+      } else {
+        const usersInBiz = await client.query(
+          `SELECT u.id FROM users u
+           JOIN user_businesses ub ON ub.user_id = u.id
+           WHERE ub.business_id = $1 AND u.role = $2 AND u.id != $3`,
+          [taskBusinessId, 'user', req.user.id]
+        );
+        for (const u of usersInBiz.rows) {
+          await client.query(
+            `INSERT INTO notifications (user_id, type, message)
+             VALUES ($1, 'task_added', $2)`,
+            [u.id, `New task added: "${title}"`]
+          );
+        }
+      }
+
+      await client.query('COMMIT');
+      res.status(201).json({ task: result.rows[0] });
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     next(err);
   }
@@ -199,9 +209,11 @@ router.post('/', authenticate, async (req, res, next) => {
 router.put('/:id', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { title, description, due_date } = req.body;
+    const title = sanitizeText(req.body.title, 200);
+    const description = sanitizeText(req.body.description, 5000);
+    const { due_date } = req.body;
 
-    if (!title || !title.trim()) {
+    if (!title) {
       return res.status(400).json({ error: 'Task title is required' });
     }
 
@@ -231,7 +243,7 @@ router.put('/:id', authenticate, async (req, res, next) => {
        SET title = $1, description = $2, due_date = $3, updated_at = NOW()
        WHERE id = $4
        RETURNING *`,
-      [title.trim(), description || '', due_date || null, id]
+      [title, description || '', due_date || null, id]
     );
 
     res.json({ task: result.rows[0] });
@@ -271,80 +283,88 @@ router.put('/:id/complete', authenticate, async (req, res, next) => {
     const completedBy = newStatus === 'completed' ? req.user.id : null;
     const completedAt = newStatus === 'completed' ? new Date() : null;
 
-    const result = await db.query(
-      `UPDATE tasks
-       SET status = $1, completed_by = $2, completed_at = $3
-       WHERE id = $4
-       RETURNING *`,
-      [newStatus, completedBy, completedAt, id]
-    );
+    const client = await db.pool.connect();
+    let resultRow;
+    try {
+      await client.query('BEGIN');
 
-    // Send notifications when task is completed (not when un-completed)
-    if (newStatus === 'completed') {
-      const completerResult = await db.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-      const completerName = completerResult.rows[0]?.name || 'Someone';
-
-      // Notify all admins and super_admins
-      const admins = await db.query(
-        `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND id != $1`,
-        [req.user.id]
+      const result = await client.query(
+        `UPDATE tasks
+         SET status = $1, completed_by = $2, completed_at = $3
+         WHERE id = $4
+         RETURNING *`,
+        [newStatus, completedBy, completedAt, id]
       );
-      for (const admin of admins.rows) {
-        await db.query(
-          `INSERT INTO notifications (user_id, type, message)
-           VALUES ($1, 'task_completed', $2)`,
-          [admin.id, `Task "${task.title}" completed by ${completerName}`]
-        );
-      }
+      resultRow = result.rows[0];
 
-      // Remove warnings for this task and reset user status if no remaining warnings
-      if (task.is_warned) {
-        const warnedUsers = await db.query(
-          'SELECT DISTINCT user_id FROM warnings WHERE task_id = $1',
-          [id]
+      if (newStatus === 'completed') {
+        const completerResult = await client.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+        const completerName = completerResult.rows[0]?.name || 'Someone';
+
+        const admins = await client.query(
+          `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND id != $1`,
+          [req.user.id]
         );
-        await db.query('DELETE FROM warnings WHERE task_id = $1', [id]);
-        await db.query('UPDATE tasks SET is_warned = false WHERE id = $1', [id]);
-        for (const w of warnedUsers.rows) {
-          const remaining = await db.query(
-            'SELECT 1 FROM warnings WHERE user_id = $1 LIMIT 1',
-            [w.user_id]
+        for (const admin of admins.rows) {
+          await client.query(
+            `INSERT INTO notifications (user_id, type, message)
+             VALUES ($1, 'task_completed', $2)`,
+            [admin.id, `Task "${task.title}" completed by ${completerName}`]
           );
-          if (remaining.rows.length === 0) {
-            await db.query("UPDATE users SET status = 'active' WHERE id = $1 AND status = 'warned'", [w.user_id]);
+        }
+
+        if (task.is_warned) {
+          const warnedUsers = await client.query(
+            'SELECT DISTINCT user_id FROM warnings WHERE task_id = $1',
+            [id]
+          );
+          await client.query('DELETE FROM warnings WHERE task_id = $1', [id]);
+          await client.query('UPDATE tasks SET is_warned = false WHERE id = $1', [id]);
+          for (const w of warnedUsers.rows) {
+            const remaining = await client.query(
+              'SELECT 1 FROM warnings WHERE user_id = $1 LIMIT 1',
+              [w.user_id]
+            );
+            if (remaining.rows.length === 0) {
+              await client.query("UPDATE users SET status = 'active' WHERE id = $1 AND status = 'warned'", [w.user_id]);
+            }
+          }
+        }
+
+        if (task.assigned_user_id) {
+          if (task.assigned_user_id !== req.user.id) {
+            await client.query(
+              `INSERT INTO notifications (user_id, type, message)
+               VALUES ($1, 'task_completed', $2)`,
+              [task.assigned_user_id, `Task "${task.title}" completed by ${completerName}`]
+            );
+          }
+        } else {
+          const bizUsers = await client.query(
+            `SELECT u.id FROM users u
+             JOIN user_businesses ub ON ub.user_id = u.id
+             WHERE ub.business_id = $1 AND u.role = 'user' AND u.id != $2`,
+            [task.business_id, req.user.id]
+          );
+          for (const u of bizUsers.rows) {
+            await client.query(
+              `INSERT INTO notifications (user_id, type, message)
+               VALUES ($1, 'task_completed', $2)`,
+              [u.id, `Task "${task.title}" completed by ${completerName}`]
+            );
           }
         }
       }
 
-      // Notify users based on assignment
-      if (task.assigned_user_id) {
-        // Task assigned to a specific user — notify only them (if they didn't complete it themselves)
-        if (task.assigned_user_id !== req.user.id) {
-          await db.query(
-            `INSERT INTO notifications (user_id, type, message)
-             VALUES ($1, 'task_completed', $2)`,
-            [task.assigned_user_id, `Task "${task.title}" completed by ${completerName}`]
-          );
-        }
-      } else {
-        // Task for all users in business — notify all regular users in that business (except completer)
-        const bizUsers = await db.query(
-          `SELECT u.id FROM users u
-           JOIN user_businesses ub ON ub.user_id = u.id
-           WHERE ub.business_id = $1 AND u.role = 'user' AND u.id != $2`,
-          [task.business_id, req.user.id]
-        );
-        for (const u of bizUsers.rows) {
-          await db.query(
-            `INSERT INTO notifications (user_id, type, message)
-             VALUES ($1, 'task_completed', $2)`,
-            [u.id, `Task "${task.title}" completed by ${completerName}`]
-          );
-        }
-      }
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      client.release();
+      throw txErr;
     }
+    client.release();
 
-    res.json({ task: result.rows[0] });
+    res.json({ task: resultRow });
   } catch (err) {
     next(err);
   }
@@ -354,9 +374,10 @@ router.put('/:id/complete', authenticate, async (req, res, next) => {
 router.put('/:id/warn', authenticate, requireAdmin, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { message, user_id } = req.body;
+    const message = sanitizeText(req.body.message, 1000);
+    const { user_id } = req.body;
 
-    if (!message || !message.trim()) {
+    if (!message) {
       return res.status(400).json({ error: 'Warning message is required' });
     }
 
@@ -408,13 +429,13 @@ router.put('/:id/warn', authenticate, requireAdmin, async (req, res, next) => {
       await db.query(
         `INSERT INTO warnings (task_id, user_id, sent_by, message)
          VALUES ($1, $2, $3, $4)`,
-        [id, uid, req.user.id, message.trim()]
+        [id, uid, req.user.id, message]
       );
 
       await db.query(
         `INSERT INTO notifications (user_id, type, message)
          VALUES ($1, 'warning', $2)`,
-        [uid, `Warning on task "${task.title}": ${message.trim()}`]
+        [uid, `Warning on task "${task.title}": ${message}`]
       );
 
       // Update user status to warned

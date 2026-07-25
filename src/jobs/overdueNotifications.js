@@ -88,18 +88,20 @@ async function sendOverdueNotifications() {
 }
 
 function scheduleOverdueNotifications() {
-  // Run once shortly after startup to cover missed days, then daily at midnight
+  // Run once shortly after startup to cover missed days
   setTimeout(() => {
     sendOverdueNotifications();
-    setInterval(sendOverdueNotifications, TWENTY_FOUR_HOURS);
-  }, 5000);
 
-  // Also schedule the recurring midnight run
-  const midnightDelay = delayUntilMidnight();
-  setTimeout(() => {
-    sendOverdueNotifications();
-    setInterval(sendOverdueNotifications, TWENTY_FOUR_HOURS);
-  }, midnightDelay);
+    // Schedule the next run at midnight, then recursively every 24h
+    const scheduleNext = () => {
+      const delay = delayUntilMidnight();
+      setTimeout(() => {
+        sendOverdueNotifications();
+        scheduleNext();
+      }, delay);
+    };
+    scheduleNext();
+  }, 5000);
 }
 
 module.exports = { scheduleOverdueNotifications, sendOverdueNotifications };

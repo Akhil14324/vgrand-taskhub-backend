@@ -120,21 +120,89 @@ async function buildConversationPreview(conversationId, userId) {
 // GET /api/chat/conversations — list current user's conversations
 router.get('/conversations', authenticate, async (req, res, next) => {
   try {
-    const convs = await db.query(
-      `SELECT c.id FROM conversations c
-       JOIN conversation_participants cp ON cp.conversation_id = c.id
-       WHERE cp.user_id = $1 AND cp.is_hidden = FALSE
-       ORDER BY c.updated_at DESC`,
+    const result = await db.query(
+      `WITH user_convs AS (
+         SELECT c.id, c.name, c.type, c.business_id, c.created_at, c.updated_at,
+                cp.is_admin AS is_group_admin, cp.last_read_message_id
+         FROM conversations c
+         JOIN conversation_participants cp ON cp.conversation_id = c.id
+         WHERE cp.user_id = $1 AND cp.is_hidden = FALSE
+         ORDER BY c.updated_at DESC
+       ),
+       last_msgs AS (
+         SELECT DISTINCT ON (m.conversation_id)
+           m.conversation_id, m.id, m.body, m.attachment_url, m.attachment_type,
+           m.sender_id, m.created_at, m.deleted_at
+         FROM messages m
+         WHERE m.deleted_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM message_deletions md
+             WHERE md.message_id = m.id AND md.user_id = $1
+           )
+         ORDER BY m.conversation_id, m.created_at DESC
+       ),
+       unread_counts AS (
+         SELECT m.conversation_id, COUNT(*) AS cnt
+         FROM messages m
+         WHERE m.sender_id != $1
+           AND m.deleted_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM message_deletions md
+             WHERE md.message_id = m.id AND md.user_id = $1
+           )
+         GROUP BY m.conversation_id
+       ),
+       conv_participants AS (
+         SELECT cp.conversation_id,
+           json_agg(json_build_object(
+             'id', u.id, 'name', u.name, 'role', u.role,
+             'status', u.status, 'business_id', u.business_id
+           ) ORDER BY u.name) AS participants
+         FROM conversation_participants cp
+         JOIN users u ON u.id = cp.user_id
+         GROUP BY cp.conversation_id
+       )
+       SELECT uc.*,
+         COALESCE(lm.id, NULL) AS last_msg_id,
+         lm.body AS last_msg_body,
+         lm.attachment_url AS last_msg_attachment_url,
+         lm.attachment_type AS last_msg_attachment_type,
+         lm.sender_id AS last_msg_sender_id,
+         lm.created_at AS last_msg_created_at,
+         lm.deleted_at AS last_msg_deleted_at,
+         COALESCE(uc_cnt.cnt, 0) AS unread_count,
+         cp_part.participants
+       FROM user_convs uc
+       LEFT JOIN last_msgs lm ON lm.conversation_id = uc.id
+       LEFT JOIN unread_counts uc_cnt ON uc_cnt.conversation_id = uc.id
+       LEFT JOIN conv_participants cp_part ON cp_part.conversation_id = uc.id`,
       [req.user.id]
     );
 
-    const result = [];
-    for (const row of convs.rows) {
-      result.push(await buildConversationPreview(row.id, req.user.id));
-    }
+    const conversations = result.rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      type: row.type,
+      business_id: row.business_id,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      is_group_admin: row.is_group_admin,
+      last_read_message_id: row.last_read_message_id,
+      participants: row.participants || [],
+      last_message: row.last_msg_id ? {
+        id: row.last_msg_id,
+        body: row.last_msg_body,
+        attachment_url: row.last_msg_attachment_url,
+        attachment_type: row.last_msg_attachment_type,
+        sender_id: row.last_msg_sender_id,
+        created_at: row.last_msg_created_at,
+        deleted_at: row.last_msg_deleted_at,
+      } : null,
+      unread_count: parseInt(row.unread_count, 10),
+    }));
 
-    const totalUnread = result.reduce((sum, c) => sum + c.unread_count, 0);
-    res.json({ conversations: result, total_unread: totalUnread });
+    const totalUnread = conversations.reduce((sum, c) => sum + c.unread_count, 0);
+    res.json({ conversations, total_unread: totalUnread });
   } catch (err) {
     next(err);
   }

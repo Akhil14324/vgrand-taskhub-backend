@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireAdmin, requireSuperAdmin } = require('../middleware/auth');
+const { sanitizeText, validatePassword } = require('../middleware/sanitize');
 
 const router = express.Router();
 
@@ -86,13 +87,23 @@ router.put('/:id/assign', authenticate, requireAdmin, async (req, res, next) => 
 
     // If no businesses selected, unassign user from all businesses
     if (bizIds.length === 0) {
-      await db.query('DELETE FROM user_businesses WHERE user_id = $1', [id]);
-      await db.query('UPDATE users SET business_id = NULL WHERE id = $1', [id]);
-      await db.query(
-        `INSERT INTO notifications (user_id, type, message)
-         VALUES ($1, 'assignment', $2)`,
-        [id, 'You have been unassigned from all businesses']
-      );
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('DELETE FROM user_businesses WHERE user_id = $1', [id]);
+        await client.query('UPDATE users SET business_id = NULL WHERE id = $1', [id]);
+        await client.query(
+          `INSERT INTO notifications (user_id, type, message)
+           VALUES ($1, 'assignment', $2)`,
+          [id, 'You have been unassigned from all businesses']
+        );
+        await client.query('COMMIT');
+      } catch (txErr) {
+        await client.query('ROLLBACK');
+        client.release();
+        throw txErr;
+      }
+      client.release();
       return res.json({ user: { id: parseInt(id), business_id: null, business_ids: [] } });
     }
 
@@ -105,28 +116,36 @@ router.put('/:id/assign', authenticate, requireAdmin, async (req, res, next) => 
       return res.status(404).json({ error: 'One or more businesses not found' });
     }
 
-    // Replace all business assignments for this user
-    await db.query('DELETE FROM user_businesses WHERE user_id = $1', [id]);
-    for (const bizId of bizIds) {
-      await db.query(
-        'INSERT INTO user_businesses (user_id, business_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-        [id, bizId]
+    // Replace all business assignments for this user in a transaction
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('DELETE FROM user_businesses WHERE user_id = $1', [id]);
+      for (const bizId of bizIds) {
+        await client.query(
+          'INSERT INTO user_businesses (user_id, business_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [id, bizId]
+        );
+      }
+
+      const primaryBizId = bizIds[0];
+      await client.query('UPDATE users SET business_id = $1 WHERE id = $2', [primaryBizId, id]);
+
+      const bizNames = bizCheck.rows.map((r) => r.name).join(', ');
+      await client.query(
+        `INSERT INTO notifications (user_id, type, message)
+         VALUES ($1, 'assignment', $2)`,
+        [id, `You have been assigned to: ${bizNames}`]
       );
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      client.release();
+      throw txErr;
     }
+    client.release();
 
-    // Keep business_id as primary (first selected)
-    const primaryBizId = bizIds[0];
-    await db.query('UPDATE users SET business_id = $1 WHERE id = $2', [primaryBizId, id]);
-
-    // Create notification for the user
-    const bizNames = bizCheck.rows.map((r) => r.name).join(', ');
-    await db.query(
-      `INSERT INTO notifications (user_id, type, message)
-       VALUES ($1, 'assignment', $2)`,
-      [id, `You have been assigned to: ${bizNames}`]
-    );
-
-    res.json({ user: { id: parseInt(id), business_id: primaryBizId, business_ids: bizIds } });
+    res.json({ user: { id: parseInt(id), business_id: bizIds[0], business_ids: bizIds } });
   } catch (err) {
     next(err);
   }
@@ -299,8 +318,7 @@ router.get('/me/warnings', authenticate, async (req, res, next) => {
 // PUT /api/users/me (authenticate only) — update name
 router.put('/me', authenticate, async (req, res, next) => {
   try {
-    const { name } = req.body;
-    const trimmed = name ? name.trim() : '';
+    const trimmed = sanitizeText(req.body.name, 100);
     if (!trimmed) {
       return res.status(400).json({ error: 'Name is required' });
     }
@@ -334,8 +352,9 @@ router.put('/me/password', authenticate, async (req, res, next) => {
     if (!current_password || !new_password) {
       return res.status(400).json({ error: 'Current password and new password are required' });
     }
-    if (new_password.length < 6) {
-      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    const pwError = validatePassword(new_password);
+    if (pwError) {
+      return res.status(400).json({ error: pwError });
     }
     const userRes = await db.query(
       'SELECT password_hash FROM users WHERE id = $1',
@@ -365,8 +384,12 @@ router.put('/:id/password', authenticate, requireSuperAdmin, async (req, res, ne
     const { id } = req.params;
     const { new_password } = req.body;
 
-    if (!new_password || new_password.length < 6) {
-      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    if (!new_password) {
+      return res.status(400).json({ error: 'New password is required' });
+    }
+    const pwError = validatePassword(new_password);
+    if (pwError) {
+      return res.status(400).json({ error: pwError });
     }
 
     const userCheck = await db.query('SELECT id, role FROM users WHERE id = $1', [id]);

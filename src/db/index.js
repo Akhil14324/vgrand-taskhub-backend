@@ -41,8 +41,23 @@ directPool.on('error', (err) => {
   console.error(`[${new Date().toISOString()}] Unexpected error on idle direct PostgreSQL client:`, err.message);
 });
 
+async function waitForConnection(maxRetries = 5, delayMs = 2000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await pool.query('SELECT 1');
+      console.log(`[db] Connected successfully on attempt ${attempt}`);
+      return;
+    } catch (err) {
+      console.error(`[db] Connection attempt ${attempt}/${maxRetries} failed: ${err.message}`);
+      if (attempt === maxRetries) throw err;
+      await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+    }
+  }
+}
+
 module.exports = {
   query: (text, params) => pool.query(text, params),
   pool,
   directPool,
+  waitForConnection,
 };

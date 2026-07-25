@@ -1,7 +1,22 @@
 const jwt = require('jsonwebtoken');
 const db = require('../db');
+const { sanitizeText } = require('../middleware/sanitize');
 
 const presenceMap = new Map();
+
+const rateLimitMap = new Map();
+
+function checkRateLimit(userId, event, maxCount, windowMs) {
+  const key = `${userId}:${event}`;
+  const now = Date.now();
+  const entry = rateLimitMap.get(key);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= maxCount;
+}
 
 function getUserSocketKey(userId) {
   return `user:${userId}`;
@@ -59,11 +74,7 @@ function isOnline(userId) {
 }
 
 function sanitizeBody(body) {
-  if (!body) return null;
-  const trimmed = String(body).trim();
-  if (trimmed.length === 0) return null;
-  if (trimmed.length > 5000) return trimmed.slice(0, 5000);
-  return trimmed.replace(/<[^>]*>/g, '');
+  return sanitizeText(body, 5000) || null;
 }
 
 function setupSocketIO(io) {
@@ -107,6 +118,10 @@ function setupSocketIO(io) {
 
     socket.on('send_message', async (data, ack) => {
       try {
+        if (!checkRateLimit(socket.userId, 'send_message', 30, 10000)) {
+          if (ack) ack({ error: 'Rate limit exceeded' });
+          return;
+        }
         const { conversationId, body, attachmentUrl, attachmentType, clientTempId } = data || {};
         if (!conversationId) {
           if (ack) ack({ error: 'conversationId is required' });
@@ -176,6 +191,7 @@ function setupSocketIO(io) {
 
     socket.on('typing_start', async (data) => {
       try {
+        if (!checkRateLimit(socket.userId, 'typing', 20, 10000)) return;
         const { conversationId } = data || {};
         if (!conversationId) return;
         if (!(await isParticipant(conversationId, socket.userId))) return;
