@@ -29,7 +29,11 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
     const offset = (page - 1) * limit;
 
-    const countResult = await db.query("SELECT COUNT(*) FROM users WHERE role != 'super_admin'");
+    const isSuperAdmin = req.user.role === 'super_admin';
+    const roleFilter = isSuperAdmin ? '' : "WHERE u.role != 'super_admin'";
+    const countFilter = isSuperAdmin ? '' : "WHERE role != 'super_admin'";
+
+    const countResult = await db.query(`SELECT COUNT(*) FROM users ${countFilter}`);
     const total = parseInt(countResult.rows[0].count);
 
     const result = await db.query(
@@ -42,7 +46,7 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
        FROM users u
        LEFT JOIN user_businesses ub ON ub.user_id = u.id
        LEFT JOIN businesses b ON b.id = ub.business_id
-       WHERE u.role != 'super_admin'
+       ${roleFilter}
        GROUP BY u.id, u.name, u.email, u.role, u.status, u.business_id, u.created_at
        ORDER BY u.created_at DESC
        LIMIT $1 OFFSET $2`,
