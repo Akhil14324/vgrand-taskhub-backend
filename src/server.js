@@ -72,6 +72,7 @@ const authLimiter = rateLimit({
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.method === 'GET' && req.path === '/me',
   message: { error: 'Too many authentication attempts, please try again later.' },
 });
 

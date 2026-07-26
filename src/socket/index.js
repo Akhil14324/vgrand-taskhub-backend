@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { sanitizeText } = require('../middleware/sanitize');
+const { sendPushToUser } = require('../utils/push');
 
 const presenceMap = new Map();
 
@@ -159,25 +160,40 @@ function setupSocketIO(io) {
         await db.query('UPDATE conversations SET updated_at = NOW() WHERE id = $1', [conversationId]);
 
         await db.query(
-          'UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1 AND user_id != $2',
-          [conversationId, socket.userId]
+          'UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1',
+          [conversationId]
         );
 
         io.to(`conv:${conversationId}`).emit('message:new', message);
 
         const participantIds = await getParticipantUserIds(conversationId);
+        const offlineParticipantIds = [];
         for (const pid of participantIds) {
           if (pid === socket.userId) continue;
+          const conv = await db.query(
+            `SELECT m.body, m.attachment_url, m.created_at FROM messages m
+             LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $2
+             WHERE m.conversation_id = $1 AND m.deleted_at IS NULL AND md.message_id IS NULL
+             ORDER BY m.created_at DESC LIMIT 1`,
+            [conversationId, pid]
+          );
+          io.to(getUserSocketKey(pid)).emit('conversation:updated', {
+            conversationId,
+            lastMessagePreview: conv.rows[0]?.body || '[Attachment]',
+            lastMessageAt: conv.rows[0]?.created_at || msg.created_at,
+          });
+
           if (!isOnline(pid)) {
-            const conv = await db.query(
-              `SELECT m.body, m.attachment_url, m.created_at FROM messages m
-               WHERE m.conversation_id = $1 ORDER BY m.created_at DESC LIMIT 1`,
-              [conversationId]
-            );
-            io.to(getUserSocketKey(pid)).emit('conversation:updated', {
-              conversationId,
-              lastMessagePreview: conv.rows[0]?.body || '[Attachment]',
-              lastMessageAt: msg.created_at,
+            offlineParticipantIds.push(pid);
+          }
+        }
+
+        if (offlineParticipantIds.length > 0) {
+          const pushBody = sanitized ? sanitized : '[Attachment]';
+          for (const pid of offlineParticipantIds) {
+            sendPushToUser(pid, socket.userName, pushBody, {
+              type: 'chat',
+              conversationId: Number(conversationId),
             });
           }
         }

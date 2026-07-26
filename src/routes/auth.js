@@ -11,33 +11,33 @@ const router = express.Router();
 router.post('/signup', async (req, res, next) => {
   try {
     const name = sanitizeText(req.body.name, 100);
-    const email = sanitizeText(req.body.email, 255).toLowerCase();
+    const username = sanitizeText(req.body.username, 100).toLowerCase();
     const { password } = req.body;
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ error: 'Name, email, and password are required' });
+    if (!name || !username || !password) {
+      return res.status(400).json({ error: 'Name, username, and password are required' });
     }
     const pwError = validatePassword(password);
     if (pwError) {
       return res.status(400).json({ error: pwError });
     }
 
-    const existing = await db.query('SELECT id FROM users WHERE email = $1', [email]);
+    const existing = await db.query('SELECT id FROM users WHERE username = $1', [username]);
     if (existing.rows.length > 0) {
-      return res.status(409).json({ error: 'Email already registered' });
+      return res.status(409).json({ error: 'Username already taken' });
     }
 
     const hash = await bcrypt.hash(password, 10);
     const result = await db.query(
-      `INSERT INTO users (name, email, password_hash, role, business_id, status)
+      `INSERT INTO users (name, username, password_hash, role, business_id, status)
        VALUES ($1, $2, $3, 'user', NULL, 'active')
-       RETURNING id, name, email, role, business_id, status, created_at`,
-      [name, email, hash]
+       RETURNING id, name, username, role, business_id, status, created_at`,
+      [name, username, hash]
     );
 
     const user = result.rows[0];
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role, business_id: user.business_id },
+      { id: user.id, username: user.username, role: user.role, business_id: user.business_id },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
@@ -50,7 +50,7 @@ router.post('/signup', async (req, res, next) => {
       await db.query(
         `INSERT INTO notifications (user_id, type, message)
          VALUES ($1, 'user_joined', $2)`,
-        [admin.id, `New user joined: ${name} (${email})`]
+        [admin.id, `New user joined: ${name} (${username})`]
       );
     }
 
@@ -63,26 +63,30 @@ router.post('/signup', async (req, res, next) => {
 // POST /api/auth/login
 router.post('/login', async (req, res, next) => {
   try {
-    const email = sanitizeText(req.body.email, 255).toLowerCase();
+    const loginField = sanitizeText(req.body.username || req.body.email, 255).toLowerCase();
     const { password } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
+    if (!loginField || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
     }
 
-    const result = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+    // Try username first, then email (super_admin can login with email)
+    let result = await db.query('SELECT * FROM users WHERE username = $1', [loginField]);
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+      result = await db.query('SELECT * FROM users WHERE email = $1 AND role = $2', [loginField, 'super_admin']);
+    }
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid username or password' });
     }
 
     const user = result.rows[0];
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+      return res.status(401).json({ error: 'Invalid username or password' });
     }
 
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role, business_id: user.business_id },
+      { id: user.id, username: user.username, role: user.role, business_id: user.business_id },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
@@ -92,6 +96,7 @@ router.post('/login', async (req, res, next) => {
       user: {
         id: user.id,
         name: user.name,
+        username: user.username,
         email: user.email,
         role: user.role,
         business_id: user.business_id,
@@ -107,7 +112,7 @@ router.post('/login', async (req, res, next) => {
 router.get('/me', authenticate, async (req, res, next) => {
   try {
     const result = await db.query(
-      `SELECT u.id, u.name, u.email, u.role, u.business_id, u.status, u.created_at,
+      `SELECT u.id, u.name, u.username, u.email, u.role, u.business_id, u.status, u.created_at,
               b.name AS business_name, b.type AS business_type
        FROM users u
        LEFT JOIN businesses b ON u.business_id = b.id

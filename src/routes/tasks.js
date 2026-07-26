@@ -2,6 +2,7 @@ const express = require('express');
 const db = require('../db');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
+const { sendPushToUser, sendPushToUsers } = require('../utils/push');
 
 const router = express.Router();
 
@@ -162,6 +163,7 @@ router.post('/', authenticate, async (req, res, next) => {
         `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND id != $1`,
         [req.user.id]
       );
+      const adminIds = admins.rows.map((a) => a.id);
       for (const admin of admins.rows) {
         await client.query(
           `INSERT INTO notifications (user_id, type, message)
@@ -169,6 +171,7 @@ router.post('/', authenticate, async (req, res, next) => {
           [admin.id, `New task created: "${title}"`]
         );
       }
+      sendPushToUsers(adminIds, 'New Task', `New task created: "${title}"`, { type: 'task_added' });
 
       if (assignedUserId) {
         await client.query(
@@ -176,6 +179,7 @@ router.post('/', authenticate, async (req, res, next) => {
            VALUES ($1, 'task_added', $2)`,
           [assignedUserId, `New task assigned to you: "${title}"`]
         );
+        sendPushToUser(assignedUserId, 'New Task Assigned', `New task assigned to you: "${title}"`, { type: 'task_added' });
       } else {
         const usersInBiz = await client.query(
           `SELECT u.id FROM users u
@@ -183,6 +187,7 @@ router.post('/', authenticate, async (req, res, next) => {
            WHERE ub.business_id = $1 AND u.role = $2 AND u.id != $3`,
           [taskBusinessId, 'user', req.user.id]
         );
+        const bizUserIds = usersInBiz.rows.map((u) => u.id);
         for (const u of usersInBiz.rows) {
           await client.query(
             `INSERT INTO notifications (user_id, type, message)
@@ -190,6 +195,7 @@ router.post('/', authenticate, async (req, res, next) => {
             [u.id, `New task added: "${title}"`]
           );
         }
+        sendPushToUsers(bizUserIds, 'New Task', `New task added: "${title}"`, { type: 'task_added' });
       }
 
       await client.query('COMMIT');
@@ -305,6 +311,7 @@ router.put('/:id/complete', authenticate, async (req, res, next) => {
           `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND id != $1`,
           [req.user.id]
         );
+        const adminIds = admins.rows.map((a) => a.id);
         for (const admin of admins.rows) {
           await client.query(
             `INSERT INTO notifications (user_id, type, message)
@@ -312,6 +319,7 @@ router.put('/:id/complete', authenticate, async (req, res, next) => {
             [admin.id, `Task "${task.title}" completed by ${completerName}`]
           );
         }
+        sendPushToUsers(adminIds, 'Task Completed', `Task "${task.title}" completed by ${completerName}`, { type: 'task_completed' });
 
         if (task.is_warned) {
           const warnedUsers = await client.query(
@@ -338,6 +346,7 @@ router.put('/:id/complete', authenticate, async (req, res, next) => {
                VALUES ($1, 'task_completed', $2)`,
               [task.assigned_user_id, `Task "${task.title}" completed by ${completerName}`]
             );
+            sendPushToUser(task.assigned_user_id, 'Task Completed', `Task "${task.title}" completed by ${completerName}`, { type: 'task_completed' });
           }
         } else {
           const bizUsers = await client.query(
@@ -346,6 +355,7 @@ router.put('/:id/complete', authenticate, async (req, res, next) => {
              WHERE ub.business_id = $1 AND u.role = 'user' AND u.id != $2`,
             [task.business_id, req.user.id]
           );
+          const bizUserIds = bizUsers.rows.map((u) => u.id);
           for (const u of bizUsers.rows) {
             await client.query(
               `INSERT INTO notifications (user_id, type, message)
@@ -353,6 +363,7 @@ router.put('/:id/complete', authenticate, async (req, res, next) => {
               [u.id, `Task "${task.title}" completed by ${completerName}`]
             );
           }
+          sendPushToUsers(bizUserIds, 'Task Completed', `Task "${task.title}" completed by ${completerName}`, { type: 'task_completed' });
         }
       }
 
@@ -432,11 +443,13 @@ router.put('/:id/warn', authenticate, requireAdmin, async (req, res, next) => {
         [id, uid, req.user.id, message]
       );
 
+      const warnNotifMsg = `Warning on task "${task.title}": ${message}`;
       await db.query(
         `INSERT INTO notifications (user_id, type, message)
          VALUES ($1, 'warning', $2)`,
-        [uid, `Warning on task "${task.title}": ${message}`]
+        [uid, warnNotifMsg]
       );
+      sendPushToUser(uid, 'Warning', warnNotifMsg, { type: 'warning', taskId: id });
 
       // Update user status to warned
       await db.query("UPDATE users SET status = 'warned' WHERE id = $1", [uid]);
@@ -541,13 +554,15 @@ router.put('/:id/hold', authenticate, requireAdmin, async (req, res, next) => {
     }
 
     const action = newStatus === 'on_hold' ? 'put on hold' : 'resumed from hold';
+    const holdMsg = `Task "${task.title}" has been ${action} by ${adminName}`;
     for (const uid of notifyUserIds) {
       await db.query(
         `INSERT INTO notifications (user_id, type, message)
          VALUES ($1, 'assignment', $2)`,
-        [uid, `Task "${task.title}" has been ${action} by ${adminName}`]
+        [uid, holdMsg]
       );
     }
+    sendPushToUsers(notifyUserIds, 'Task Update', holdMsg, { type: 'assignment', taskId: id });
 
     res.json({ task: result.rows[0] });
   } catch (err) {

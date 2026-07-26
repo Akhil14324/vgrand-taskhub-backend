@@ -81,4 +81,40 @@ router.put('/read-all', authenticate, async (req, res, next) => {
   }
 });
 
+// POST /api/notifications/push-token — register a push notification token
+router.post('/push-token', authenticate, async (req, res, next) => {
+  try {
+    const { token, platform } = req.body;
+    if (!token) {
+      return res.status(400).json({ error: 'Push token is required' });
+    }
+    await db.query(
+      `INSERT INTO push_tokens (user_id, token, platform)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, token) DO UPDATE SET updated_at = NOW(), platform = $3`,
+      [req.user.id, token, platform || 'android']
+    );
+    res.json({ message: 'Push token registered' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/notifications/push-token — unregister a push notification token
+router.delete('/push-token', authenticate, async (req, res, next) => {
+  try {
+    const { token } = req.body;
+    if (!token) {
+      return res.status(400).json({ error: 'Push token is required' });
+    }
+    await db.query(
+      'DELETE FROM push_tokens WHERE user_id = $1 AND token = $2',
+      [req.user.id, token]
+    );
+    res.json({ message: 'Push token removed' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

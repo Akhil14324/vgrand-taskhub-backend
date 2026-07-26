@@ -1,4 +1,6 @@
 const db = require('../db');
+const { formatOverdueMessage } = require('../utils/dates');
+const { sendPushToUser } = require('../utils/push');
 
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 
@@ -13,6 +15,8 @@ async function sendOverdueNotifications() {
   try {
     // Tasks that are overdue (due date is in the past), not completed, not on hold,
     // and have not already received an overdue notification.
+    // CURRENT_DATE is evaluated in Postgres's session timezone; this assumes the DB
+    // server and the application agree on what "today" is.
     const overdueTasks = await db.query(
       `SELECT t.id, t.title, t.due_date, t.assigned_user_id, t.business_id,
               b.name AS business_name
@@ -36,7 +40,7 @@ async function sendOverdueNotifications() {
     );
 
     for (const task of overdueTasks.rows) {
-      const message = `Task "${task.title}" (${task.business_name}) is overdue. Due date was ${task.due_date}.`;
+      const message = formatOverdueMessage(task);
       const notified = new Set();
 
       // Notify the assigned user (primary user to notify)
@@ -45,6 +49,7 @@ async function sendOverdueNotifications() {
           `INSERT INTO notifications (user_id, type, message) VALUES ($1, 'overdue', $2)`,
           [task.assigned_user_id, message]
         );
+        sendPushToUser(task.assigned_user_id, 'Task Overdue', message, { type: 'overdue', taskId: task.id });
         notified.add(task.assigned_user_id);
       }
 
@@ -55,6 +60,7 @@ async function sendOverdueNotifications() {
           `INSERT INTO notifications (user_id, type, message) VALUES ($1, 'overdue', $2)`,
           [admin.id, message]
         );
+        sendPushToUser(admin.id, 'Task Overdue', message, { type: 'overdue', taskId: task.id });
         notified.add(admin.id);
       }
 
@@ -72,6 +78,7 @@ async function sendOverdueNotifications() {
             `INSERT INTO notifications (user_id, type, message) VALUES ($1, 'overdue', $2)`,
             [u.id, message]
           );
+          sendPushToUser(u.id, 'Task Overdue', message, { type: 'overdue', taskId: task.id });
           notified.add(u.id);
         }
       }

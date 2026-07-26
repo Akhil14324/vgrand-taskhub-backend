@@ -49,13 +49,14 @@ async function runMigrations({ autoClose = true } = {}) {
   // Seed admin user with properly hashed password
   console.log('Seeding admin user...');
   const adminEmail = 'admin@taskhub.com';
+  const adminUsername = 'admin';
   const existing = await directQuery('SELECT id FROM users WHERE email = $1', [adminEmail]);
   if (existing.rows.length === 0) {
     const hash = await bcrypt.hash('admin123', 10);
     await directQuery(
-      `INSERT INTO users (name, email, password_hash, role, status)
-       VALUES ($1, $2, $3, 'super_admin', 'active')`,
-      ['Super Admin', adminEmail, hash]
+      `INSERT INTO users (name, email, username, password_hash, role, status)
+       VALUES ($1, $2, $3, $4, 'super_admin', 'active')`,
+      ['Super Admin', adminEmail, adminUsername, hash]
     );
     console.log('  ✓ Admin user created (admin@taskhub.com / admin123)');
   } else {

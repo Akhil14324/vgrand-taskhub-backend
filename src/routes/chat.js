@@ -117,6 +117,36 @@ async function buildConversationPreview(conversationId, userId) {
   };
 }
 
+// GET /api/chat/users — list users available to start a chat with
+router.get('/users', authenticate, async (req, res, next) => {
+  try {
+    const isAdmin = ['admin', 'super_admin'].includes(req.user.role);
+    let result;
+    if (isAdmin) {
+      result = await db.query(
+        `SELECT u.id, u.name, u.username, u.role, u.status
+         FROM users u
+         WHERE u.id != $1 AND u.status = 'active'
+         ORDER BY u.name`,
+        [req.user.id]
+      );
+    } else {
+      result = await db.query(
+        `SELECT DISTINCT u.id, u.name, u.username, u.role, u.status
+         FROM users u
+         JOIN user_businesses ub1 ON ub1.user_id = u.id
+         JOIN user_businesses ub2 ON ub2.business_id = ub1.business_id AND ub2.user_id = $1
+         WHERE u.id != $1 AND u.status = 'active'
+         ORDER BY u.name`,
+        [req.user.id]
+      );
+    }
+    res.json({ users: result.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/chat/conversations — list current user's conversations
 router.get('/conversations', authenticate, async (req, res, next) => {
   try {
@@ -144,23 +174,31 @@ router.get('/conversations', authenticate, async (req, res, next) => {
        unread_counts AS (
          SELECT m.conversation_id, COUNT(*) AS cnt
          FROM messages m
+         JOIN conversation_participants cp ON cp.conversation_id = m.conversation_id AND cp.user_id = $1
          WHERE m.sender_id != $1
            AND m.deleted_at IS NULL
            AND NOT EXISTS (
              SELECT 1 FROM message_deletions md
              WHERE md.message_id = m.id AND md.user_id = $1
            )
+           AND m.id > COALESCE(cp.last_read_message_id, 0)
          GROUP BY m.conversation_id
        ),
        conv_participants AS (
-         SELECT cp.conversation_id,
+         SELECT cu.conversation_id,
            json_agg(json_build_object(
              'id', u.id, 'name', u.name, 'role', u.role,
              'status', u.status, 'business_id', u.business_id
            ) ORDER BY u.name) AS participants
-         FROM conversation_participants cp
-         JOIN users u ON u.id = cp.user_id
-         GROUP BY cp.conversation_id
+         FROM (
+           SELECT DISTINCT conversation_id, user_id FROM conversation_participants
+           UNION
+           SELECT DISTINCT m.conversation_id, m.sender_id
+           FROM messages m
+           WHERE m.conversation_id IN (SELECT id FROM user_convs)
+         ) cu
+         JOIN users u ON u.id = cu.user_id
+         GROUP BY cu.conversation_id
        )
        SELECT uc.*,
          COALESCE(lm.id, NULL) AS last_msg_id,
@@ -250,19 +288,44 @@ router.post('/conversations', authenticate, async (req, res, next) => {
         return res.status(400).json({ error: 'Direct chat must have exactly 2 participants' });
       }
       const otherId = participantIds[0];
+
+      // Find the direct conversation the other user already participates in and that only
+      // contains messages between the two of you. Prefer the one with the most messages
+      // (the original conversation) in case duplicates were previously created.
       const existing = await db.query(
-        `SELECT c.id FROM conversations c
+        `SELECT c.id,
+           (SELECT COUNT(*) FROM conversation_participants WHERE conversation_id = c.id AND user_id = $1) AS has_current_user
+         FROM conversations c
+         JOIN conversation_participants cp_other ON cp_other.conversation_id = c.id AND cp_other.user_id = $2
          WHERE c.type = 'direct'
-           AND c.id IN (
-             SELECT conversation_id FROM conversation_participants WHERE user_id = $1
-             INTERSECT
-             SELECT conversation_id FROM conversation_participants WHERE user_id = $2
+           AND NOT EXISTS (
+             SELECT 1 FROM messages m
+             WHERE m.conversation_id = c.id AND m.sender_id NOT IN ($1, $2)
            )
+         ORDER BY (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) DESC
          LIMIT 1`,
         [req.user.id, otherId]
       );
+
       if (existing.rows.length > 0) {
-        const preview = await buildConversationPreview(existing.rows[0].id, req.user.id);
+        const existingId = existing.rows[0].id;
+        const hasCurrentUser = parseInt(existing.rows[0].has_current_user, 10) > 0;
+
+        if (!hasCurrentUser) {
+          // Current user row was deleted/removed; re-add it
+          await db.query(
+            `INSERT INTO conversation_participants (conversation_id, user_id, is_admin)
+             VALUES ($1, $2, FALSE)
+             ON CONFLICT (conversation_id, user_id) DO UPDATE SET is_hidden = FALSE`,
+            [existingId, req.user.id]
+          );
+        }
+
+        await db.query(
+          'UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1 AND user_id = $2',
+          [existingId, req.user.id]
+        );
+        const preview = await buildConversationPreview(existingId, req.user.id);
         return res.json({ conversation: preview });
       }
     }
@@ -419,10 +482,39 @@ router.delete('/conversations/:id', authenticate, async (req, res, next) => {
       return res.status(403).json({ error: 'You are not a participant in this conversation' });
     }
 
+    // Hide the conversation for the current user (delete-for-me)
     await db.query(
       'UPDATE conversation_participants SET is_hidden = TRUE WHERE conversation_id = $1 AND user_id = $2',
       [id, userId]
     );
+
+    // Mark all existing messages as deleted for the current user so they
+    // do not reappear if the conversation becomes visible again later.
+    await db.query(
+      `INSERT INTO message_deletions (message_id, user_id)
+       SELECT id, $2 FROM messages WHERE conversation_id = $1
+       ON CONFLICT DO NOTHING`,
+      [id, userId]
+    );
+
+    // Check if any unhidden participants remain
+    const remaining = await db.query(
+      'SELECT COUNT(*) AS cnt FROM conversation_participants WHERE conversation_id = $1 AND is_hidden = FALSE',
+      [id]
+    );
+
+    if (parseInt(remaining.rows[0].cnt, 10) === 0) {
+      // No unhidden participants left — permanently delete the conversation and all its messages
+      await db.query('DELETE FROM message_deletions WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = $1)', [id]);
+      await db.query('DELETE FROM messages WHERE conversation_id = $1', [id]);
+      await db.query('DELETE FROM conversation_participants WHERE conversation_id = $1', [id]);
+      await db.query('DELETE FROM conversations WHERE id = $1', [id]);
+
+      const io = req.app.get('io');
+      if (io) {
+        io.to(`conv:${id}`).emit('conversation:deleted', { conversationId: parseInt(id), deletedBy: userId });
+      }
+    }
 
     res.json({ ok: true });
   } catch (err) {
@@ -473,15 +565,11 @@ router.delete('/messages/:id', authenticate, async (req, res, next) => {
         }
       }
 
-      if (msg.deleted_at) {
-        return res.status(400).json({ error: 'Message is already deleted' });
-      }
-
       const attachmentUrl = msg.attachment_url;
-      await db.query(
-        'UPDATE messages SET deleted_at = NOW(), body = NULL, attachment_url = NULL, attachment_type = NULL WHERE id = $1',
-        [id]
-      );
+
+      // Permanently delete the message and all related records
+      await db.query('DELETE FROM message_deletions WHERE message_id = $1', [id]);
+      await db.query('DELETE FROM messages WHERE id = $1', [id]);
 
       if (attachmentUrl) {
         try {
@@ -501,6 +589,7 @@ router.delete('/messages/:id', authenticate, async (req, res, next) => {
           conversationId: msg.conversation_id,
           messageId: parseInt(id),
           deletedAt: new Date().toISOString(),
+          permanent: true,
         });
       }
 

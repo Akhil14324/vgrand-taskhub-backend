@@ -10,7 +10,7 @@ const router = express.Router();
 router.get('/unassigned', authenticate, requireAdmin, async (req, res, next) => {
   try {
     const result = await db.query(
-      `SELECT u.id, u.name, u.email, u.role, u.status, u.created_at
+      `SELECT u.id, u.name, u.username, u.role, u.status, u.created_at
        FROM users u
        WHERE u.role = 'user'
          AND NOT EXISTS (SELECT 1 FROM user_businesses ub WHERE ub.user_id = u.id)
@@ -32,12 +32,13 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
     const isSuperAdmin = req.user.role === 'super_admin';
     const roleFilter = isSuperAdmin ? '' : "WHERE u.role != 'super_admin'";
     const countFilter = isSuperAdmin ? '' : "WHERE role != 'super_admin'";
+    const emailColumn = isSuperAdmin ? 'u.email,' : '';
 
     const countResult = await db.query(`SELECT COUNT(*) FROM users ${countFilter}`);
     const total = parseInt(countResult.rows[0].count);
 
     const result = await db.query(
-      `SELECT u.id, u.name, u.email, u.role, u.status, u.business_id, u.created_at,
+      `SELECT u.id, u.name, u.username, ${emailColumn} u.role, u.status, u.business_id, u.created_at,
               COALESCE(
                 json_agg(
                   json_build_object('id', b.id, 'name', b.name, 'type', b.type)
@@ -47,7 +48,7 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
        LEFT JOIN user_businesses ub ON ub.user_id = u.id
        LEFT JOIN businesses b ON b.id = ub.business_id
        ${roleFilter}
-       GROUP BY u.id, u.name, u.email, u.role, u.status, u.business_id, u.created_at
+       GROUP BY u.id, u.name, u.username, ${emailColumn} u.role, u.status, u.business_id, u.created_at
        ORDER BY u.created_at DESC
        LIMIT $1 OFFSET $2`,
       [limit, offset]
@@ -181,7 +182,7 @@ router.put('/:id/role', authenticate, requireSuperAdmin, async (req, res, next) 
 
     const result = await db.query(
       `UPDATE users SET role = $1 WHERE id = $2
-       RETURNING id, name, email, role, business_id, status`,
+       RETURNING id, name, username, role, business_id, status`,
       [role, id]
     );
 
@@ -328,7 +329,7 @@ router.put('/me', authenticate, async (req, res, next) => {
     }
     const result = await db.query(
       `UPDATE users SET name = $1, updated_at = NOW() WHERE id = $2
-       RETURNING id, name, email, role, business_id, status, created_at`,
+       RETURNING id, name, username, role, business_id, status, created_at`,
       [trimmed, req.user.id]
     );
     if (result.rows.length === 0) {
