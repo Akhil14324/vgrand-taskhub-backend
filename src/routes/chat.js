@@ -68,7 +68,7 @@ async function getParticipantUserIds(conversationId) {
   return result.rows.map((r) => r.user_id);
 }
 
-async function buildConversationPreview(conversationId, userId) {
+async function buildConversationPreview(conversationId, userId, viewerRole) {
   const conv = await db.query(
     `SELECT c.*, cp.is_admin AS is_group_admin
      FROM conversations c
@@ -100,11 +100,12 @@ async function buildConversationPreview(conversationId, userId) {
     [conversationId, userId]
   );
 
+  const isSuperAdmin = viewerRole === 'super_admin';
   const participants = await db.query(
     `SELECT u.id, u.name, u.role, u.status, u.business_id
      FROM conversation_participants cp
      JOIN users u ON u.id = cp.user_id
-     WHERE cp.conversation_id = $1
+     WHERE cp.conversation_id = $1 ${isSuperAdmin ? '' : "AND cp.is_invisible = FALSE"}
      ORDER BY u.name`,
     [conversationId]
   );
@@ -150,6 +151,9 @@ router.get('/users', authenticate, async (req, res, next) => {
 // GET /api/chat/conversations — list current user's conversations
 router.get('/conversations', authenticate, async (req, res, next) => {
   try {
+    const isSuperAdmin = req.user.role === 'super_admin';
+    const invisibleFilter = isSuperAdmin ? '' : 'AND cp.is_invisible = FALSE';
+
     const result = await db.query(
       `WITH user_convs AS (
          SELECT c.id, c.name, c.type, c.business_id, c.created_at, c.updated_at,
@@ -191,7 +195,9 @@ router.get('/conversations', authenticate, async (req, res, next) => {
              'status', u.status, 'business_id', u.business_id
            ) ORDER BY u.name) AS participants
          FROM (
-           SELECT DISTINCT conversation_id, user_id FROM conversation_participants
+           SELECT DISTINCT cp.conversation_id, cp.user_id
+           FROM conversation_participants cp
+           WHERE 1=1 ${invisibleFilter}
            UNION
            SELECT DISTINCT m.conversation_id, m.sender_id
            FROM messages m
@@ -261,6 +267,9 @@ router.post('/conversations', authenticate, async (req, res, next) => {
     const allIds = [...new Set([...participantIds, req.user.id])];
 
     if (type === 'group') {
+      if (!['admin', 'super_admin'].includes(req.user.role)) {
+        return res.status(403).json({ error: 'Only admins can create group chats' });
+      }
       if (allIds.length < 3) {
         return res.status(400).json({ error: 'Group chat requires at least 3 participants' });
       }
@@ -325,7 +334,7 @@ router.post('/conversations', authenticate, async (req, res, next) => {
           'UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1 AND user_id = $2',
           [existingId, req.user.id]
         );
-        const preview = await buildConversationPreview(existingId, req.user.id);
+        const preview = await buildConversationPreview(existingId, req.user.id, req.user.role);
         return res.json({ conversation: preview });
       }
     }
@@ -346,7 +355,7 @@ router.post('/conversations', authenticate, async (req, res, next) => {
       );
     }
 
-    const preview = await buildConversationPreview(conversationId, req.user.id);
+    const preview = await buildConversationPreview(conversationId, req.user.id, req.user.role);
     res.status(201).json({ conversation: preview });
   } catch (err) {
     next(err);

@@ -49,7 +49,7 @@ async function runMigrations({ autoClose = true } = {}) {
   // Seed admin user with properly hashed password
   console.log('Seeding admin user...');
   const adminEmail = 'admin@taskhub.com';
-  const adminUsername = 'admin';
+  const adminUsername = 'Superadmin';
   const existing = await directQuery('SELECT id FROM users WHERE email = $1', [adminEmail]);
   if (existing.rows.length === 0) {
     const hash = await bcrypt.hash('admin123', 10);
@@ -58,13 +58,13 @@ async function runMigrations({ autoClose = true } = {}) {
        VALUES ($1, $2, $3, $4, 'super_admin', 'active')`,
       ['Super Admin', adminEmail, adminUsername, hash]
     );
-    console.log('  ✓ Admin user created (admin@taskhub.com / admin123)');
+    console.log('  ✓ Admin user created (Superadmin / admin123)');
   } else {
     await directQuery(
-      `UPDATE users SET role = 'super_admin' WHERE email = $1 AND role != 'super_admin'`,
-      [adminEmail]
+      `UPDATE users SET role = 'super_admin', username = $2 WHERE email = $1 AND (role != 'super_admin' OR username != $2)`,
+      [adminEmail, adminUsername]
     );
-    console.log('  ✓ Admin user already exists (upgraded to super_admin if needed)');
+    console.log('  ✓ Admin user already exists (upgraded to super_admin and username set to Superadmin if needed)');
   }
 
   if (autoClose) {

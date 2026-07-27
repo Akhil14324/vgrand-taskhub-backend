@@ -5,6 +5,57 @@ const { sanitizeText } = require('../middleware/sanitize');
 
 const router = express.Router();
 
+async function createBusinessGroup(businessId, businessName, createdByUserId) {
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const convResult = await client.query(
+      `INSERT INTO conversations (type, name, business_id, created_by)
+       VALUES ('group', $1, $2, $3) RETURNING id`,
+      [businessName, businessId, createdByUserId]
+    );
+    const conversationId = convResult.rows[0].id;
+
+    const adminsResult = await client.query(
+      `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND status = 'active'`
+    );
+
+    const assignedResult = await client.query(
+      `SELECT ub.user_id FROM user_businesses ub
+       JOIN users u ON u.id = ub.user_id
+       WHERE ub.business_id = $1 AND u.status = 'active'`,
+      [businessId]
+    );
+
+    const allUserIds = new Set();
+    adminsResult.rows.forEach((r) => allUserIds.add(r.id));
+    assignedResult.rows.forEach((r) => allUserIds.add(r.user_id));
+    allUserIds.add(createdByUserId);
+
+    for (const uid of allUserIds) {
+      const isSuperAdmin = adminsResult.rows.some(
+        (r) => r.id === uid
+      ) && await client.query('SELECT role FROM users WHERE id = $1', [uid]).then((r) => r.rows[0]?.role === 'super_admin');
+
+      await client.query(
+        `INSERT INTO conversation_participants (conversation_id, user_id, is_admin, is_invisible)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT DO NOTHING`,
+        [conversationId, uid, uid === createdByUserId, isSuperAdmin]
+      );
+    }
+
+    await client.query('COMMIT');
+    return conversationId;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 // GET /api/businesses/types — existing distinct business types
 router.get('/types', authenticate, requireAdmin, async (req, res, next) => {
   try {
@@ -36,7 +87,7 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
        FROM businesses b
        LEFT JOIN tasks t ON t.business_id = b.id
        GROUP BY b.id
-       ORDER BY b.created_at DESC
+       ORDER BY b.name ASC
        LIMIT $1 OFFSET $2`,
       [limit, offset]
     );
@@ -72,7 +123,15 @@ router.post('/', authenticate, requireAdmin, async (req, res, next) => {
       [name, type, description || '']
     );
 
-    res.status(201).json({ business: result.rows[0] });
+    const business = result.rows[0];
+
+    try {
+      await createBusinessGroup(business.id, business.name, req.user.id);
+    } catch (groupErr) {
+      console.error('[businesses] Failed to auto-create group:', groupErr.message);
+    }
+
+    res.status(201).json({ business });
   } catch (err) {
     next(err);
   }
@@ -99,6 +158,11 @@ router.put('/:id', authenticate, requireAdmin, async (req, res, next) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Business not found' });
     }
+
+    await db.query(
+      `UPDATE conversations SET name = $1 WHERE business_id = $2 AND type = 'group'`,
+      [name, id]
+    );
 
     res.json({ business: result.rows[0] });
   } catch (err) {

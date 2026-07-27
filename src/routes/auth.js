@@ -11,7 +11,7 @@ const router = express.Router();
 router.post('/signup', async (req, res, next) => {
   try {
     const name = sanitizeText(req.body.name, 100);
-    const username = sanitizeText(req.body.username, 100).toLowerCase();
+    const username = sanitizeText(req.body.username, 100);
     const { password } = req.body;
 
     if (!name || !username || !password) {
@@ -22,7 +22,7 @@ router.post('/signup', async (req, res, next) => {
       return res.status(400).json({ error: pwError });
     }
 
-    const existing = await db.query('SELECT id FROM users WHERE username = $1', [username]);
+    const existing = await db.query('SELECT id FROM users WHERE LOWER(username) = LOWER($1)', [username]);
     if (existing.rows.length > 0) {
       return res.status(409).json({ error: 'Username already taken' });
     }
@@ -63,7 +63,7 @@ router.post('/signup', async (req, res, next) => {
 // POST /api/auth/login
 router.post('/login', async (req, res, next) => {
   try {
-    const loginField = sanitizeText(req.body.username || req.body.email, 255).toLowerCase();
+    const loginField = sanitizeText(req.body.username || req.body.email, 255);
     const { password } = req.body;
 
     if (!loginField || !password) {
@@ -71,9 +71,9 @@ router.post('/login', async (req, res, next) => {
     }
 
     // Try username first, then email (super_admin can login with email)
-    let result = await db.query('SELECT * FROM users WHERE username = $1', [loginField]);
+    let result = await db.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [loginField]);
     if (result.rows.length === 0) {
-      result = await db.query('SELECT * FROM users WHERE email = $1 AND role = $2', [loginField, 'super_admin']);
+      result = await db.query('SELECT * FROM users WHERE LOWER(email) = LOWER($1) AND role = $2', [loginField, 'super_admin']);
     }
     if (result.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid username or password' });
@@ -101,6 +101,7 @@ router.post('/login', async (req, res, next) => {
         role: user.role,
         business_id: user.business_id,
         status: user.status,
+        created_at: user.created_at,
       },
     });
   } catch (err) {

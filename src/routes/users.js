@@ -95,8 +95,27 @@ router.put('/:id/assign', authenticate, requireAdmin, async (req, res, next) => 
       const client = await db.pool.connect();
       try {
         await client.query('BEGIN');
+
+        const oldBizResult = await client.query(
+          'SELECT business_id FROM user_businesses WHERE user_id = $1', [id]
+        );
+
         await client.query('DELETE FROM user_businesses WHERE user_id = $1', [id]);
         await client.query('UPDATE users SET business_id = NULL WHERE id = $1', [id]);
+
+        for (const row of oldBizResult.rows) {
+          const convResult = await client.query(
+            `SELECT id FROM conversations WHERE business_id = $1 AND type = 'group'`,
+            [row.business_id]
+          );
+          for (const conv of convResult.rows) {
+            await client.query(
+              'DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
+              [conv.id, id]
+            );
+          }
+        }
+
         await client.query(
           `INSERT INTO notifications (user_id, type, message)
            VALUES ($1, 'assignment', $2)`,
@@ -125,12 +144,48 @@ router.put('/:id/assign', authenticate, requireAdmin, async (req, res, next) => 
     const client = await db.pool.connect();
     try {
       await client.query('BEGIN');
+
+      const oldBizResult = await client.query(
+        'SELECT business_id FROM user_businesses WHERE user_id = $1', [id]
+      );
+      const oldBizIds = oldBizResult.rows.map((r) => r.business_id);
+      const removedBizIds = oldBizIds.filter((bid) => !bizIds.includes(bid));
+      const addedBizIds = bizIds.filter((bid) => !oldBizIds.includes(bid));
+
       await client.query('DELETE FROM user_businesses WHERE user_id = $1', [id]);
       for (const bizId of bizIds) {
         await client.query(
           'INSERT INTO user_businesses (user_id, business_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
           [id, bizId]
         );
+      }
+
+      for (const bizId of addedBizIds) {
+        const convResult = await client.query(
+          `SELECT id FROM conversations WHERE business_id = $1 AND type = 'group'`,
+          [bizId]
+        );
+        for (const conv of convResult.rows) {
+          await client.query(
+            `INSERT INTO conversation_participants (conversation_id, user_id, is_admin, is_invisible)
+             VALUES ($1, $2, FALSE, FALSE)
+             ON CONFLICT DO NOTHING`,
+            [conv.id, id]
+          );
+        }
+      }
+
+      for (const bizId of removedBizIds) {
+        const convResult = await client.query(
+          `SELECT id FROM conversations WHERE business_id = $1 AND type = 'group'`,
+          [bizId]
+        );
+        for (const conv of convResult.rows) {
+          await client.query(
+            'DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
+            [conv.id, id]
+          );
+        }
       }
 
       const primaryBizId = bizIds[0];
@@ -185,6 +240,39 @@ router.put('/:id/role', authenticate, requireSuperAdmin, async (req, res, next) 
        RETURNING id, name, username, role, business_id, status`,
       [role, id]
     );
+
+    if (role === 'admin') {
+      const bizGroups = await db.query(
+        `SELECT c.id FROM conversations c
+         WHERE c.type = 'group' AND c.business_id IS NOT NULL`
+      );
+      for (const conv of bizGroups.rows) {
+        await db.query(
+          `INSERT INTO conversation_participants (conversation_id, user_id, is_admin, is_invisible)
+           VALUES ($1, $2, FALSE, FALSE)
+           ON CONFLICT DO NOTHING`,
+          [conv.id, id]
+        );
+      }
+    } else {
+      const userBizResult = await db.query(
+        'SELECT business_id FROM user_businesses WHERE user_id = $1', [id]
+      );
+      const userBizIds = userBizResult.rows.map((r) => r.business_id);
+
+      const allBizGroups = await db.query(
+        `SELECT c.id, c.business_id FROM conversations c
+         WHERE c.type = 'group' AND c.business_id IS NOT NULL`
+      );
+      for (const conv of allBizGroups.rows) {
+        if (!userBizIds.includes(conv.business_id)) {
+          await db.query(
+            'DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
+            [conv.id, id]
+          );
+        }
+      }
+    }
 
     const notifMsg = role === 'admin'
       ? 'You have been promoted to Admin. Please log out and log back in to access admin features.'
