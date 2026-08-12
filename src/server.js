@@ -89,6 +89,14 @@ app.use('/api', globalLimiter);
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'uploads');
 app.use('/uploads', express.static(UPLOAD_DIR));
 
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+app.use('/legal', express.static(PUBLIC_DIR));
+app.get('/privacy', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'privacy.html')));
+app.get('/terms', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'terms.html')));
+app.get('/', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TaskHub</title><style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f9fafb;color:#111827;margin:0;padding:48px 16px;text-align:center}h1{color:#4f46e5}p{color:#6b7280}a{color:#4f46e5;margin:0 8px}</style></head><body><h1>TaskHub API</h1><p>Multi-Business Task Monitoring backend.</p><p><a href="/privacy">Privacy Policy</a> &middot; <a href="/terms">Terms of Service</a></p></body></html>`);
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     const result = await db.query('SELECT 1');

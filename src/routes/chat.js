@@ -376,7 +376,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
     let query, params;
     if (after) {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.deleted_at
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.deleted_at, m.reply_to_id
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $4
                WHERE m.conversation_id = $1 AND m.id > $2 AND md.message_id IS NULL
@@ -384,7 +384,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
       params = [id, parseInt(after), lim, req.user.id];
     } else if (before) {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.deleted_at
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.deleted_at, m.reply_to_id
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $4
                WHERE m.conversation_id = $1 AND m.id < $2 AND md.message_id IS NULL
@@ -392,7 +392,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
       params = [id, parseInt(before), lim, req.user.id];
     } else {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.deleted_at
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.deleted_at, m.reply_to_id
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $3
                WHERE m.conversation_id = $1 AND md.message_id IS NULL
@@ -402,6 +402,48 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
 
     const result = await db.query(query, params);
     const messages = result.rows.reverse();
+
+    if (messages.length > 0) {
+      const messageIds = messages.map((m) => m.id);
+      const reactionsResult = await db.query(
+        `SELECT mr.message_id, mr.emoji, json_agg(json_build_object('userId', mr.user_id, 'userName', u.name)) as users
+         FROM message_reactions mr JOIN users u ON u.id = mr.user_id
+         WHERE mr.message_id = ANY($1::int[]) GROUP BY mr.message_id, mr.emoji`,
+        [messageIds]
+      );
+      const reactionsMap = {};
+      reactionsResult.rows.forEach((r) => {
+        if (!reactionsMap[r.message_id]) reactionsMap[r.message_id] = {};
+        reactionsMap[r.message_id][r.emoji] = r.users;
+      });
+      messages.forEach((m) => {
+        m.reactions = reactionsMap[m.id] || {};
+      });
+
+      const replyIds = [...new Set(messages.map((m) => m.reply_to_id).filter(Boolean))];
+      if (replyIds.length > 0) {
+        const replyResult = await db.query(
+          `SELECT m.id, m.body, m.attachment_url, m.attachment_type, u.name as sender_name
+           FROM messages m JOIN users u ON u.id = m.sender_id
+           WHERE m.id = ANY($1::int[])`,
+          [replyIds]
+        );
+        const replyMap = {};
+        replyResult.rows.forEach((r) => {
+          replyMap[r.id] = {
+            id: r.id,
+            body: r.body,
+            attachmentUrl: r.attachment_url,
+            attachmentType: r.attachment_type,
+            senderName: r.sender_name,
+          };
+        });
+        messages.forEach((m) => {
+          if (m.reply_to_id) m.replyTo = replyMap[m.reply_to_id] || null;
+        });
+      }
+    }
+
     res.json({ messages, has_more: result.rows.length === lim });
   } catch (err) {
     next(err);
@@ -412,7 +454,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
 router.post('/conversations/:id/messages', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { body, attachmentUrl, attachmentType, clientTempId } = req.body;
+    const { body, attachmentUrl, attachmentType, clientTempId, replyToId } = req.body;
 
     if (!(await isParticipant(id, req.user.id))) {
       return res.status(403).json({ error: 'You are not a participant in this conversation' });
@@ -424,13 +466,33 @@ router.post('/conversations/:id/messages', authenticate, async (req, res, next) 
     }
 
     const result = await db.query(
-      `INSERT INTO messages (conversation_id, sender_id, body, attachment_url, attachment_type)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-      [id, req.user.id, sanitized, attachmentUrl || null, attachmentType || null]
+      `INSERT INTO messages (conversation_id, sender_id, body, attachment_url, attachment_type, reply_to_id)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
+      [id, req.user.id, sanitized, attachmentUrl || null, attachmentType || null, replyToId || null]
     );
 
     const msg = result.rows[0];
     const userResult = await db.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+
+    let replyTo = null;
+    if (replyToId) {
+      const replyResult = await db.query(
+        `SELECT m.id, m.body, m.attachment_url, m.attachment_type, u.name as sender_name
+         FROM messages m JOIN users u ON u.id = m.sender_id
+         WHERE m.id = $1`,
+        [replyToId]
+      );
+      if (replyResult.rows.length > 0) {
+        const r = replyResult.rows[0];
+        replyTo = {
+          id: r.id,
+          body: r.body,
+          attachmentUrl: r.attachment_url,
+          attachmentType: r.attachment_type,
+          senderName: r.sender_name,
+        };
+      }
+    }
 
     const message = {
       id: msg.id,
@@ -440,6 +502,8 @@ router.post('/conversations/:id/messages', authenticate, async (req, res, next) 
       body: sanitized,
       attachmentUrl: attachmentUrl || null,
       attachmentType: attachmentType || null,
+      replyToId: replyToId || null,
+      replyTo,
       createdAt: msg.created_at,
     };
 

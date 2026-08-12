@@ -123,7 +123,7 @@ function setupSocketIO(io) {
           if (ack) ack({ error: 'Rate limit exceeded' });
           return;
         }
-        const { conversationId, body, attachmentUrl, attachmentType, clientTempId } = data || {};
+        const { conversationId, body, attachmentUrl, attachmentType, clientTempId, replyToId } = data || {};
         if (!conversationId) {
           if (ack) ack({ error: 'conversationId is required' });
           return;
@@ -140,12 +140,33 @@ function setupSocketIO(io) {
         }
 
         const result = await db.query(
-          `INSERT INTO messages (conversation_id, sender_id, body, attachment_url, attachment_type)
-           VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-          [conversationId, socket.userId, sanitized, attachmentUrl || null, attachmentType || null]
+          `INSERT INTO messages (conversation_id, sender_id, body, attachment_url, attachment_type, reply_to_id)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
+          [conversationId, socket.userId, sanitized, attachmentUrl || null, attachmentType || null, replyToId || null]
         );
 
         const msg = result.rows[0];
+
+        let replyTo = null;
+        if (replyToId) {
+          const replyResult = await db.query(
+            `SELECT m.id, m.body, m.attachment_url, m.attachment_type, u.name as sender_name
+             FROM messages m JOIN users u ON u.id = m.sender_id
+             WHERE m.id = $1`,
+            [replyToId]
+          );
+          if (replyResult.rows.length > 0) {
+            const r = replyResult.rows[0];
+            replyTo = {
+              id: r.id,
+              body: r.body,
+              attachmentUrl: r.attachment_url,
+              attachmentType: r.attachment_type,
+              senderName: r.sender_name,
+            };
+          }
+        }
+
         const message = {
           id: msg.id,
           conversationId,
@@ -154,6 +175,8 @@ function setupSocketIO(io) {
           body: sanitized,
           attachmentUrl: attachmentUrl || null,
           attachmentType: attachmentType || null,
+          replyToId: replyToId || null,
+          replyTo,
           createdAt: msg.created_at,
         };
 
@@ -257,6 +280,64 @@ function setupSocketIO(io) {
         });
       } catch (err) {
         console.error('[socket] mark_read error:', err.message);
+      }
+    });
+
+    socket.on('react_to_message', async (data, ack) => {
+      try {
+        const { messageId, emoji } = data || {};
+        if (!messageId || !emoji) {
+          if (ack) ack({ error: 'messageId and emoji are required' });
+          return;
+        }
+
+        const msgResult = await db.query('SELECT conversation_id FROM messages WHERE id = $1', [messageId]);
+        if (msgResult.rows.length === 0) {
+          if (ack) ack({ error: 'Message not found' });
+          return;
+        }
+        const conversationId = msgResult.rows[0].conversation_id;
+
+        if (!(await isParticipant(conversationId, socket.userId))) {
+          if (ack) ack({ error: 'Not a participant' });
+          return;
+        }
+
+        const existing = await db.query(
+          'SELECT id FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3',
+          [messageId, socket.userId, emoji]
+        );
+
+        if (existing.rows.length > 0) {
+          await db.query('DELETE FROM message_reactions WHERE id = $1', [existing.rows[0].id]);
+        } else {
+          await db.query(
+            'INSERT INTO message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)',
+            [messageId, socket.userId, emoji]
+          );
+        }
+
+        const reactionsResult = await db.query(
+          `SELECT emoji, json_agg(json_build_object('userId', user_id, 'userName', u.name)) as users
+           FROM message_reactions mr JOIN users u ON u.id = mr.user_id
+           WHERE mr.message_id = $1 GROUP BY emoji`,
+          [messageId]
+        );
+        const reactions = {};
+        reactionsResult.rows.forEach((r) => {
+          reactions[r.emoji] = r.users;
+        });
+
+        io.to(`conv:${conversationId}`).emit('message:reaction', {
+          messageId,
+          conversationId,
+          reactions,
+        });
+
+        if (ack) ack({ ok: true, reactions });
+      } catch (err) {
+        console.error('[socket] react_to_message error:', err.message);
+        if (ack) ack({ error: 'Failed to react' });
       }
     });
 
