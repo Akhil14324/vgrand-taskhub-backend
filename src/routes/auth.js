@@ -109,6 +109,45 @@ router.post('/login', async (req, res, next) => {
   }
 });
 
+// DELETE /api/auth/me — self-service account deletion (password confirmed)
+router.delete('/me', authenticate, async (req, res, next) => {
+  try {
+    const { password } = req.body;
+    if (!password) {
+      return res.status(400).json({ error: 'Password is required to delete your account' });
+    }
+
+    const userRes = await db.query(
+      'SELECT password_hash FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const valid = await bcrypt.compare(password, userRes.rows[0].password_hash);
+    if (!valid) {
+      return res.status(401).json({ error: 'Password is incorrect' });
+    }
+
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('DELETE FROM users WHERE id = $1', [req.user.id]);
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      client.release();
+      throw txErr;
+    }
+    client.release();
+
+    res.json({ message: 'Account deleted successfully' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/auth/me — get current user from token
 router.get('/me', authenticate, async (req, res, next) => {
   try {
