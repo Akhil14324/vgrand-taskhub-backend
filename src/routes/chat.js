@@ -30,7 +30,7 @@ const upload = multer({
   storage,
   limits: { fileSize: MAX_UPLOAD_SIZE },
   fileFilter: (req, file, cb) => {
-    const allowed = /image\/|application\/pdf|text\/plain/;
+    const allowed = /image\/|application\/pdf|text\/plain|audio\//;
     if (allowed.test(file.mimetype)) {
       cb(null, true);
     } else {
@@ -102,7 +102,7 @@ async function buildConversationPreview(conversationId, userId, viewerRole) {
 
   const isSuperAdmin = viewerRole === 'super_admin';
   const participants = await db.query(
-    `SELECT u.id, u.name, u.role, u.status, u.business_id
+    `SELECT u.id, u.name, u.role, u.status, u.business_id, u.profile_picture, u.last_seen
      FROM conversation_participants cp
      JOIN users u ON u.id = cp.user_id
      WHERE cp.conversation_id = $1 ${isSuperAdmin ? '' : "AND cp.is_invisible = FALSE"}
@@ -192,8 +192,9 @@ router.get('/conversations', authenticate, async (req, res, next) => {
          SELECT cu.conversation_id,
            json_agg(json_build_object(
              'id', u.id, 'name', u.name, 'role', u.role,
-             'status', u.status, 'business_id', u.business_id
-           ) ORDER BY u.name) AS participants
+            'status', u.status, 'business_id', u.business_id,
+            'profile_picture', u.profile_picture, 'last_seen', u.last_seen
+          ) ORDER BY u.name) AS participants
          FROM (
            SELECT DISTINCT cp.conversation_id, cp.user_id
            FROM conversation_participants cp
@@ -376,7 +377,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
     let query, params;
     if (after) {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.deleted_at, m.reply_to_id
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.reply_to_id
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $4
                WHERE m.conversation_id = $1 AND m.id > $2 AND md.message_id IS NULL
@@ -384,7 +385,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
       params = [id, parseInt(after), lim, req.user.id];
     } else if (before) {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.deleted_at, m.reply_to_id
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.reply_to_id
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $4
                WHERE m.conversation_id = $1 AND m.id < $2 AND md.message_id IS NULL
@@ -392,7 +393,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
       params = [id, parseInt(before), lim, req.user.id];
     } else {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.deleted_at, m.reply_to_id
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.reply_to_id
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $3
                WHERE m.conversation_id = $1 AND md.message_id IS NULL
@@ -675,7 +676,7 @@ router.delete('/messages/:id', authenticate, async (req, res, next) => {
   }
 });
 
-// POST /api/chat/upload — image/file upload for attachments
+// POST /api/chat/upload — image/file/audio upload for attachments
 router.post('/upload', authenticate, upload.single('file'), (req, res, next) => {
   try {
     if (!req.file) {
@@ -689,6 +690,100 @@ router.post('/upload', authenticate, upload.single('file'), (req, res, next) => 
       filename: req.file.filename,
       size: req.file.size,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/chat/messages/:id — edit message
+router.patch('/messages/:id', authenticate, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { body } = req.body;
+    if (!body || !body.trim()) {
+      return res.status(400).json({ error: 'Body is required' });
+    }
+
+    const msgResult = await db.query('SELECT sender_id FROM messages WHERE id = $1 AND deleted_at IS NULL', [id]);
+    if (msgResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+    if (msgResult.rows[0].sender_id !== req.user.id) {
+      return res.status(403).json({ error: 'Can only edit your own messages' });
+    }
+
+    const sanitized = sanitizeBody(body);
+    await db.query('UPDATE messages SET body = $1, is_edited = TRUE, edited_at = NOW() WHERE id = $2', [sanitized, id]);
+
+    const io = req.app.get('io');
+    if (io) {
+      const msgConv = await db.query('SELECT conversation_id FROM messages WHERE id = $1', [id]);
+      if (msgConv.rows.length > 0) {
+        io.to(`conv:${msgConv.rows[0].conversation_id}`).emit('message:edited', {
+          messageId: parseInt(id),
+          conversationId: msgConv.rows[0].conversation_id,
+          body: sanitized,
+          editedAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/chat/conversations/:id/mute — toggle mute
+router.patch('/conversations/:id/mute', authenticate, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { muted } = req.body;
+    if (!(await isParticipant(id, req.user.id))) {
+      return res.status(403).json({ error: 'Not a participant' });
+    }
+    await db.query(
+      'UPDATE conversation_participants SET is_muted = $3 WHERE conversation_id = $1 AND user_id = $2',
+      [id, req.user.id, !!muted]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/chat/upload-profile-picture — upload user profile picture
+router.post('/upload-profile-picture', authenticate, upload.single('file'), (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    const baseUrl = UPLOAD_BASE_URL || `${req.protocol}://${req.get('host')}/uploads`;
+    const fileUrl = `${baseUrl}/${req.file.filename}`;
+    db.query('UPDATE users SET profile_picture = $1 WHERE id = $2', [fileUrl, req.user.id])
+      .then(() => res.status(201).json({ url: fileUrl }))
+      .catch(next);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/chat/conversations/:id/pinned — get pinned message
+router.get('/conversations/:id/pinned', authenticate, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!(await isParticipant(id, req.user.id))) {
+      return res.status(403).json({ error: 'Not a participant' });
+    }
+    const result = await db.query(
+      `SELECT m.id, m.body, m.attachment_url, m.attachment_type, m.sender_id, u.name as sender_name, m.created_at
+       FROM conversation_participants cp
+       JOIN messages m ON m.id = cp.pinned_message_id
+       JOIN users u ON u.id = m.sender_id
+       WHERE cp.conversation_id = $1 AND cp.user_id = $2 AND m.deleted_at IS NULL`,
+      [id, req.user.id]
+    );
+    res.json({ pinnedMessage: result.rows[0] || null });
   } catch (err) {
     next(err);
   }

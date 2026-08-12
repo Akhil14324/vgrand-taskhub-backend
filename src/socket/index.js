@@ -341,9 +341,143 @@ function setupSocketIO(io) {
       }
     });
 
+    socket.on('edit_message', async (data, ack) => {
+      try {
+        const { messageId, body } = data || {};
+        if (!messageId || !body) {
+          if (ack) ack({ error: 'messageId and body are required' });
+          return;
+        }
+
+        const msgResult = await db.query('SELECT conversation_id, sender_id FROM messages WHERE id = $1 AND deleted_at IS NULL', [messageId]);
+        if (msgResult.rows.length === 0) {
+          if (ack) ack({ error: 'Message not found' });
+          return;
+        }
+        const { conversation_id: conversationId, sender_id: senderId } = msgResult.rows[0];
+
+        if (senderId !== socket.userId) {
+          if (ack) ack({ error: 'Can only edit your own messages' });
+          return;
+        }
+
+        const sanitized = sanitizeBody(body);
+        if (!sanitized) {
+          if (ack) ack({ error: 'Body cannot be empty' });
+          return;
+        }
+
+        await db.query(
+          'UPDATE messages SET body = $1, is_edited = TRUE, edited_at = NOW() WHERE id = $2',
+          [sanitized, messageId]
+        );
+
+        io.to(`conv:${conversationId}`).emit('message:edited', {
+          messageId,
+          conversationId: Number(conversationId),
+          body: sanitized,
+          editedAt: new Date().toISOString(),
+        });
+
+        if (ack) ack({ ok: true });
+      } catch (err) {
+        console.error('[socket] edit_message error:', err.message);
+        if (ack) ack({ error: 'Failed to edit' });
+      }
+    });
+
+    socket.on('pin_message', async (data, ack) => {
+      try {
+        const { conversationId, messageId } = data || {};
+        if (!conversationId || !messageId) {
+          if (ack) ack({ error: 'conversationId and messageId are required' });
+          return;
+        }
+
+        if (!(await isParticipant(conversationId, socket.userId))) {
+          if (ack) ack({ error: 'Not a participant' });
+          return;
+        }
+
+        await db.query(
+          'UPDATE conversation_participants SET pinned_message_id = $3 WHERE conversation_id = $1 AND user_id = $2',
+          [conversationId, socket.userId, messageId]
+        );
+
+        if (ack) ack({ ok: true });
+      } catch (err) {
+        console.error('[socket] pin_message error:', err.message);
+        if (ack) ack({ error: 'Failed to pin' });
+      }
+    });
+
+    socket.on('forward_message', async (data, ack) => {
+      try {
+        const { messageId, targetConversationId } = data || {};
+        if (!messageId || !targetConversationId) {
+          if (ack) ack({ error: 'messageId and targetConversationId are required' });
+          return;
+        }
+
+        const msgResult = await db.query('SELECT body, attachment_url, attachment_type FROM messages WHERE id = $1 AND deleted_at IS NULL', [messageId]);
+        if (msgResult.rows.length === 0) {
+          if (ack) ack({ error: 'Message not found' });
+          return;
+        }
+        const msg = msgResult.rows[0];
+
+        if (!(await isParticipant(targetConversationId, socket.userId))) {
+          if (ack) ack({ error: 'Not a participant in target conversation' });
+          return;
+        }
+
+        const result = await db.query(
+          `INSERT INTO messages (conversation_id, sender_id, body, attachment_url, attachment_type)
+           VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
+          [targetConversationId, socket.userId, msg.body, msg.attachment_url, msg.attachment_type]
+        );
+
+        const newMsg = result.rows[0];
+        const message = {
+          id: newMsg.id,
+          conversationId: Number(targetConversationId),
+          senderId: socket.userId,
+          senderName: socket.userName,
+          body: msg.body,
+          attachmentUrl: msg.attachment_url,
+          attachmentType: msg.attachment_type,
+          replyToId: null,
+          replyTo: null,
+          createdAt: newMsg.created_at,
+        };
+
+        await db.query('UPDATE conversations SET updated_at = NOW() WHERE id = $1', [targetConversationId]);
+        await db.query(
+          'UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1',
+          [targetConversationId]
+        );
+
+        io.to(`conv:${targetConversationId}`).emit('message:new', message);
+
+        if (ack) ack({ ok: true, message });
+      } catch (err) {
+        console.error('[socket] forward_message error:', err.message);
+        if (ack) ack({ error: 'Failed to forward' });
+      }
+    });
+
+    socket.on('update_last_seen', async () => {
+      try {
+        await db.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [socket.userId]);
+      } catch (err) {
+        console.error('[socket] update_last_seen error:', err.message);
+      }
+    });
+
     socket.on('disconnect', () => {
       const stillOnline = removePresence(socket.userId, socket.id);
       if (!stillOnline) {
+        db.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [socket.userId]).catch(() => {});
         io.emit('presence:update', { userId: socket.userId, online: false });
       }
     });
