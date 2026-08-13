@@ -1,0 +1,13 @@
+Admin delete, soft-delete, edit window, deleted_by tracking
+
+- Migration 026: add deleted_by column to messages table
+- chat.js: "delete for everyone" now soft-deletes instead of permanent delete
+- chat.js: admin can delete any message (no time limit), sender within 15-min window
+- chat.js: 30-min edit window enforcement on PATCH /messages/:id
+- chat.js: include deleted_by in all message SELECT queries
+- chat.js: socket emits deletedBy ('admin' or 'sender') on message:deleted
+- constants/chat.js: add EDIT_WINDOW_MS (30 minutes)
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>

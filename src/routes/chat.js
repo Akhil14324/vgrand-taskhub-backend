@@ -6,7 +6,7 @@ const stream = require('stream');
 const { promisify } = require('util');
 const db = require('../db');
 const { authenticate, requireAdmin } = require('../middleware/auth');
-const { DELETE_FOR_EVERYONE_WINDOW_MS } = require('../constants/chat');
+const { DELETE_FOR_EVERYONE_WINDOW_MS, EDIT_WINDOW_MS } = require('../constants/chat');
 const cloudinary = require('../utils/cloudinary');
 
 const router = express.Router();
@@ -385,7 +385,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
     let query, params;
     if (after) {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.reply_to_id
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.deleted_by, m.reply_to_id
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $4
                WHERE m.conversation_id = $1 AND m.id > $2 AND md.message_id IS NULL
@@ -393,7 +393,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
       params = [id, parseInt(after), lim, req.user.id];
     } else if (before) {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.reply_to_id
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.deleted_by, m.reply_to_id
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $4
                WHERE m.conversation_id = $1 AND m.id < $2 AND md.message_id IS NULL
@@ -401,7 +401,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
       params = [id, parseInt(before), lim, req.user.id];
     } else {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.reply_to_id
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.deleted_by, m.reply_to_id
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $3
                WHERE m.conversation_id = $1 AND md.message_id IS NULL
@@ -637,7 +637,7 @@ router.delete('/messages/:id', authenticate, async (req, res, next) => {
       const isAdmin = ['admin', 'super_admin'].includes(req.user.role);
 
       if (!isSender && !isAdmin) {
-        return res.status(403).json({ error: 'Only the sender can delete this message' });
+        return res.status(403).json({ error: 'Only the sender or an admin can delete this message' });
       }
 
       if (!isAdmin) {
@@ -647,31 +647,23 @@ router.delete('/messages/:id', authenticate, async (req, res, next) => {
         }
       }
 
-      const attachmentUrl = msg.attachment_url;
+      const deletedAt = new Date().toISOString();
 
-      // Permanently delete the message and all related records
-      await db.query('DELETE FROM message_deletions WHERE message_id = $1', [id]);
-      await db.query('DELETE FROM messages WHERE id = $1', [id]);
-
-      if (attachmentUrl) {
-        try {
-          const filename = path.basename(attachmentUrl);
-          const filePath = path.join(UPLOAD_DIR, filename);
-          if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-          }
-        } catch (e) {
-          console.error('[chat] Failed to delete attachment file:', e.message);
-        }
-      }
+      // Soft-delete: mark as deleted, clear content, track who deleted it
+      await db.query(
+        `UPDATE messages SET deleted_at = $1, deleted_by = $2, body = NULL, attachment_url = NULL, attachment_type = NULL WHERE id = $3`,
+        [deletedAt, userId, id]
+      );
 
       const io = req.app.get('io');
       if (io) {
         io.to(`conv:${msg.conversation_id}`).emit('message:deleted', {
           conversationId: msg.conversation_id,
           messageId: parseInt(id),
-          deletedAt: new Date().toISOString(),
-          permanent: true,
+          deletedAt,
+          permanent: false,
+          deletedBy: isAdmin && !isSender ? 'admin' : 'sender',
+          deletedByName: req.user.name || null,
         });
       }
 
@@ -742,12 +734,16 @@ router.patch('/messages/:id', authenticate, async (req, res, next) => {
       return res.status(400).json({ error: 'Body is required' });
     }
 
-    const msgResult = await db.query('SELECT sender_id FROM messages WHERE id = $1 AND deleted_at IS NULL', [id]);
+    const msgResult = await db.query('SELECT sender_id, created_at FROM messages WHERE id = $1 AND deleted_at IS NULL', [id]);
     if (msgResult.rows.length === 0) {
       return res.status(404).json({ error: 'Message not found' });
     }
     if (msgResult.rows[0].sender_id !== req.user.id) {
       return res.status(403).json({ error: 'Can only edit your own messages' });
+    }
+    const elapsed = Date.now() - new Date(msgResult.rows[0].created_at).getTime();
+    if (elapsed > EDIT_WINDOW_MS) {
+      return res.status(403).json({ error: 'Edit window has expired' });
     }
 
     const sanitized = sanitizeBody(body);
