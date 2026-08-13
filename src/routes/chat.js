@@ -200,7 +200,7 @@ router.get('/conversations', authenticate, async (req, res, next) => {
              'id', u.id, 'name', u.name, 'role', u.role,
             'status', u.status, 'business_id', u.business_id,
             'profile_picture', u.profile_picture, 'last_seen', u.last_seen,
-            'is_admin', cp.is_admin
+            'is_admin', cu.is_admin
           ) ORDER BY u.name) AS participants
          FROM (
            SELECT DISTINCT cp.conversation_id, cp.user_id, cp.is_admin
