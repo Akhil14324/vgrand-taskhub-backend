@@ -419,12 +419,17 @@ function setupSocketIO(io) {
           return;
         }
 
-        const msgResult = await db.query('SELECT body, attachment_url, attachment_type FROM messages WHERE id = $1 AND deleted_at IS NULL', [messageId]);
+        const msgResult = await db.query('SELECT conversation_id, body, attachment_url, attachment_type FROM messages WHERE id = $1 AND deleted_at IS NULL', [messageId]);
         if (msgResult.rows.length === 0) {
           if (ack) ack({ error: 'Message not found' });
           return;
         }
         const msg = msgResult.rows[0];
+
+        if (!(await isParticipant(msg.conversation_id, socket.userId))) {
+          if (ack) ack({ error: 'Not a participant in source conversation' });
+          return;
+        }
 
         if (!(await isParticipant(targetConversationId, socket.userId))) {
           if (ack) ack({ error: 'Not a participant in target conversation' });

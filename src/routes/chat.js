@@ -2,9 +2,12 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const stream = require('stream');
+const { promisify } = require('util');
 const db = require('../db');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const { DELETE_FOR_EVERYONE_WINDOW_MS } = require('../constants/chat');
+const cloudinary = require('../utils/cloudinary');
 
 const router = express.Router();
 
@@ -12,19 +15,22 @@ const MAX_MESSAGE_LENGTH = 5000;
 const MAX_UPLOAD_SIZE = parseInt(process.env.UPLOAD_MAX_SIZE || '5242880', 10);
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', '..', 'uploads');
 const UPLOAD_BASE_URL = process.env.UPLOAD_BASE_URL || '';
+const USE_CLOUDINARY = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
 
-if (!fs.existsSync(UPLOAD_DIR)) {
+if (!USE_CLOUDINARY && !fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname || '');
-    const name = `chat_${Date.now()}_${Math.round(Math.random() * 1e9)}${ext}`;
-    cb(null, name);
-  },
-});
+const storage = USE_CLOUDINARY
+  ? multer.memoryStorage()
+  : multer.diskStorage({
+      destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+      filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname || '');
+        const name = `chat_${Date.now()}_${Math.round(Math.random() * 1e9)}${ext}`;
+        cb(null, name);
+      },
+    });
 
 const upload = multer({
   storage,
@@ -157,7 +163,7 @@ router.get('/conversations', authenticate, async (req, res, next) => {
     const result = await db.query(
       `WITH user_convs AS (
          SELECT c.id, c.name, c.type, c.business_id, c.created_at, c.updated_at,
-                cp.is_admin AS is_group_admin, cp.last_read_message_id
+                cp.is_admin AS is_group_admin, cp.last_read_message_id, cp.is_muted
          FROM conversations c
          JOIN conversation_participants cp ON cp.conversation_id = c.id
          WHERE cp.user_id = $1 AND cp.is_hidden = FALSE
@@ -193,14 +199,15 @@ router.get('/conversations', authenticate, async (req, res, next) => {
            json_agg(json_build_object(
              'id', u.id, 'name', u.name, 'role', u.role,
             'status', u.status, 'business_id', u.business_id,
-            'profile_picture', u.profile_picture, 'last_seen', u.last_seen
+            'profile_picture', u.profile_picture, 'last_seen', u.last_seen,
+            'is_admin', cp.is_admin
           ) ORDER BY u.name) AS participants
          FROM (
-           SELECT DISTINCT cp.conversation_id, cp.user_id
+           SELECT DISTINCT cp.conversation_id, cp.user_id, cp.is_admin
            FROM conversation_participants cp
            WHERE 1=1 ${invisibleFilter}
            UNION
-           SELECT DISTINCT m.conversation_id, m.sender_id
+           SELECT DISTINCT m.conversation_id, m.sender_id, FALSE AS is_admin
            FROM messages m
            WHERE m.conversation_id IN (SELECT id FROM user_convs)
          ) cu
@@ -232,6 +239,7 @@ router.get('/conversations', authenticate, async (req, res, next) => {
       created_at: row.created_at,
       updated_at: row.updated_at,
       is_group_admin: row.is_group_admin,
+      is_muted: row.is_muted || false,
       last_read_message_id: row.last_read_message_id,
       participants: row.participants || [],
       last_message: row.last_msg_id ? {
@@ -677,10 +685,30 @@ router.delete('/messages/:id', authenticate, async (req, res, next) => {
 });
 
 // POST /api/chat/upload — image/file/audio upload for attachments
-router.post('/upload', authenticate, upload.single('file'), (req, res, next) => {
+router.post('/upload', authenticate, upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
+    }
+    if (USE_CLOUDINARY) {
+      const ext = path.extname(req.file.originalname || '');
+      const publicId = `chat/${Date.now()}_${Math.round(Math.random() * 1e9)}`;
+      const resourceType = req.file.mimetype.startsWith('image/') ? 'image' : 'raw';
+      const result = await new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          { public_id: publicId, resource_type: resourceType, format: ext.replace('.', '') || undefined },
+          (err, result) => (err ? reject(err) : resolve(result)),
+        );
+        const bufferStream = new stream.PassThrough();
+        bufferStream.end(req.file.buffer);
+        bufferStream.pipe(uploadStream);
+      });
+      return res.status(201).json({
+        url: result.secure_url,
+        type: req.file.mimetype,
+        filename: req.file.originalname,
+        size: req.file.size,
+      });
     }
     const baseUrl = UPLOAD_BASE_URL || `${req.protocol}://${req.get('host')}/uploads`;
     const fileUrl = `${baseUrl}/${req.file.filename}`;
@@ -753,16 +781,30 @@ router.patch('/conversations/:id/mute', authenticate, async (req, res, next) => 
 });
 
 // POST /api/chat/upload-profile-picture — upload user profile picture
-router.post('/upload-profile-picture', authenticate, upload.single('file'), (req, res, next) => {
+router.post('/upload-profile-picture', authenticate, upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
-    const baseUrl = UPLOAD_BASE_URL || `${req.protocol}://${req.get('host')}/uploads`;
-    const fileUrl = `${baseUrl}/${req.file.filename}`;
-    db.query('UPDATE users SET profile_picture = $1 WHERE id = $2', [fileUrl, req.user.id])
-      .then(() => res.status(201).json({ url: fileUrl }))
-      .catch(next);
+    let fileUrl;
+    if (USE_CLOUDINARY) {
+      const publicId = `profiles/${req.user.id}_${Date.now()}`;
+      const result = await new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          { public_id: publicId, resource_type: 'image' },
+          (err, result) => (err ? reject(err) : resolve(result)),
+        );
+        const bufferStream = new stream.PassThrough();
+        bufferStream.end(req.file.buffer);
+        bufferStream.pipe(uploadStream);
+      });
+      fileUrl = result.secure_url;
+    } else {
+      const baseUrl = UPLOAD_BASE_URL || `${req.protocol}://${req.get('host')}/uploads`;
+      fileUrl = `${baseUrl}/${req.file.filename}`;
+    }
+    await db.query('UPDATE users SET profile_picture = $1 WHERE id = $2', [fileUrl, req.user.id]);
+    res.status(201).json({ url: fileUrl });
   } catch (err) {
     next(err);
   }
@@ -784,6 +826,65 @@ router.get('/conversations/:id/pinned', authenticate, async (req, res, next) => 
       [id, req.user.id]
     );
     res.json({ pinnedMessage: result.rows[0] || null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/chat/conversations/:id/pinned — pin a message (REST fallback)
+router.put('/conversations/:id/pinned', authenticate, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { messageId } = req.body;
+    if (!messageId) {
+      return res.status(400).json({ error: 'messageId is required' });
+    }
+    if (!(await isParticipant(id, req.user.id))) {
+      return res.status(403).json({ error: 'Not a participant' });
+    }
+    await db.query(
+      'UPDATE conversation_participants SET pinned_message_id = $3 WHERE conversation_id = $1 AND user_id = $2',
+      [id, req.user.id, messageId]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/chat/last-seen — update user's last seen timestamp (REST fallback)
+router.patch('/last-seen', authenticate, async (req, res, next) => {
+  try {
+    await db.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [req.user.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/chat/conversations/:id/leave — leave a group conversation
+router.delete('/conversations/:id/leave', authenticate, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const convCheck = await db.query('SELECT type FROM conversations WHERE id = $1', [id]);
+    if (convCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    if (convCheck.rows[0].type !== 'group') {
+      return res.status(400).json({ error: 'Can only leave group conversations' });
+    }
+    const partCheck = await db.query(
+      'SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+    if (partCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Not a participant' });
+    }
+    await db.query(
+      'DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }
