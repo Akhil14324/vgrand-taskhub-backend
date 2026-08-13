@@ -694,9 +694,19 @@ router.post('/upload', authenticate, upload.single('file'), async (req, res, nex
       const ext = path.extname(req.file.originalname || '');
       const publicId = `chat/${Date.now()}_${Math.round(Math.random() * 1e9)}`;
       const resourceType = req.file.mimetype.startsWith('image/') ? 'image' : 'raw';
+      const isImage = req.file.mimetype.startsWith('image/');
+      const uploadOpts = {
+        public_id: publicId,
+        resource_type: resourceType,
+        format: ext.replace('.', '') || undefined,
+      };
+      if (isImage) {
+        uploadOpts.quality = 'auto';
+        uploadOpts.fetch_format = 'auto';
+      }
       const result = await new Promise((resolve, reject) => {
         const uploadStream = cloudinary.uploader.upload_stream(
-          { public_id: publicId, resource_type: resourceType, format: ext.replace('.', '') || undefined },
+          uploadOpts,
           (err, result) => (err ? reject(err) : resolve(result)),
         );
         const bufferStream = new stream.PassThrough();
