@@ -1,68 +1,161 @@
 # vgrand-taskhub-backend
 
-Node/Express + PostgreSQL backend for TaskHub — multi-business task monitoring with real-time chat.
+Node/Express + PostgreSQL backend for TaskHub — the VGrand group's internal app for tasks, personal to-dos, the organisation hierarchy and real-time chat.
 
 ## Features
 
-- JWT auth (user, admin, super_admin roles)
-- Business scoping (users assigned to one or more businesses via `user_businesses`)
-- Task CRUD with warnings, overdue notifications
-- **Real-time chat** (1:1 and group) via Socket.IO
-- File/image upload for chat attachments (multer, local disk)
+- JWT auth (user, admin, super_admin roles) plus an **organisation hierarchy** (Chairman → Chief of Staff → Directors → business heads → managers/accountants/… → members)
+- Business scoping via `user_businesses` (each membership has a `designation`)
+- Tasks across businesses: priority, review/approval flow, comments & activity, warnings, overdue alerts, deletion requests that go up the chain of command
+- Personal **to-dos** (Todoist-style): lists, due dates/times, reminders, recurrence, @mentions that add the to-do to someone else's list, sharing into chat
+- **Real-time chat** (1:1 and group) via Socket.IO, @mentions (and `@all` in groups)
+- **Push notifications** through Firebase Cloud Messaging (web/PWA) and Expo (native)
 
 ## Setup
 
 ```bash
 npm install
 cp .env.example .env   # edit values
-npm run migrate         # run SQL migrations
+npm run migrate         # run SQL migrations (+ one-time organisation seed)
 npm run dev             # start dev server
+npm test                # unit tests (node --test)
 ```
 
-## Chat Feature
+The server also runs pending migrations on startup.
 
-### Dependencies
+### Organisation seed
 
-- `socket.io` — WebSocket server for real-time messaging
-- `multer` — file upload middleware for chat attachments
+On first start (`SEED_ORGANIZATION=true`, default) `src/seed/organization.js` creates the four businesses (VGrand Family Restaurant, VGrand Infra, VTech, BVL Mines & Minerals) and the people:
 
-### Environment Variables
-
-| Variable | Description | Default |
+| Username | Name | Position |
 |---|---|---|
-| `UPLOAD_DIR` | Local directory for uploaded files | `./uploads` |
-| `UPLOAD_MAX_SIZE` | Max upload size in bytes | `5242880` (5MB) |
-| `UPLOAD_BASE_URL` | Base URL for serving uploaded files (e.g. CDN) | Auto-derived from request |
+| `vinod` | T Vinod Kumar | Chairman (level 1, super admin) |
+| `kaushal` | Kaushal | Chief of Staff (level 2) + Head of VTech |
+| `akhil` | V Akhil | Director (level 3) |
+| `varun` | N Varun Kumar | Director (level 3) |
+| `chandrasekhar` | Chandrasekhar | Head, VGrand Family Restaurant |
+| `srinivas` | Srinivas | Head, BVL Mines & Minerals |
+| `nagarjuna` | Nagarjuna | Head, VGrand Infra |
+| `ashok` | Ashok Kumar | Head, VGrand Infra |
 
-### Socket.IO Event Contract
+New accounts get `SEED_DEFAULT_PASSWORD` and must change it on first login. An existing account with the same username is placed in the hierarchy instead (its password is untouched). Existing businesses whose names match are reused. The seed runs once (marker `seed:organization-v1` in the `migrations` table); afterwards everything is managed from the app's Organisation screen.
+
+### Chain of command
+
+Levels (lower = more senior): `0` system owner (`Superadmin` account), `1` Chairman, `2` Chief of Staff, `3` Director, `4` Head, `5` Manager, `6` Accountant / Supervisor / Coordinator, `7` Member, `8` Intern. A person's level inside a business is the most senior of their leadership tier and their designation there. See `src/utils/org.js`.
+
+- Only someone **strictly more senior** can manage, delete, reset the password of, or change the role of another person.
+- The Organisation portal (`/api/org/people…`) is for levels ≤ 2 (Chairman, Chief of Staff). Heads/managers can add people junior to them to their own business.
+- Tasks: the creator or anyone senior to the creator can edit/delete; others can **request deletion**, which goes to the creator and the next tier up. Tasks with "review before closing" go to `in_review` when the assignee finishes; the creator or anyone senior to the finisher approves or requests changes.
+
+### Environment variables
+
+See `.env.example`. Notable ones:
+
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` / `DIRECT_URL` | Pooled / direct Postgres URLs (migrations use the direct one) |
+| `DATABASE_SSL` | `true`/`false` to force TLS; auto-on for Render, Supabase, Railway, Neon |
+| `CLIENT_URL` | Comma-separated allowed origins (your PWA URL) or `*` |
+| `APP_TIMEZONE` | Timezone for "today" and to-do reminders (default `Asia/Kolkata`) |
+| `FIREBASE_SERVICE_ACCOUNT` | Service-account JSON (raw or base64) for FCM — or use `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY` |
+| `SEED_ORGANIZATION`, `SEED_DEFAULT_PASSWORD` | One-time organisation seed |
+| `UPLOAD_DIR`, `UPLOAD_MAX_SIZE`, `UPLOAD_BASE_URL`, `CLOUDINARY_*` | Chat attachments |
+
+## Notifications
+
+`src/utils/notify.js` → `notify(userIds, { type, title, body, data })` stores an in-app notification, emits `notification:new` to each user's socket room and sends a push. `src/utils/push.js` sends **data-only** FCM messages to web tokens (the PWA service worker decides whether to show a system notification or an in-app banner) and Expo pushes to native tokens. Chat messages push without being stored; @mentions are stored and push even when a chat is muted.
+
+`data` carries deep-link ids: `conversationId`, `taskId`, `todoId`, `approvalId`.
+
+Jobs: `jobs/overdueNotifications.js` (daily) and `jobs/todoReminders.js` (every minute, for to-dos with a due time).
+
+## Socket.IO Event Contract
+
+Each socket joins `user:<id>` (personal room) on connect and `conv:<id>` rooms via `join_conversations`.
 
 **Client emits:**
 - `join_conversations` — `{ conversationIds: number[] }`
-- `send_message` — `{ conversationId, body?, attachmentUrl?, attachmentType?, clientTempId? }` (ack callback)
+- `send_message` — `{ conversationId, body?, attachmentUrl?, attachmentType?, clientTempId?, replyToId? }` (ack callback)
 - `typing_start` / `typing_stop` — `{ conversationId }`
 - `mark_read` — `{ conversationId, messageId }`
+- `react_to_message` — `{ messageId, emoji }` (ack)
+- `edit_message` — `{ messageId, body }` (ack)
+- `pin_message` — `{ conversationId, messageId }` (ack)
+- `forward_message` — `{ messageId, targetConversationId }` (ack)
+- `update_last_seen`
 
 **Server emits:**
-- `message:new` — `{ id, conversationId, senderId, senderName, body, attachmentUrl, attachmentType, createdAt }`
+- `message:new` — `{ id, conversationId, senderId, senderName, body, attachmentUrl, attachmentType, replyToId, replyTo, meta, createdAt }` (`meta.kind === 'todos'` for shared to-do cards)
 - `message:read` — `{ conversationId, userId, lastReadMessageId }`
+- `message:reaction`, `message:edited`, `message:deleted`, `conversation:deleted`
 - `typing:update` — `{ conversationId, userId, userName, typing }`
-- `presence:update` — `{ userId, online }`
-- `conversation:updated` — `{ conversationId, lastMessagePreview, lastMessageAt }`
+- `presence:update` — `{ userId, online }`; `presence:snapshot` — `{ userIds }` sent on connect
+- `conversation:updated` — `{ conversationId, messageId, lastMessagePreview, lastMessageAt }` (personal room)
+- `notification:new` — the stored notification row (personal room)
+- `todo:changed` — `{ todoId, action }` (personal rooms of the to-do's members)
+- `task:changed` — `{ taskId, businessId, action }` (broadcast)
 
-### REST Endpoints (`/api/chat`)
+## REST Endpoints
+
+### Chat (`/api/chat`)
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/conversations` | List user's conversations with unread counts |
+| GET | `/users` | Everyone you can start a chat with (all active colleagues) |
+| GET | `/conversations` | Your conversations with unread counts |
 | POST | `/conversations` | Create direct or group conversation |
-| GET | `/conversations/:id/messages` | Paginated message history (`?before=<id>` or `?after=<id>`) |
-| POST | `/conversations/:id/messages` | REST fallback send |
+| GET | `/conversations/:id/messages` | Paginated history (`?before=<id>` or `?after=<id>`) |
+| POST | `/conversations/:id/messages` | REST fallback send (same fan-out as the socket) |
 | PATCH | `/conversations/:id/read` | Mark read up to message ID |
 | POST | `/upload` | Upload image/file attachment |
 
-### Migration
+### Tasks (`/api/tasks`)
 
-Run `npm run migrate` to apply `010_create_chat_tables.sql` which creates:
-- `conversations` — direct or group chats
-- `conversation_participants` — junction with `last_read_message_id` for read tracking
-- `messages` — text + attachment support, soft delete
+| Method | Path | Description |
+|---|---|---|
+| GET | `/?view=all\|mine\|delegated&status&business_id&priority&q` | Tasks you can see, with `permissions` flags |
+| GET | `/summary` | Badge counts (mine open, delegated, overdue, done this week) |
+| GET | `/assignees?business_id=` | People a task in that business can be assigned to |
+| GET | `/:id` | Task + activity timeline |
+| POST | `/` | Create (any business; `assigned_user_id`, `priority`, `requires_approval`) |
+| PUT | `/:id` | Edit / reassign |
+| PUT | `/:id/status` | `pending` · `in_progress` · `completed` (→ `in_review` if approval needed) · `on_hold` |
+| POST | `/:id/approve`, `/:id/reject` | Review decision (`note`) |
+| POST | `/:id/comments` | Comment (`@mentions` notify) |
+| PUT | `/:id/warn` | Warn the assignee (must be senior) |
+| DELETE | `/:id` | Delete (creator or senior) |
+| POST | `/:id/request-delete` | Ask the chain of command to delete |
+
+`PUT /:id/complete` and `PUT /:id/hold` remain for older clients.
+
+### Approvals (`/api/approvals`)
+
+`GET /` (reviews + requests waiting on you, your own requests) · `POST /:id/decide` `{ decision: approve|reject, note }` · `DELETE /:id` (withdraw).
+
+### To-dos (`/api/todos`)
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/` | Your lists and to-dos (open + done in the last 30 days) |
+| GET | `/insights` | Completions per day (7 days) and streak |
+| POST | `/` | Create `{ title, notes, due_date, due_time, priority, list_id, recurrence, mention_ids }` — @usernames in the title add those people |
+| PUT | `/:id` | Edit; `list_id` moves it in *your* list only |
+| POST | `/:id/toggle` | Tick/untick (recurring ones roll to the next date) |
+| DELETE | `/:id` | Creator deletes for everyone; others leave it |
+| DELETE | `/:id/members/:userId` | Remove someone from a shared to-do |
+| POST | `/share` | `{ conversation_ids, todo_ids, title?, note? }` → checklist card in chat |
+| POST | `/import` | Copy shared items into your list |
+| POST/PUT/DELETE | `/lists`, `/lists/:id` | Manage lists |
+
+### Organisation (`/api/org`)
+
+`GET /structure` (org chart, everyone) · `GET /directory?q=` (people for @mentions/pickers) · `GET /catalog` · portal only: `GET/POST /people`, `PUT /people/:id`, `PUT /people/:id/password`, `DELETE /people/:id` · `PUT/DELETE /businesses/:id/members/:userId` (portal, or heads/managers for people junior to them).
+
+### Notifications (`/api/notifications`)
+
+`GET /` · `GET /unread-count` · `PUT /:id/read` · `PUT /read-all` · `DELETE /read` · `POST /push-token` `{ token, platform, provider: fcm|expo }` · `DELETE /push-token` · `GET /push-status` · `POST /test`.
+
+## Migrations
+
+SQL files in `src/migrations/` run in filename order and are tracked in the `migrations` table. `027_org_todos_approvals.sql` adds the hierarchy columns, task workflow, approvals, to-dos, notification data and FCM token support.

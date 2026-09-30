@@ -56,6 +56,30 @@ async function createBusinessGroup(businessId, businessName, createdByUserId) {
   }
 }
 
+const BUSINESS_COLORS = ['indigo', 'red', 'orange', 'amber', 'green', 'teal', 'blue', 'purple', 'pink', 'gray'];
+
+// GET /api/businesses/directory — every business with its heads (any signed-in user,
+// used to raise tasks for other businesses)
+router.get('/directory', authenticate, async (req, res, next) => {
+  try {
+    const result = await db.query(
+      `SELECT b.id, b.name, b.type, b.color,
+         COALESCE(json_agg(json_build_object('id', u.id, 'name', u.name, 'username', u.username))
+           FILTER (WHERE u.id IS NOT NULL), '[]') AS heads,
+         EXISTS (SELECT 1 FROM user_businesses me WHERE me.business_id = b.id AND me.user_id = $1) AS is_member
+       FROM businesses b
+       LEFT JOIN user_businesses ub ON ub.business_id = b.id AND ub.designation = 'head'
+       LEFT JOIN users u ON u.id = ub.user_id AND u.status != 'inactive'
+       GROUP BY b.id
+       ORDER BY b.sort_order, b.name`,
+      [req.user.id]
+    );
+    res.json({ businesses: result.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/businesses/types — existing distinct business types
 router.get('/types', authenticate, requireAdmin, async (req, res, next) => {
   try {
@@ -87,7 +111,7 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
        FROM businesses b
        LEFT JOIN tasks t ON t.business_id = b.id
        GROUP BY b.id
-       ORDER BY b.name ASC
+       ORDER BY b.sort_order, b.name ASC
        LIMIT $1 OFFSET $2`,
       [limit, offset]
     );
@@ -111,16 +135,17 @@ router.post('/', authenticate, requireAdmin, async (req, res, next) => {
     const name = sanitizeText(req.body.name, 100);
     const type = sanitizeText(req.body.type, 50);
     const description = sanitizeText(req.body.description, 1000);
+    const color = BUSINESS_COLORS.includes(req.body.color) ? req.body.color : null;
 
     if (!name || !type) {
       return res.status(400).json({ error: 'Name and type are required' });
     }
 
     const result = await db.query(
-      `INSERT INTO businesses (name, type, description)
-       VALUES ($1, $2, $3)
+      `INSERT INTO businesses (name, type, description, color, sort_order)
+       VALUES ($1, $2, $3, $4, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM businesses))
        RETURNING *`,
-      [name, type, description || '']
+      [name, type, description || '', color]
     );
 
     const business = result.rows[0];
@@ -149,10 +174,11 @@ router.put('/:id', authenticate, requireAdmin, async (req, res, next) => {
       return res.status(400).json({ error: 'Name and type are required' });
     }
 
+    const color = BUSINESS_COLORS.includes(req.body.color) ? req.body.color : null;
     const result = await db.query(
-      `UPDATE businesses SET name = $1, type = $2, description = $3
+      `UPDATE businesses SET name = $1, type = $2, description = $3, color = COALESCE($5, color)
        WHERE id = $4 RETURNING *`,
-      [name, type, description || '', id]
+      [name, type, description || '', id, color]
     );
 
     if (result.rows.length === 0) {

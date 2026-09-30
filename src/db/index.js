@@ -1,9 +1,23 @@
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
 const dotenv = require('dotenv');
 
 dotenv.config();
 
+// Return Postgres DATE columns as plain 'YYYY-MM-DD' strings instead of JS Dates,
+// so calendar dates never shift across timezones on their way to the client.
+types.setTypeParser(1082, (value) => value);
+
 const isProduction = process.env.NODE_ENV === 'production';
+
+// Hosted Postgres (Render, Supabase, Railway, Neon) needs TLS; their certificates are
+// not always in Node's CA bundle, so accept them unless DATABASE_SSL=false.
+const MANAGED_HOSTS = ['render.com', 'supabase.co', 'supabase.com', 'railway.app', 'rlwy.net', 'neon.tech'];
+function sslFor(url) {
+  if (process.env.DATABASE_SSL === 'false') return undefined;
+  if (process.env.DATABASE_SSL === 'true') return { rejectUnauthorized: false };
+  if (url && MANAGED_HOSTS.some((host) => url.includes(host))) return { rejectUnauthorized: false };
+  return undefined;
+}
 
 const poolConfig = {
   connectionString: process.env.DATABASE_URL,
@@ -12,24 +26,19 @@ const poolConfig = {
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
   maxUses: 7500,
+  ssl: sslFor(process.env.DATABASE_URL),
 };
-
-if (isProduction && process.env.DATABASE_URL && process.env.DATABASE_URL.includes('render.com')) {
-  poolConfig.ssl = { rejectUnauthorized: false };
-}
 
 const pool = new Pool(poolConfig);
 
+const directUrl = process.env.DIRECT_URL || process.env.DATABASE_URL;
 const directPoolConfig = {
-  connectionString: process.env.DIRECT_URL || process.env.DATABASE_URL,
+  connectionString: directUrl,
   max: 5,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
+  ssl: sslFor(directUrl),
 };
-
-if (isProduction && process.env.DIRECT_URL && process.env.DIRECT_URL.includes('render.com')) {
-  directPoolConfig.ssl = { rejectUnauthorized: false };
-}
 
 const directPool = new Pool(directPoolConfig);
 

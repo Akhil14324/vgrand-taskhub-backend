@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const db = require('../db');
+const { seedOrganization } = require('../seed/organization');
 
 async function ensureMigrationsTable(directQuery) {
   await directQuery(`
@@ -66,6 +67,8 @@ async function runMigrations({ autoClose = true } = {}) {
     );
     console.log('  ✓ Admin user already exists (upgraded to super_admin and username set to Superadmin if needed)');
   }
+
+  await seedOrganization({ query: directQuery });
 
   if (autoClose) {
     await db.directPool.end();

@@ -1,570 +1,719 @@
 const express = require('express');
 const db = require('../db');
-const { authenticate, requireAdmin } = require('../middleware/auth');
+const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
-const { sendPushToUser, sendPushToUsers } = require('../utils/push');
+const { notify } = require('../utils/notify');
+const { resolveMentions } = require('../utils/mentions');
+const {
+  loadActor,
+  actorLevelIn,
+  isLeader,
+  managesBusiness,
+  nextApprovers,
+} = require('../utils/org');
+const {
+  TASK_SELECT,
+  decorateTask,
+  getTaskForActor,
+  recordActivity,
+  broadcastTaskChange,
+  clearWarnings,
+  businessMemberIds,
+} = require('../services/tasks');
 
 const router = express.Router();
 
-// GET /api/tasks?business_id=X&status=pending&page=1&limit=20
+const STATUS_LABELS = {
+  pending: 'To do',
+  in_progress: 'In progress',
+  in_review: 'In review',
+  completed: 'Completed',
+  on_hold: 'On hold',
+};
+
+function parsePriority(value, fallback = 4) {
+  const n = parseInt(value, 10);
+  return n >= 1 && n <= 4 ? n : fallback;
+}
+
+function parseDate(value) {
+  if (!value) return null;
+  const s = String(value).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+async function withActor(req, res) {
+  const actor = await loadActor(req.user.id);
+  if (!actor) {
+    res.status(401).json({ error: 'User no longer exists' });
+    return null;
+  }
+  return actor;
+}
+
+/** Is this user allowed to be assigned work in the business? (member or leadership) */
+async function isAssignable(userId, businessId) {
+  const result = await db.query(
+    `SELECT u.id FROM users u
+     LEFT JOIN user_businesses ub ON ub.user_id = u.id AND ub.business_id = $2
+     WHERE u.id = $1 AND u.status != 'inactive'
+       AND (ub.user_id IS NOT NULL OR u.org_level IS NOT NULL OR u.role IN ('admin', 'super_admin'))`,
+    [userId, businessId]
+  );
+  return result.rows.length > 0;
+}
+
+async function notifyMentions(text, explicitIds, actor, task, exclude = []) {
+  const mentioned = await resolveMentions(text, explicitIds);
+  const ids = mentioned.map((m) => m.id).filter((id) => id !== actor.id && !exclude.includes(id));
+  if (ids.length) {
+    await notify(ids, {
+      type: 'mention',
+      title: `${actor.name} mentioned you`,
+      body: `On task "${task.title}"`,
+      data: { taskId: task.id },
+    });
+  }
+  return ids;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/tasks?view=all|mine|delegated&business_id&status&priority&q&assigned_user_id&page&limit
+// ---------------------------------------------------------------------------
 router.get('/', authenticate, async (req, res, next) => {
   try {
-    const { business_id, status } = req.query;
+    const actor = await withActor(req, res);
+    if (!actor) return;
+
+    const { business_id, status, priority, q, assigned_user_id } = req.query;
+    const view = req.query.view || 'all';
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 100));
     const offset = (page - 1) * limit;
+
     const conditions = [];
     const params = [];
-    let paramIdx = 1;
+    const add = (sql, value) => {
+      params.push(value);
+      conditions.push(sql.replace('?', `$${params.length}`));
+    };
 
-    if (business_id) {
-      conditions.push(`t.business_id = $${paramIdx++}`);
-      params.push(business_id);
+    const memberBizIds = [...actor.memberships.keys()];
+    const managedBizIds = memberBizIds.filter((id) => managesBusiness(actor, id));
+
+    // Visibility: leaders see everything; others see their own work, their business's
+    // shared (unassigned) tasks, and everything in businesses they manage.
+    if (!isLeader(actor)) {
+      params.push(actor.id, memberBizIds, managedBizIds);
+      const [me, member, managed] = [params.length - 2, params.length - 1, params.length];
+      conditions.push(`(t.created_by = $${me} OR t.assigned_user_id = $${me}
+        OR t.business_id = ANY($${managed}::int[])
+        OR (t.business_id = ANY($${member}::int[]) AND t.assigned_user_id IS NULL))`);
+    }
+
+    if (view === 'mine') {
+      params.push(actor.id, memberBizIds);
+      const [me, member] = [params.length - 1, params.length];
+      conditions.push(`(t.assigned_user_id = $${me}
+        OR (t.assigned_user_id IS NULL AND t.business_id = ANY($${member}::int[]) AND t.created_by != $${me}))`);
+    } else if (view === 'delegated') {
+      params.push(actor.id);
+      conditions.push(`(t.created_by = $${params.length} AND (t.assigned_user_id IS NULL OR t.assigned_user_id != $${params.length}))`);
+    }
+
+    if (business_id) add('t.business_id = ?', parseInt(business_id));
+    if (assigned_user_id) add('t.assigned_user_id = ?', parseInt(assigned_user_id));
+    if (priority) add('t.priority = ?', parsePriority(priority));
+    if (q && String(q).trim()) {
+      params.push(`%${String(q).trim()}%`);
+      conditions.push(`(t.title ILIKE $${params.length} OR t.description ILIKE $${params.length})`);
     }
 
     if (status === 'warned') {
       conditions.push('t.is_warned = true');
-    } else if (status && ['pending', 'completed', 'on_hold'].includes(status)) {
-      conditions.push(`t.status = $${paramIdx++}`);
-      params.push(status);
+    } else if (status === 'overdue') {
+      conditions.push(`t.due_date < CURRENT_DATE AND t.status NOT IN ('completed', 'on_hold')`);
+    } else if (status === 'open') {
+      conditions.push(`t.status != 'completed'`);
+    } else if (status && STATUS_LABELS[status]) {
+      add('t.status = ?', status);
     }
 
-    // Non-admin users can only see tasks in businesses they're assigned to
-    // and only tasks assigned to them or unassigned (assigned_user_id IS NULL)
-    if (!['admin', 'super_admin'].includes(req.user.role)) {
-      conditions.push(`EXISTS (SELECT 1 FROM user_businesses ub WHERE ub.user_id = $${paramIdx++} AND ub.business_id = t.business_id)`);
-      params.push(req.user.id);
-      conditions.push(`(t.assigned_user_id IS NULL OR t.assigned_user_id = $${paramIdx++})`);
-      params.push(req.user.id);
-    }
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-    const countResult = await db.query(
-      `SELECT COUNT(*) FROM tasks t ${whereClause}`,
-      params
-    );
+    const countResult = await db.query(`SELECT COUNT(*) FROM tasks t ${whereClause}`, params);
     const total = parseInt(countResult.rows[0].count);
 
-    params.push(limit);
-    params.push(offset);
-
+    const listParams = [...params, limit, offset];
     const result = await db.query(
-      `SELECT t.*,
-         u.name AS created_by_name,
-         c.name AS completed_by_name,
-         b.name AS business_name,
-         b.type AS business_type,
-         a.name AS assigned_user_name,
-         w.message AS warning_message,
-         w.created_at AS warning_created_at
-       FROM tasks t
-       JOIN users u ON t.created_by = u.id
-       LEFT JOIN users c ON t.completed_by = c.id
-       LEFT JOIN users a ON t.assigned_user_id = a.id
-       JOIN businesses b ON t.business_id = b.id
-       LEFT JOIN LATERAL (
-         SELECT message, created_at FROM warnings
-         WHERE task_id = t.id
-         ORDER BY created_at DESC LIMIT 1
-       ) w ON true
+      `${TASK_SELECT}
        ${whereClause}
-       ORDER BY t.created_at DESC
-       LIMIT $${paramIdx++} OFFSET $${paramIdx++}`,
-      params
+       ORDER BY (t.status = 'completed'), t.priority ASC, t.due_date ASC NULLS LAST, t.created_at DESC
+       LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+      listParams
     );
 
     res.json({
-      tasks: result.rows,
-      pagination: {
-        page,
-        limit,
-        total,
-        total_pages: Math.ceil(total / limit),
-      },
+      tasks: result.rows.map((row) => decorateTask(row, actor)),
+      pagination: { page, limit, total, total_pages: Math.ceil(total / limit) },
     });
   } catch (err) {
     next(err);
   }
 });
 
-// POST /api/tasks
+// GET /api/tasks/summary — badge counts for the current user
+router.get('/summary', authenticate, async (req, res, next) => {
+  try {
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const memberBizIds = [...actor.memberships.keys()];
+    const result = await db.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status != 'completed' AND (assigned_user_id = $1
+           OR (assigned_user_id IS NULL AND business_id = ANY($2::int[]) AND created_by != $1))) AS mine_open,
+         COUNT(*) FILTER (WHERE status != 'completed' AND created_by = $1
+           AND (assigned_user_id IS NULL OR assigned_user_id != $1)) AS delegated_open,
+         COUNT(*) FILTER (WHERE status NOT IN ('completed', 'on_hold') AND due_date < CURRENT_DATE
+           AND (assigned_user_id = $1 OR created_by = $1)) AS overdue,
+         COUNT(*) FILTER (WHERE status = 'completed' AND completed_by = $1
+           AND completed_at > NOW() - INTERVAL '7 days') AS completed_week
+       FROM tasks`,
+      [actor.id, memberBizIds]
+    );
+    const row = result.rows[0];
+    res.json({
+      mine_open: parseInt(row.mine_open) || 0,
+      delegated_open: parseInt(row.delegated_open) || 0,
+      overdue: parseInt(row.overdue) || 0,
+      completed_week: parseInt(row.completed_week) || 0,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/tasks/assignees?business_id=X — people a task in this business can be assigned to
+router.get('/assignees', authenticate, async (req, res, next) => {
+  try {
+    const businessId = parseInt(req.query.business_id);
+    if (!businessId) return res.status(400).json({ error: 'business_id is required' });
+    const result = await db.query(
+      `SELECT u.id, u.name, u.username, u.profile_picture, u.org_level, u.role, u.title,
+              ub.designation, ub.title AS membership_title
+       FROM users u
+       LEFT JOIN user_businesses ub ON ub.user_id = u.id AND ub.business_id = $1
+       WHERE u.status != 'inactive'
+         AND (ub.user_id IS NOT NULL OR u.org_level IS NOT NULL)
+       ORDER BY u.org_level NULLS LAST, u.name`,
+      [businessId]
+    );
+    res.json({ users: result.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/tasks/:id — full task with activity timeline
+router.get('/:id', authenticate, async (req, res, next) => {
+  try {
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
+
+    const activity = await db.query(
+      `SELECT ta.id, ta.kind, ta.body, ta.meta, ta.created_at, ta.user_id,
+              u.name AS user_name, u.username AS user_username, u.profile_picture AS user_picture
+       FROM task_activity ta
+       LEFT JOIN users u ON u.id = ta.user_id
+       WHERE ta.task_id = $1
+       ORDER BY ta.created_at ASC, ta.id ASC`,
+      [task.id]
+    );
+    res.json({ task, activity: activity.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/tasks — create (any business, optionally assigned to a person)
+// ---------------------------------------------------------------------------
 router.post('/', authenticate, async (req, res, next) => {
   try {
+    const actor = await withActor(req, res);
+    if (!actor) return;
+
     const title = sanitizeText(req.body.title, 200);
     const description = sanitizeText(req.body.description, 5000);
-    const { due_date, business_id, assigned_user_id } = req.body;
+    const dueDate = parseDate(req.body.due_date);
+    const priority = parsePriority(req.body.priority);
+    let businessId = parseInt(req.body.business_id) || null;
+    const assignedUserId = parseInt(req.body.assigned_user_id) || null;
 
-    if (!title) {
-      return res.status(400).json({ error: 'Task title is required' });
+    if (!title) return res.status(400).json({ error: 'Task title is required' });
+
+    if (!businessId) {
+      businessId = [...actor.memberships.keys()][0] || null;
+      if (!businessId) return res.status(400).json({ error: 'Choose which business this task belongs to' });
     }
 
-    let taskBusinessId = business_id;
+    const bizCheck = await db.query('SELECT id, name FROM businesses WHERE id = $1', [businessId]);
+    if (bizCheck.rows.length === 0) return res.status(404).json({ error: 'Business not found' });
+    const business = bizCheck.rows[0];
 
-    // Non-admin users can only create tasks in businesses they're assigned to
-    if (!['admin', 'super_admin'].includes(req.user.role)) {
-      if (taskBusinessId) {
-        const accessCheck = await db.query(
-          'SELECT 1 FROM user_businesses WHERE user_id = $1 AND business_id = $2',
-          [req.user.id, taskBusinessId]
-        );
-        if (accessCheck.rows.length === 0) {
-          return res.status(403).json({ error: 'You can only create tasks in your assigned businesses' });
-        }
-      } else {
-        const userBiz = await db.query(
-          'SELECT business_id FROM user_businesses WHERE user_id = $1 LIMIT 1',
-          [req.user.id]
-        );
-        if (userBiz.rows.length === 0) {
-          return res.status(403).json({ error: 'You must be assigned to a business to create tasks' });
-        }
-        taskBusinessId = userBiz.rows[0].business_id;
-      }
+    if (assignedUserId && !(await isAssignable(assignedUserId, businessId))) {
+      return res.status(400).json({ error: 'That person is not part of this business' });
     }
 
-    if (!taskBusinessId) {
-      return res.status(400).json({ error: 'business_id is required' });
+    // Raised from outside the business → remember which business asked for it.
+    let sourceBusinessId = parseInt(req.body.source_business_id) || null;
+    if (!sourceBusinessId && !actor.memberships.has(businessId) && !isLeader(actor)) {
+      sourceBusinessId = [...actor.memberships.keys()][0] || null;
     }
 
-    // Verify business exists
-    const bizCheck = await db.query('SELECT id FROM businesses WHERE id = $1', [taskBusinessId]);
-    if (bizCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Business not found' });
+    // Review before completion defaults to on when you hand work to someone else.
+    const requiresApproval = req.body.requires_approval !== undefined
+      ? !!req.body.requires_approval
+      : !!(assignedUserId && assignedUserId !== actor.id);
+
+    const inserted = await db.query(
+      `INSERT INTO tasks (business_id, created_by, title, description, due_date, assigned_user_id,
+                          priority, requires_approval, source_business_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id`,
+      [businessId, actor.id, title, description || '', dueDate, assignedUserId, priority, requiresApproval, sourceBusinessId]
+    );
+    const taskId = inserted.rows[0].id;
+    await recordActivity(taskId, actor.id, 'created', null, {
+      assigned_user_id: assignedUserId,
+      business_id: businessId,
+    });
+
+    const { task } = await getTaskForActor(taskId, actor);
+    const priorityTag = priority === 1 ? '🔴 ' : priority === 2 ? '🟠 ' : '';
+
+    let notified = [];
+    if (assignedUserId && assignedUserId !== actor.id) {
+      notified = [assignedUserId];
+      await notify(notified, {
+        type: 'task_assigned',
+        title: `${priorityTag}${actor.name} assigned you a task`,
+        body: `${title} · ${business.name}`,
+        data: { taskId },
+      });
+    } else if (!assignedUserId) {
+      notified = await businessMemberIds(businessId, { excludeId: actor.id });
+      await notify(notified, {
+        type: 'task_added',
+        title: `${priorityTag}New task for ${business.name}`,
+        body: `${title} — from ${actor.name}`,
+        data: { taskId },
+      });
     }
+    await notifyMentions(description, req.body.mention_ids, actor, task, notified);
 
-    // Validate assigned_user_id if provided
-    let assignedUserId = null;
-    if (assigned_user_id) {
-      const userCheck = await db.query(
-        `SELECT u.id FROM users u
-         JOIN user_businesses ub ON ub.user_id = u.id
-         WHERE u.id = $1 AND ub.business_id = $2 AND u.role = $3`,
-        [assigned_user_id, taskBusinessId, 'user']
-      );
-      if (userCheck.rows.length === 0) {
-        return res.status(400).json({ error: 'Assigned user not found in this business' });
-      }
-      assignedUserId = assigned_user_id;
-    }
-
-    const client = await db.pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      const result = await client.query(
-        `INSERT INTO tasks (business_id, created_by, title, description, due_date, assigned_user_id)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING *`,
-        [taskBusinessId, req.user.id, title, description || '', due_date || null, assignedUserId]
-      );
-
-      const admins = await client.query(
-        `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND id != $1`,
-        [req.user.id]
-      );
-      const adminIds = admins.rows.map((a) => a.id);
-      for (const admin of admins.rows) {
-        await client.query(
-          `INSERT INTO notifications (user_id, type, message)
-           VALUES ($1, 'task_added', $2)`,
-          [admin.id, `New task created: "${title}"`]
-        );
-      }
-      sendPushToUsers(adminIds, 'New Task', `New task created: "${title}"`, { type: 'task_added' });
-
-      if (assignedUserId) {
-        await client.query(
-          `INSERT INTO notifications (user_id, type, message)
-           VALUES ($1, 'task_added', $2)`,
-          [assignedUserId, `New task assigned to you: "${title}"`]
-        );
-        sendPushToUser(assignedUserId, 'New Task Assigned', `New task assigned to you: "${title}"`, { type: 'task_added' });
-      } else {
-        const usersInBiz = await client.query(
-          `SELECT u.id FROM users u
-           JOIN user_businesses ub ON ub.user_id = u.id
-           WHERE ub.business_id = $1 AND u.role = $2 AND u.id != $3`,
-          [taskBusinessId, 'user', req.user.id]
-        );
-        const bizUserIds = usersInBiz.rows.map((u) => u.id);
-        for (const u of usersInBiz.rows) {
-          await client.query(
-            `INSERT INTO notifications (user_id, type, message)
-             VALUES ($1, 'task_added', $2)`,
-            [u.id, `New task added: "${title}"`]
-          );
-        }
-        sendPushToUsers(bizUserIds, 'New Task', `New task added: "${title}"`, { type: 'task_added' });
-      }
-
-      await client.query('COMMIT');
-      res.status(201).json({ task: result.rows[0] });
-    } catch (txErr) {
-      await client.query('ROLLBACK');
-      throw txErr;
-    } finally {
-      client.release();
-    }
+    broadcastTaskChange(taskId, businessId, 'created');
+    res.status(201).json({ task });
   } catch (err) {
     next(err);
   }
 });
 
-// PUT /api/tasks/:id — edit task details
+// ---------------------------------------------------------------------------
+// PUT /api/tasks/:id — edit details / reassign
+// ---------------------------------------------------------------------------
 router.put('/:id', authenticate, async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const title = sanitizeText(req.body.title, 200);
-    const description = sanitizeText(req.body.description, 5000);
-    const { due_date } = req.body;
-
-    if (!title) {
-      return res.status(400).json({ error: 'Task title is required' });
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
+    if (!task.permissions.can_edit) {
+      return res.status(403).json({ error: 'Only the person who created this task or someone senior to them can edit it' });
     }
 
-    const taskResult = await db.query('SELECT * FROM tasks WHERE id = $1', [id]);
-    if (taskResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
+    const title = req.body.title !== undefined ? sanitizeText(req.body.title, 200) : task.title;
+    if (!title) return res.status(400).json({ error: 'Task title is required' });
+    const description = req.body.description !== undefined ? sanitizeText(req.body.description, 5000) : task.description;
+    const dueDate = req.body.due_date !== undefined ? parseDate(req.body.due_date) : task.due_date;
+    const priority = req.body.priority !== undefined ? parsePriority(req.body.priority, task.priority) : task.priority;
+    const requiresApproval = req.body.requires_approval !== undefined ? !!req.body.requires_approval : task.requires_approval;
 
-    const task = taskResult.rows[0];
-
-    // Non-admin users can only edit tasks they can access
-    if (!['admin', 'super_admin'].includes(req.user.role)) {
-      const accessCheck = await db.query(
-        'SELECT 1 FROM user_businesses WHERE user_id = $1 AND business_id = $2',
-        [req.user.id, task.business_id]
-      );
-      if (accessCheck.rows.length === 0) {
-        return res.status(403).json({ error: 'You can only edit tasks in your business' });
-      }
-      if (task.assigned_user_id && task.assigned_user_id !== req.user.id) {
-        return res.status(403).json({ error: 'You can only edit tasks assigned to you' });
+    let assignedUserId = task.assigned_user_id;
+    if (req.body.assigned_user_id !== undefined) {
+      assignedUserId = parseInt(req.body.assigned_user_id) || null;
+      if (assignedUserId && !(await isAssignable(assignedUserId, task.business_id))) {
+        return res.status(400).json({ error: 'That person is not part of this business' });
       }
     }
 
-    const result = await db.query(
+    await db.query(
       `UPDATE tasks
-       SET title = $1, description = $2, due_date = $3, updated_at = NOW()
-       WHERE id = $4
-       RETURNING *`,
-      [title, description || '', due_date || null, id]
+       SET title = $1, description = $2, due_date = $3, priority = $4, assigned_user_id = $5,
+           requires_approval = $6,
+           last_overdue_notification_at = CASE WHEN due_date IS DISTINCT FROM $3::date THEN NULL ELSE last_overdue_notification_at END
+       WHERE id = $7`,
+      [title, description || '', dueDate, priority, assignedUserId, requiresApproval, task.id]
     );
 
-    res.json({ task: result.rows[0] });
+    const changes = [];
+    if (title !== task.title) changes.push('title');
+    if ((description || '') !== (task.description || '')) changes.push('description');
+    if (dueDate !== task.due_date) changes.push('due date');
+    if (priority !== task.priority) changes.push('priority');
+    if (changes.length) await recordActivity(task.id, actor.id, 'edited', changes.join(', '));
+
+    if (assignedUserId !== task.assigned_user_id) {
+      await recordActivity(task.id, actor.id, 'assigned', null, { from: task.assigned_user_id, to: assignedUserId });
+      if (assignedUserId && assignedUserId !== actor.id) {
+        await notify([assignedUserId], {
+          type: 'task_assigned',
+          title: `${actor.name} assigned you a task`,
+          body: `${title} · ${task.business_name}`,
+          data: { taskId: task.id },
+        });
+      }
+    }
+    await notifyMentions(
+      description !== task.description ? description : '',
+      req.body.mention_ids,
+      actor,
+      { id: task.id, title }
+    );
+
+    const updated = await getTaskForActor(task.id, actor);
+    broadcastTaskChange(task.id, task.business_id);
+    res.json({ task: updated.task });
   } catch (err) {
     next(err);
   }
 });
 
-// PUT /api/tasks/:id/complete — toggle complete status
+/**
+ * Move a task to a new status, applying the review flow:
+ * completing a task that needs approval puts it "in review" for the person who
+ * assigned it (or anyone senior to whoever finished it).
+ */
+async function changeStatus(req, res, actor, task, nextStatus) {
+  const isHoldChange = nextStatus === 'on_hold' || task.status === 'on_hold';
+  if (isHoldChange && !task.permissions.can_hold && !task.permissions.can_change_status) {
+    return res.status(403).json({ error: 'You cannot put this task on hold' });
+  }
+  if (!isHoldChange && !task.permissions.can_change_status) {
+    return res.status(403).json({ error: 'You cannot update this task' });
+  }
+  if (nextStatus === 'on_hold' && task.status === 'completed') {
+    return res.status(400).json({ error: 'Cannot put a completed task on hold' });
+  }
+
+  // The creator, or anyone senior to the creator, can close a task outright;
+  // everyone else sends it for review when the task asks for approval.
+  let finalStatus = nextStatus;
+  if (nextStatus === 'completed' && task.requires_approval && !task.permissions.can_edit) {
+    finalStatus = 'in_review';
+  }
+
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (finalStatus === 'completed' || finalStatus === 'in_review') {
+      // Review (in_review) clears any previous approval; a direct completion keeps it.
+      await client.query(
+        `UPDATE tasks SET status = $1, completed_by = $2, completed_at = NOW(),
+           approved_by = CASE WHEN $4 THEN approved_by ELSE NULL END,
+           approved_at = CASE WHEN $4 THEN approved_at ELSE NULL END
+         WHERE id = $3`,
+        [finalStatus, actor.id, task.id, finalStatus === 'completed']
+      );
+      if (finalStatus === 'completed') await clearWarnings(task.id, client);
+    } else {
+      await client.query(
+        `UPDATE tasks SET status = $1, completed_by = NULL, completed_at = NULL, approved_by = NULL, approved_at = NULL
+         WHERE id = $2`,
+        [finalStatus, task.id]
+      );
+    }
+    await recordActivity(task.id, actor.id, 'status', null, { from: task.status, to: finalStatus }, client);
+    await client.query('COMMIT');
+  } catch (txErr) {
+    await client.query('ROLLBACK');
+    throw txErr;
+  } finally {
+    client.release();
+  }
+
+  const involved = [task.created_by, task.assigned_user_id].filter((id) => id && id !== actor.id);
+  if (finalStatus === 'in_review') {
+    const reviewers = task.created_by !== actor.id
+      ? [task.created_by]
+      : await nextApprovers(task.business_id, actorLevelIn(actor, task.business_id), actor.id);
+    await notify(reviewers, {
+      type: 'approval_request',
+      title: `✅ ${actor.name} finished a task — review it`,
+      body: task.title,
+      data: { taskId: task.id },
+    }, { exclude: [actor.id] });
+  } else if (finalStatus === 'completed') {
+    await notify(involved, {
+      type: 'task_completed',
+      title: `🎉 Task completed by ${actor.name}`,
+      body: task.title,
+      data: { taskId: task.id },
+    });
+  } else if (finalStatus !== task.status) {
+    await notify(involved, {
+      type: 'task_status',
+      title: `${actor.name} moved a task to ${STATUS_LABELS[finalStatus]}`,
+      body: task.title,
+      data: { taskId: task.id },
+    });
+  }
+
+  const updated = await getTaskForActor(task.id, actor);
+  broadcastTaskChange(task.id, task.business_id);
+  return res.json({ task: updated.task });
+}
+
+// PUT /api/tasks/:id/status — { status: pending | in_progress | completed | on_hold }
+router.put('/:id/status', authenticate, async (req, res, next) => {
+  try {
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const nextStatus = req.body.status;
+    if (!['pending', 'in_progress', 'completed', 'on_hold'].includes(nextStatus)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
+    return await changeStatus(req, res, actor, task, nextStatus);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/tasks/:id/complete — toggle completed (kept for older clients)
 router.put('/:id/complete', authenticate, async (req, res, next) => {
   try {
-    const { id } = req.params;
-
-    // Get the task
-    const taskResult = await db.query('SELECT * FROM tasks WHERE id = $1', [id]);
-    if (taskResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
-
-    const task = taskResult.rows[0];
-
-    // Non-admin users can only toggle tasks in their businesses
-    if (!['admin', 'super_admin'].includes(req.user.role)) {
-      const accessCheck = await db.query(
-        'SELECT 1 FROM user_businesses WHERE user_id = $1 AND business_id = $2',
-        [req.user.id, task.business_id]
-      );
-      if (accessCheck.rows.length === 0) {
-        return res.status(403).json({ error: 'You can only modify tasks in your business' });
-      }
-    }
-
-    // If task is on_hold, completing it should set it to completed
-    // If task is completed, un-completing sets it back to pending
-    // If task is pending, completing it sets it to completed
-    const newStatus = task.status === 'completed' ? 'pending' : 'completed';
-    const completedBy = newStatus === 'completed' ? req.user.id : null;
-    const completedAt = newStatus === 'completed' ? new Date() : null;
-
-    const client = await db.pool.connect();
-    let resultRow;
-    try {
-      await client.query('BEGIN');
-
-      const result = await client.query(
-        `UPDATE tasks
-         SET status = $1, completed_by = $2, completed_at = $3
-         WHERE id = $4
-         RETURNING *`,
-        [newStatus, completedBy, completedAt, id]
-      );
-      resultRow = result.rows[0];
-
-      if (newStatus === 'completed') {
-        const completerResult = await client.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-        const completerName = completerResult.rows[0]?.name || 'Someone';
-
-        const admins = await client.query(
-          `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND id != $1`,
-          [req.user.id]
-        );
-        const adminIds = admins.rows.map((a) => a.id);
-        for (const admin of admins.rows) {
-          await client.query(
-            `INSERT INTO notifications (user_id, type, message)
-             VALUES ($1, 'task_completed', $2)`,
-            [admin.id, `Task "${task.title}" completed by ${completerName}`]
-          );
-        }
-        sendPushToUsers(adminIds, 'Task Completed', `Task "${task.title}" completed by ${completerName}`, { type: 'task_completed' });
-
-        if (task.is_warned) {
-          const warnedUsers = await client.query(
-            'SELECT DISTINCT user_id FROM warnings WHERE task_id = $1',
-            [id]
-          );
-          await client.query('DELETE FROM warnings WHERE task_id = $1', [id]);
-          await client.query('UPDATE tasks SET is_warned = false WHERE id = $1', [id]);
-          for (const w of warnedUsers.rows) {
-            const remaining = await client.query(
-              'SELECT 1 FROM warnings WHERE user_id = $1 LIMIT 1',
-              [w.user_id]
-            );
-            if (remaining.rows.length === 0) {
-              await client.query("UPDATE users SET status = 'active' WHERE id = $1 AND status = 'warned'", [w.user_id]);
-            }
-          }
-        }
-
-        if (task.assigned_user_id) {
-          if (task.assigned_user_id !== req.user.id) {
-            await client.query(
-              `INSERT INTO notifications (user_id, type, message)
-               VALUES ($1, 'task_completed', $2)`,
-              [task.assigned_user_id, `Task "${task.title}" completed by ${completerName}`]
-            );
-            sendPushToUser(task.assigned_user_id, 'Task Completed', `Task "${task.title}" completed by ${completerName}`, { type: 'task_completed' });
-          }
-        } else {
-          const bizUsers = await client.query(
-            `SELECT u.id FROM users u
-             JOIN user_businesses ub ON ub.user_id = u.id
-             WHERE ub.business_id = $1 AND u.role = 'user' AND u.id != $2`,
-            [task.business_id, req.user.id]
-          );
-          const bizUserIds = bizUsers.rows.map((u) => u.id);
-          for (const u of bizUsers.rows) {
-            await client.query(
-              `INSERT INTO notifications (user_id, type, message)
-               VALUES ($1, 'task_completed', $2)`,
-              [u.id, `Task "${task.title}" completed by ${completerName}`]
-            );
-          }
-          sendPushToUsers(bizUserIds, 'Task Completed', `Task "${task.title}" completed by ${completerName}`, { type: 'task_completed' });
-        }
-      }
-
-      await client.query('COMMIT');
-    } catch (txErr) {
-      await client.query('ROLLBACK');
-      client.release();
-      throw txErr;
-    }
-    client.release();
-
-    res.json({ task: resultRow });
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
+    const nextStatus = task.status === 'completed' || task.status === 'in_review' ? 'pending' : 'completed';
+    return await changeStatus(req, res, actor, task, nextStatus);
   } catch (err) {
     next(err);
   }
 });
 
-// PUT /api/tasks/:id/warn (admin only — creates warning + notification)
-router.put('/:id/warn', authenticate, requireAdmin, async (req, res, next) => {
+// PUT /api/tasks/:id/hold — toggle on hold (kept for older clients)
+router.put('/:id/hold', authenticate, async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const message = sanitizeText(req.body.message, 1000);
-    const { user_id } = req.body;
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
+    return await changeStatus(req, res, actor, task, task.status === 'on_hold' ? 'pending' : 'on_hold');
+  } catch (err) {
+    next(err);
+  }
+});
 
-    if (!message) {
-      return res.status(400).json({ error: 'Warning message is required' });
-    }
+// POST /api/tasks/:id/approve — accept a task that is in review
+router.post('/:id/approve', authenticate, async (req, res, next) => {
+  try {
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
+    if (!task.permissions.can_approve) return res.status(403).json({ error: 'You cannot approve this task' });
 
-    // Get the task
-    const taskResult = await db.query(
-      `SELECT t.*, u.name AS creator_name FROM tasks t
-       JOIN users u ON t.created_by = u.id
-       WHERE t.id = $1`,
-      [id]
+    const note = sanitizeText(req.body.note, 1000);
+    await db.query(
+      `UPDATE tasks SET status = 'completed', approved_by = $1, approved_at = NOW() WHERE id = $2`,
+      [actor.id, task.id]
     );
-    if (taskResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
+    await clearWarnings(task.id);
+    await recordActivity(task.id, actor.id, 'approved', note || null);
+    await notify([task.completed_by, task.assigned_user_id], {
+      type: 'task_approved',
+      title: `👍 ${actor.name} approved your work`,
+      body: task.title,
+      data: { taskId: task.id },
+    }, { exclude: [actor.id] });
 
-    const task = taskResult.rows[0];
+    const updated = await getTaskForActor(task.id, actor);
+    broadcastTaskChange(task.id, task.business_id);
+    res.json({ task: updated.task });
+  } catch (err) {
+    next(err);
+  }
+});
 
-    if (task.status === 'completed') {
-      return res.status(400).json({ error: 'Cannot warn on a completed task' });
-    }
-    if (task.status === 'on_hold') {
-      return res.status(400).json({ error: 'Cannot warn on a task that is on hold' });
-    }
+// POST /api/tasks/:id/reject — send a task in review back with a note
+router.post('/:id/reject', authenticate, async (req, res, next) => {
+  try {
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
+    if (!task.permissions.can_approve) return res.status(403).json({ error: 'You cannot review this task' });
 
-    // Determine who to warn:
-    // - If task has assigned_user_id, warn that specific user only
-    // - Otherwise warn all regular users in the task's business
-    let warnUserIds = [];
-    if (task.assigned_user_id) {
-      warnUserIds = [task.assigned_user_id];
-    } else {
-      const bizUsers = await db.query(
-        `SELECT u.id FROM users u
-         JOIN user_businesses ub ON ub.user_id = u.id
-         WHERE ub.business_id = $1 AND u.role = 'user'`,
-        [task.business_id]
-      );
-      warnUserIds = bizUsers.rows.map((r) => r.id);
-    }
+    const note = sanitizeText(req.body.note, 1000);
+    await db.query(
+      `UPDATE tasks SET status = 'in_progress', completed_by = NULL, completed_at = NULL WHERE id = $1`,
+      [task.id]
+    );
+    await recordActivity(task.id, actor.id, 'changes_requested', note || null);
+    await notify([task.completed_by, task.assigned_user_id], {
+      type: 'task_rejected',
+      title: `↩️ ${actor.name} asked for changes`,
+      body: note ? `${task.title}: ${note}` : task.title,
+      data: { taskId: task.id },
+    }, { exclude: [actor.id] });
 
-    if (warnUserIds.length === 0) {
-      return res.status(400).json({ error: 'No users to warn for this task' });
-    }
+    const updated = await getTaskForActor(task.id, actor);
+    broadcastTaskChange(task.id, task.business_id);
+    res.json({ task: updated.task });
+  } catch (err) {
+    next(err);
+  }
+});
 
-    // Mark task as warned
-    await db.query('UPDATE tasks SET is_warned = true WHERE id = $1', [id]);
+// POST /api/tasks/:id/comments — { body, mention_ids? }
+router.post('/:id/comments', authenticate, async (req, res, next) => {
+  try {
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
 
-    // Create warning records and notifications for each target user
-    for (const uid of warnUserIds) {
+    const body = sanitizeText(req.body.body, 3000);
+    if (!body) return res.status(400).json({ error: 'Comment cannot be empty' });
+
+    const activity = await recordActivity(task.id, actor.id, 'comment', body);
+    const mentioned = await notifyMentions(body, req.body.mention_ids, actor, task);
+    await notify([task.created_by, task.assigned_user_id], {
+      type: 'task_comment',
+      title: `💬 ${actor.name} commented`,
+      body: `${task.title}: ${body.length > 100 ? `${body.slice(0, 97)}…` : body}`,
+      data: { taskId: task.id },
+    }, { exclude: [actor.id, ...mentioned] });
+
+    broadcastTaskChange(task.id, task.business_id, 'comment');
+    res.status(201).json({
+      activity: { ...activity, user_name: actor.name, user_username: actor.username },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/tasks/:id/warn — warn the assignee (must be senior to them)
+router.put('/:id/warn', authenticate, async (req, res, next) => {
+  try {
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const message = sanitizeText(req.body.message, 1000);
+    if (!message) return res.status(400).json({ error: 'Warning message is required' });
+
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
+    if (task.status === 'completed') return res.status(400).json({ error: 'Cannot warn on a completed task' });
+    if (task.status === 'on_hold') return res.status(400).json({ error: 'Cannot warn on a task that is on hold' });
+    if (!task.permissions.can_warn) return res.status(403).json({ error: 'Only someone senior to the assignee can send a warning' });
+
+    // Unassigned task: warn everyone in the business who is junior to the sender.
+    const targets = (task.assigned_user_id
+      ? [task.assigned_user_id]
+      : await businessMemberIds(task.business_id, { belowLevel: actorLevelIn(actor, task.business_id) })
+    ).filter((id) => id !== actor.id);
+    if (targets.length === 0) return res.status(400).json({ error: 'No users to warn for this task' });
+
+    await db.query('UPDATE tasks SET is_warned = true WHERE id = $1', [task.id]);
+    for (const uid of targets) {
       await db.query(
-        `INSERT INTO warnings (task_id, user_id, sent_by, message)
-         VALUES ($1, $2, $3, $4)`,
-        [id, uid, req.user.id, message]
+        'INSERT INTO warnings (task_id, user_id, sent_by, message) VALUES ($1, $2, $3, $4)',
+        [task.id, uid, actor.id, message]
       );
-
-      const warnNotifMsg = `Warning on task "${task.title}": ${message}`;
-      await db.query(
-        `INSERT INTO notifications (user_id, type, message)
-         VALUES ($1, 'warning', $2)`,
-        [uid, warnNotifMsg]
-      );
-      sendPushToUser(uid, 'Warning', warnNotifMsg, { type: 'warning', taskId: id });
-
-      // Update user status to warned
-      await db.query("UPDATE users SET status = 'warned' WHERE id = $1", [uid]);
+      await db.query("UPDATE users SET status = 'warned' WHERE id = $1 AND status = 'active'", [uid]);
     }
+    await recordActivity(task.id, actor.id, 'warning', message);
+    await notify(targets, {
+      type: 'warning',
+      title: `⚠️ Warning from ${actor.name}`,
+      body: `${task.title}: ${message}`,
+      data: { taskId: task.id },
+    });
 
+    broadcastTaskChange(task.id, task.business_id);
     res.json({ message: 'Warning sent successfully' });
   } catch (err) {
     next(err);
   }
 });
 
-// DELETE /api/tasks/:id
+// DELETE /api/tasks/:id — creator or someone senior to the creator
 router.delete('/:id', authenticate, async (req, res, next) => {
   try {
-    const { id } = req.params;
-
-    // Get task to check visibility/permissions
-    const taskResult = await db.query('SELECT * FROM tasks WHERE id = $1', [id]);
-    if (taskResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Task not found' });
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
+    if (!task.permissions.can_delete) {
+      return res.status(403).json({
+        error: 'Only the person who created this task or someone senior can delete it. You can request deletion instead.',
+        can_request: task.permissions.can_request_delete,
+      });
     }
 
-    const task = taskResult.rows[0];
+    await clearWarnings(task.id);
+    await db.query('DELETE FROM tasks WHERE id = $1', [task.id]);
+    await notify([task.assigned_user_id, task.created_by], {
+      type: 'task_deleted',
+      title: `🗑️ ${actor.name} deleted a task`,
+      body: task.title,
+      data: {},
+    }, { exclude: [actor.id] });
 
-    // Non-admin users can only delete tasks they can see in their businesses
-    if (!['admin', 'super_admin'].includes(req.user.role)) {
-      const accessCheck = await db.query(
-        'SELECT 1 FROM user_businesses WHERE user_id = $1 AND business_id = $2',
-        [req.user.id, task.business_id]
-      );
-      if (accessCheck.rows.length === 0) {
-        return res.status(403).json({ error: 'You can only delete tasks in your business' });
-      }
-      if (task.assigned_user_id && task.assigned_user_id !== req.user.id) {
-        return res.status(403).json({ error: 'You can only delete tasks assigned to you' });
-      }
-    }
-
-    // Remove warnings for this task and reset user status if no remaining warnings
-    if (task.is_warned) {
-      const warnedUsers = await db.query(
-        'SELECT DISTINCT user_id FROM warnings WHERE task_id = $1',
-        [id]
-      );
-      await db.query('DELETE FROM warnings WHERE task_id = $1', [id]);
-      for (const w of warnedUsers.rows) {
-        const remaining = await db.query(
-          'SELECT 1 FROM warnings WHERE user_id = $1 LIMIT 1',
-          [w.user_id]
-        );
-        if (remaining.rows.length === 0) {
-          await db.query("UPDATE users SET status = 'active' WHERE id = $1 AND status = 'warned'", [w.user_id]);
-        }
-      }
-    }
-
-    await db.query('DELETE FROM tasks WHERE id = $1', [id]);
+    broadcastTaskChange(task.id, task.business_id, 'deleted');
     res.json({ message: 'Task deleted successfully' });
   } catch (err) {
     next(err);
   }
 });
 
-// PUT /api/tasks/:id/hold — toggle on_hold status (admin only)
-router.put('/:id/hold', authenticate, requireAdmin, async (req, res, next) => {
+// POST /api/tasks/:id/request-delete — { reason } → goes up the chain for approval
+router.post('/:id/request-delete', authenticate, async (req, res, next) => {
   try {
-    const { id } = req.params;
+    const actor = await withActor(req, res);
+    if (!actor) return;
+    const { task, error, status } = await getTaskForActor(req.params.id, actor);
+    if (error) return res.status(status).json({ error });
+    if (task.permissions.can_delete) return res.status(400).json({ error: 'You can delete this task directly' });
+    if (task.pending_delete_request_id) return res.status(409).json({ error: 'A deletion request is already pending' });
 
-    const taskResult = await db.query('SELECT * FROM tasks WHERE id = $1', [id]);
-    if (taskResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
-
-    const task = taskResult.rows[0];
-
-    if (task.status === 'completed') {
-      return res.status(400).json({ error: 'Cannot put a completed task on hold' });
-    }
-
-    const newStatus = task.status === 'on_hold' ? 'pending' : 'on_hold';
-
-    const result = await db.query(
-      `UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
-      [newStatus, id]
+    const reason = sanitizeText(req.body.reason, 1000);
+    const myLevel = actorLevelIn(actor, task.business_id);
+    const inserted = await db.query(
+      `INSERT INTO approvals (kind, task_id, business_id, requested_by, requester_level, reason, subject)
+       VALUES ('task_deletion', $1, $2, $3, $4, $5, $6) RETURNING *`,
+      [task.id, task.business_id, actor.id, myLevel, reason || null, task.title]
     );
+    await recordActivity(task.id, actor.id, 'delete_requested', reason || null);
 
-    // Notify assigned user(s) about the hold status change
-    const actorName = await db.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    const adminName = actorName.rows[0]?.name || 'Admin';
+    const approvers = new Set(await nextApprovers(task.business_id, myLevel, actor.id));
+    approvers.add(task.created_by);
+    await notify([...approvers], {
+      type: 'approval_request',
+      title: `🗑️ ${actor.name} asked to delete a task`,
+      body: reason ? `${task.title} — "${reason}"` : task.title,
+      data: { taskId: task.id, approvalId: inserted.rows[0].id },
+    }, { exclude: [actor.id] });
 
-    let notifyUserIds = [];
-    if (task.assigned_user_id) {
-      notifyUserIds = [task.assigned_user_id];
-    } else {
-      const bizUsers = await db.query(
-        `SELECT u.id FROM users u
-         JOIN user_businesses ub ON ub.user_id = u.id
-         WHERE ub.business_id = $1 AND u.role = 'user'`,
-        [task.business_id]
-      );
-      notifyUserIds = bizUsers.rows.map((r) => r.id);
-    }
-
-    const action = newStatus === 'on_hold' ? 'put on hold' : 'resumed from hold';
-    const holdMsg = `Task "${task.title}" has been ${action} by ${adminName}`;
-    for (const uid of notifyUserIds) {
-      await db.query(
-        `INSERT INTO notifications (user_id, type, message)
-         VALUES ($1, 'assignment', $2)`,
-        [uid, holdMsg]
-      );
-    }
-    sendPushToUsers(notifyUserIds, 'Task Update', holdMsg, { type: 'assignment', taskId: id });
-
-    res.json({ task: result.rows[0] });
+    broadcastTaskChange(task.id, task.business_id);
+    res.status(201).json({ approval: inserted.rows[0] });
   } catch (err) {
     next(err);
   }

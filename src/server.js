@@ -13,9 +13,14 @@ const userRoutes = require('./routes/users');
 const taskRoutes = require('./routes/tasks');
 const notificationRoutes = require('./routes/notifications');
 const chatRoutes = require('./routes/chat');
+const todoRoutes = require('./routes/todos');
+const orgRoutes = require('./routes/org');
+const approvalRoutes = require('./routes/approvals');
 const db = require('./db');
 const { runMigrations } = require('./migrations/run');
 const { scheduleOverdueNotifications } = require('./jobs/overdueNotifications');
+const { scheduleTodoReminders } = require('./jobs/todoReminders');
+const { setIO } = require('./utils/notify');
 const { setupSocketIO } = require('./socket');
 const { requestId } = require('./middleware/requestId');
 const { waitForConnection } = db;
@@ -38,6 +43,7 @@ app.set('trust proxy', 1);
 const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173')
   .split(',')
   .map((u) => u.trim().replace(/\/+$/, ''));
+const allowAllOrigins = allowedOrigins.includes('*');
 
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
@@ -50,7 +56,7 @@ app.use(requestId);
 
 app.use(cors({
   origin(origin, cb) {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    if (!origin || allowAllOrigins || allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error(`CORS blocked origin: ${origin}`));
   },
   credentials: true,
@@ -61,7 +67,7 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 300,
+  max: 600,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' },
@@ -122,6 +128,9 @@ app.use('/api/users', userRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/chat', chatLimiter, chatRoutes);
+app.use('/api/todos', todoRoutes);
+app.use('/api/org', orgRoutes);
+app.use('/api/approvals', approvalRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
@@ -143,12 +152,13 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: allowAllOrigins ? true : allowedOrigins,
     credentials: true,
   },
 });
 
 app.set('io', io);
+setIO(io);
 setupSocketIO(io);
 
 if (require.main === module) {
@@ -160,6 +170,7 @@ if (require.main === module) {
         console.log(`TaskHub backend running on port ${PORT}`);
       });
       scheduleOverdueNotifications();
+      scheduleTodoReminders();
     } catch (err) {
       console.error('Failed to start server:', err);
       process.exit(1);

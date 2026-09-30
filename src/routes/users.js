@@ -3,8 +3,19 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireAdmin, requireSuperAdmin } = require('../middleware/auth');
 const { sanitizeText, validatePassword } = require('../middleware/sanitize');
+const { loadActor, actorBestLevel } = require('../utils/org');
+const { setMemberships, syncLeaderGroups } = require('../services/org');
+const { notify } = require('../utils/notify');
 
 const router = express.Router();
+
+/** Managing someone requires being strictly more senior than them. */
+async function outranks(actorId, targetId) {
+  if (Number(actorId) === Number(targetId)) return false;
+  const [actor, target] = await Promise.all([loadActor(actorId), loadActor(targetId)]);
+  if (!actor || !target) return false;
+  return actorBestLevel(actor) < actorBestLevel(target);
+}
 
 // GET /api/users/unassigned (admin only)
 router.get('/unassigned', authenticate, requireAdmin, async (req, res, next) => {
@@ -39,16 +50,17 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
 
     const result = await db.query(
       `SELECT u.id, u.name, u.username, ${emailColumn} u.role, u.status, u.business_id, u.created_at,
+              u.org_level, u.title, u.profile_picture,
               COALESCE(
                 json_agg(
-                  json_build_object('id', b.id, 'name', b.name, 'type', b.type)
+                  json_build_object('id', b.id, 'name', b.name, 'type', b.type, 'designation', ub.designation)
                 ) FILTER (WHERE b.id IS NOT NULL), '[]'
               ) AS businesses
        FROM users u
        LEFT JOIN user_businesses ub ON ub.user_id = u.id
        LEFT JOIN businesses b ON b.id = ub.business_id
        ${roleFilter}
-       GROUP BY u.id, u.name, u.username, ${emailColumn} u.role, u.status, u.business_id, u.created_at
+       GROUP BY u.id
        ORDER BY u.created_at DESC
        LIMIT $1 OFFSET $2`,
       [limit, offset]
@@ -67,150 +79,64 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
   }
 });
 
-// PUT /api/users/:id/assign (admin only) — supports single or multiple businesses
+// PUT /api/users/:id/assign (admin only) — supports single or multiple businesses.
+// Keeps each person's designation in businesses they stay in; new ones start as "member".
 router.put('/:id/assign', authenticate, requireAdmin, async (req, res, next) => {
   try {
     const { id } = req.params;
     const { business_id, business_ids } = req.body;
 
-    // Support both single (business_id) and multiple (business_ids) assignment
     let bizIds = [];
     if (Array.isArray(business_ids)) {
-      bizIds = business_ids.map(Number).filter((n) => !isNaN(n));
+      bizIds = business_ids.map(Number).filter((n) => !isNaN(n) && n > 0);
     } else if (business_id !== undefined && business_id !== null) {
-      bizIds = [Number(business_id)].filter((n) => !isNaN(n));
+      bizIds = [Number(business_id)].filter((n) => !isNaN(n) && n > 0);
     }
+    bizIds = [...new Set(bizIds)];
 
-    // Verify user exists and is not an admin
-    const userCheck = await db.query('SELECT id, role FROM users WHERE id = $1', [id]);
+    const userCheck = await db.query('SELECT id FROM users WHERE id = $1', [id]);
     if (userCheck.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
-    if (['admin', 'super_admin'].includes(userCheck.rows[0].role)) {
-      return res.status(400).json({ error: 'Cannot assign admin to a business' });
+    if (Number(id) !== req.user.id && !(await outranks(req.user.id, id))) {
+      return res.status(403).json({ error: 'You can only manage people below you in the hierarchy' });
     }
 
-    // If no businesses selected, unassign user from all businesses
-    if (bizIds.length === 0) {
-      const client = await db.pool.connect();
-      try {
-        await client.query('BEGIN');
-
-        const oldBizResult = await client.query(
-          'SELECT business_id FROM user_businesses WHERE user_id = $1', [id]
-        );
-
-        await client.query('DELETE FROM user_businesses WHERE user_id = $1', [id]);
-        await client.query('UPDATE users SET business_id = NULL WHERE id = $1', [id]);
-
-        for (const row of oldBizResult.rows) {
-          const convResult = await client.query(
-            `SELECT id FROM conversations WHERE business_id = $1 AND type = 'group'`,
-            [row.business_id]
-          );
-          for (const conv of convResult.rows) {
-            await client.query(
-              'DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
-              [conv.id, id]
-            );
-          }
-        }
-
-        await client.query(
-          `INSERT INTO notifications (user_id, type, message)
-           VALUES ($1, 'assignment', $2)`,
-          [id, 'You have been unassigned from all businesses']
-        );
-        await client.query('COMMIT');
-      } catch (txErr) {
-        await client.query('ROLLBACK');
-        client.release();
-        throw txErr;
+    let bizNames = [];
+    if (bizIds.length) {
+      const bizCheck = await db.query('SELECT id, name FROM businesses WHERE id = ANY($1)', [bizIds]);
+      if (bizCheck.rows.length !== bizIds.length) {
+        return res.status(404).json({ error: 'One or more businesses not found' });
       }
-      client.release();
-      return res.json({ user: { id: parseInt(id), business_id: null, business_ids: [] } });
+      bizNames = bizCheck.rows.map((r) => r.name);
     }
 
-    // Verify all businesses exist
-    const bizCheck = await db.query(
-      'SELECT id, name FROM businesses WHERE id = ANY($1)',
-      [bizIds]
-    );
-    if (bizCheck.rows.length !== bizIds.length) {
-      return res.status(404).json({ error: 'One or more businesses not found' });
-    }
-
-    // Replace all business assignments for this user in a transaction
+    const existing = await db.query('SELECT business_id, designation, title FROM user_businesses WHERE user_id = $1', [id]);
+    const keep = new Map(existing.rows.map((m) => [m.business_id, m]));
     const client = await db.pool.connect();
     try {
       await client.query('BEGIN');
-
-      const oldBizResult = await client.query(
-        'SELECT business_id FROM user_businesses WHERE user_id = $1', [id]
-      );
-      const oldBizIds = oldBizResult.rows.map((r) => r.business_id);
-      const removedBizIds = oldBizIds.filter((bid) => !bizIds.includes(bid));
-      const addedBizIds = bizIds.filter((bid) => !oldBizIds.includes(bid));
-
-      await client.query('DELETE FROM user_businesses WHERE user_id = $1', [id]);
-      for (const bizId of bizIds) {
-        await client.query(
-          'INSERT INTO user_businesses (user_id, business_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-          [id, bizId]
-        );
-      }
-
-      for (const bizId of addedBizIds) {
-        const convResult = await client.query(
-          `SELECT id FROM conversations WHERE business_id = $1 AND type = 'group'`,
-          [bizId]
-        );
-        for (const conv of convResult.rows) {
-          await client.query(
-            `INSERT INTO conversation_participants (conversation_id, user_id, is_admin, is_invisible)
-             VALUES ($1, $2, FALSE, FALSE)
-             ON CONFLICT DO NOTHING`,
-            [conv.id, id]
-          );
-        }
-      }
-
-      for (const bizId of removedBizIds) {
-        const convResult = await client.query(
-          `SELECT id FROM conversations WHERE business_id = $1 AND type = 'group'`,
-          [bizId]
-        );
-        for (const conv of convResult.rows) {
-          await client.query(
-            'DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
-            [conv.id, id]
-          );
-        }
-      }
-
-      const primaryBizId = bizIds[0];
-      await client.query('UPDATE users SET business_id = $1 WHERE id = $2', [primaryBizId, id]);
-
-      const bizNames = bizCheck.rows.map((r) => r.name).join(', ');
-      await client.query(
-        `INSERT INTO notifications (user_id, type, message)
-         VALUES ($1, 'assignment', $2)`,
-        [id, `You have been assigned to: ${bizNames}`]
-      );
+      await setMemberships(client, Number(id), bizIds.map((bid) => keep.get(bid) || { business_id: bid, designation: 'member' }));
       await client.query('COMMIT');
     } catch (txErr) {
       await client.query('ROLLBACK');
-      client.release();
       throw txErr;
+    } finally {
+      client.release();
     }
-    client.release();
 
-    res.json({ user: { id: parseInt(id), business_id: bizIds[0], business_ids: bizIds } });
+    await notify([Number(id)], {
+      type: 'assignment',
+      title: '🏢 Your businesses changed',
+      body: bizNames.length ? `You are now part of: ${bizNames.join(', ')}` : 'You have been unassigned from all businesses',
+      data: {},
+    });
+
+    res.json({ user: { id: parseInt(id), business_id: bizIds[0] || null, business_ids: bizIds } });
   } catch (err) {
     next(err);
   }
 });
-
 // PUT /api/users/:id/role (super_admin only) — promote/demote user
 router.put('/:id/role', authenticate, requireSuperAdmin, async (req, res, next) => {
   try {
@@ -226,62 +152,31 @@ router.put('/:id/role', authenticate, requireSuperAdmin, async (req, res, next) 
       return res.status(403).json({ error: 'You cannot change your own role' });
     }
 
-    // Verify target user exists and is not a super_admin
-    const userCheck = await db.query('SELECT id, role FROM users WHERE id = $1', [id]);
+    const userCheck = await db.query('SELECT id, role, org_level FROM users WHERE id = $1', [id]);
     if (userCheck.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
-    if (userCheck.rows[0].role === 'super_admin') {
-      return res.status(403).json({ error: 'Cannot change a super_admin\'s role' });
+    if (userCheck.rows[0].role === 'super_admin' || !(await outranks(req.user.id, id))) {
+      return res.status(403).json({ error: 'You can only change the role of people below you' });
     }
 
+    // "Admin" maps to the Director tier of the organisation.
+    const orgLevel = role === 'admin' ? 3 : null;
     const result = await db.query(
-      `UPDATE users SET role = $1 WHERE id = $2
-       RETURNING id, name, username, role, business_id, status`,
-      [role, id]
+      `UPDATE users SET role = $1, org_level = $2 WHERE id = $3
+       RETURNING id, name, username, role, business_id, status, org_level`,
+      [role, orgLevel, id]
     );
+    await syncLeaderGroups(db, Number(id), role);
 
-    if (role === 'admin') {
-      const bizGroups = await db.query(
-        `SELECT c.id FROM conversations c
-         WHERE c.type = 'group' AND c.business_id IS NOT NULL`
-      );
-      for (const conv of bizGroups.rows) {
-        await db.query(
-          `INSERT INTO conversation_participants (conversation_id, user_id, is_admin, is_invisible)
-           VALUES ($1, $2, FALSE, FALSE)
-           ON CONFLICT DO NOTHING`,
-          [conv.id, id]
-        );
-      }
-    } else {
-      const userBizResult = await db.query(
-        'SELECT business_id FROM user_businesses WHERE user_id = $1', [id]
-      );
-      const userBizIds = userBizResult.rows.map((r) => r.business_id);
-
-      const allBizGroups = await db.query(
-        `SELECT c.id, c.business_id FROM conversations c
-         WHERE c.type = 'group' AND c.business_id IS NOT NULL`
-      );
-      for (const conv of allBizGroups.rows) {
-        if (!userBizIds.includes(conv.business_id)) {
-          await db.query(
-            'DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
-            [conv.id, id]
-          );
-        }
-      }
-    }
-
-    const notifMsg = role === 'admin'
-      ? 'You have been promoted to Admin. Please log out and log back in to access admin features.'
-      : 'Your role has been changed to User.';
-    await db.query(
-      `INSERT INTO notifications (user_id, type, message)
-       VALUES ($1, 'assignment', $2)`,
-      [id, notifMsg]
-    );
+    await notify([Number(id)], {
+      type: 'assignment',
+      title: role === 'admin' ? '⭐ You were promoted to Director' : 'Your role changed',
+      body: role === 'admin'
+        ? 'You can now see and manage tasks across every business.'
+        : 'Your role has been changed to a regular member.',
+      data: {},
+    });
 
     res.json({ user: result.rows[0] });
   } catch (err) {
@@ -289,31 +184,24 @@ router.put('/:id/role', authenticate, requireSuperAdmin, async (req, res, next) 
   }
 });
 
-// DELETE /api/users/:id (admin only — super_admin can delete admins too)
+// DELETE /api/users/:id (admin only — only people below you in the hierarchy)
 router.delete('/:id', authenticate, requireAdmin, async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    // Cannot delete yourself
     if (parseInt(id) === req.user.id) {
       return res.status(403).json({ error: 'You cannot delete your own account' });
     }
 
-    const userCheck = await db.query('SELECT id, role FROM users WHERE id = $1', [id]);
+    const userCheck = await db.query('SELECT id, role, org_level FROM users WHERE id = $1', [id]);
     if (userCheck.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
-
-    const targetRole = userCheck.rows[0].role;
-
-    // Nobody can delete super_admin
-    if (targetRole === 'super_admin') {
-      return res.status(403).json({ error: 'Cannot delete a super admin' });
+    if (userCheck.rows[0].role === 'super_admin' && !userCheck.rows[0].org_level) {
+      return res.status(403).json({ error: 'Cannot delete the system super admin' });
     }
-
-    // Regular admins can only delete regular users
-    if (req.user.role === 'admin' && targetRole === 'admin') {
-      return res.status(403).json({ error: 'Only super admin can delete admin users' });
+    if (!(await outranks(req.user.id, id))) {
+      return res.status(403).json({ error: 'You can only delete people below you in the hierarchy' });
     }
 
     await db.query('DELETE FROM users WHERE id = $1', [id]);
@@ -322,7 +210,6 @@ router.delete('/:id', authenticate, requireAdmin, async (req, res, next) => {
     next(err);
   }
 });
-
 // GET /api/users/me/stats (authenticate only)
 router.get('/me/stats', authenticate, async (req, res, next) => {
   try {
@@ -462,7 +349,7 @@ router.put('/me/password', authenticate, async (req, res, next) => {
     }
     const hash = await bcrypt.hash(new_password, 10);
     await db.query(
-      'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+      'UPDATE users SET password_hash = $1, must_change_password = FALSE, updated_at = NOW() WHERE id = $2',
       [hash, req.user.id]
     );
     res.json({ message: 'Password updated successfully' });
@@ -489,13 +376,13 @@ router.put('/:id/password', authenticate, requireSuperAdmin, async (req, res, ne
     if (userCheck.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
-    if (userCheck.rows[0].role === 'super_admin') {
-      return res.status(403).json({ error: 'Cannot change a super admin\'s password here' });
+    if (!(await outranks(req.user.id, id))) {
+      return res.status(403).json({ error: 'You can only reset passwords for people below you' });
     }
 
     const hash = await bcrypt.hash(new_password, 10);
     await db.query(
-      'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+      'UPDATE users SET password_hash = $1, must_change_password = TRUE, updated_at = NOW() WHERE id = $2',
       [hash, id]
     );
 

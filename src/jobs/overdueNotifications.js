@@ -1,6 +1,7 @@
 const db = require('../db');
 const { formatOverdueMessage } = require('../utils/dates');
-const { sendPushToUser } = require('../utils/push');
+const { notify } = require('../utils/notify');
+const { levelWithDesignation } = require('../utils/org');
 
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 
@@ -18,13 +19,12 @@ async function sendOverdueNotifications() {
     // CURRENT_DATE is evaluated in Postgres's session timezone; this assumes the DB
     // server and the application agree on what "today" is.
     const overdueTasks = await db.query(
-      `SELECT t.id, t.title, t.due_date, t.assigned_user_id, t.business_id,
+      `SELECT t.id, t.title, t.due_date, t.assigned_user_id, t.business_id, t.created_by,
               b.name AS business_name
        FROM tasks t
        JOIN businesses b ON b.id = t.business_id
        WHERE t.due_date < CURRENT_DATE
-         AND t.status != 'completed'
-         AND t.status != 'on_hold'
+         AND t.status NOT IN ('completed', 'on_hold', 'in_review')
          AND t.last_overdue_notification_at IS NULL`
     );
 
@@ -35,53 +35,30 @@ async function sendOverdueNotifications() {
 
     console.log(`[overdue] Notifying for ${overdueTasks.rows.length} overdue task(s).`);
 
-    const admins = await db.query(
-      `SELECT id, role FROM users WHERE role IN ('super_admin', 'admin') AND status = 'active'`
+    const leaders = await db.query(
+      `SELECT id FROM users WHERE role IN ('super_admin', 'admin') AND status != 'inactive'`
     );
+    const leaderIds = leaders.rows.map((r) => r.id);
 
     for (const task of overdueTasks.rows) {
       const message = formatOverdueMessage(task);
-      const notified = new Set();
+      const data = { taskId: task.id };
 
-      // Notify the assigned user (primary user to notify)
-      if (task.assigned_user_id) {
-        await db.query(
-          `INSERT INTO notifications (user_id, type, message) VALUES ($1, 'overdue', $2)`,
-          [task.assigned_user_id, message]
-        );
-        sendPushToUser(task.assigned_user_id, 'Task Overdue', message, { type: 'overdue', taskId: task.id });
-        notified.add(task.assigned_user_id);
-      }
+      // People who have to act: the assignee (or the whole business if unassigned),
+      // whoever raised it, and the business heads/managers.
+      const members = await db.query(
+        `SELECT u.id, u.role, u.org_level, ub.designation FROM users u
+         JOIN user_businesses ub ON ub.user_id = u.id
+         WHERE ub.business_id = $1 AND u.status != 'inactive'`,
+        [task.business_id]
+      );
+      const managers = members.rows.filter((m) => levelWithDesignation(m, m.designation) <= 5).map((m) => m.id);
+      const doers = task.assigned_user_id ? [task.assigned_user_id] : members.rows.map((m) => m.id);
+      const actNow = [...new Set([...doers, task.created_by, ...managers])];
 
-      // Notify all active super_admins and admins
-      for (const admin of admins.rows) {
-        if (notified.has(admin.id)) continue;
-        await db.query(
-          `INSERT INTO notifications (user_id, type, message) VALUES ($1, 'overdue', $2)`,
-          [admin.id, message]
-        );
-        sendPushToUser(admin.id, 'Task Overdue', message, { type: 'overdue', taskId: task.id });
-        notified.add(admin.id);
-      }
-
-      // If no specific user is assigned, also notify regular users linked to the business
-      if (!task.assigned_user_id) {
-        const bizUsers = await db.query(
-          `SELECT u.id FROM users u
-           JOIN user_businesses ub ON ub.user_id = u.id
-           WHERE ub.business_id = $1 AND u.role = 'user' AND u.status = 'active'`,
-          [task.business_id]
-        );
-        for (const u of bizUsers.rows) {
-          if (notified.has(u.id)) continue;
-          await db.query(
-            `INSERT INTO notifications (user_id, type, message) VALUES ($1, 'overdue', $2)`,
-            [u.id, message]
-          );
-          sendPushToUser(u.id, 'Task Overdue', message, { type: 'overdue', taskId: task.id });
-          notified.add(u.id);
-        }
-      }
+      await notify(actNow, { type: 'overdue', title: '⏰ Task overdue', body: message, data });
+      // Leadership sees it in their feed without a buzz for every task.
+      await notify(leaderIds, { type: 'overdue', title: '⏰ Task overdue', body: message, data }, { push: false, exclude: actNow });
 
       // Mark task as notified
       await db.query(

@@ -10,7 +10,10 @@ const MONTHS = [
  * the server's UTC offset.
  */
 function formatDate(date) {
-  const d = new Date(date);
+  // DATE columns arrive as 'YYYY-MM-DD' strings (see db/index.js); read them as
+  // a local calendar date rather than UTC midnight.
+  const ymd = typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date.split('-').map(Number) : null;
+  const d = ymd ? new Date(ymd[0], ymd[1] - 1, ymd[2]) : new Date(date);
   const year = d.getFullYear();
   const month = MONTHS[d.getMonth()];
   const day = d.getDate();

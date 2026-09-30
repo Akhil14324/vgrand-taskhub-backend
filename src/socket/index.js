@@ -1,7 +1,7 @@
 const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { sanitizeText } = require('../middleware/sanitize');
-const { sendPushToUser } = require('../utils/push');
+const { deliverMessage } = require('../services/chatDelivery');
 
 const presenceMap = new Map();
 
@@ -41,14 +41,6 @@ async function isParticipant(conversationId, userId) {
     [conversationId, userId]
   );
   return result.rows.length > 0;
-}
-
-async function getParticipantUserIds(conversationId) {
-  const result = await db.query(
-    'SELECT user_id FROM conversation_participants WHERE conversation_id = $1',
-    [conversationId]
-  );
-  return result.rows.map((r) => r.user_id);
 }
 
 function addPresence(userId, socketId) {
@@ -100,8 +92,11 @@ function setupSocketIO(io) {
 
   io.on('connection', (socket) => {
     addPresence(socket.userId, socket.id);
+    // Personal room: conversation list updates, notifications, to-do and task changes.
+    socket.join(getUserSocketKey(socket.userId));
 
     io.emit('presence:update', { userId: socket.userId, online: true });
+    socket.emit('presence:snapshot', { userIds: [...presenceMap.keys()] });
 
     socket.on('join_conversations', async (data) => {
       try {
@@ -139,87 +134,14 @@ function setupSocketIO(io) {
           return;
         }
 
-        const result = await db.query(
-          `INSERT INTO messages (conversation_id, sender_id, body, attachment_url, attachment_type, reply_to_id)
-           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
-          [conversationId, socket.userId, sanitized, attachmentUrl || null, attachmentType || null, replyToId || null]
-        );
-
-        const msg = result.rows[0];
-
-        let replyTo = null;
-        if (replyToId) {
-          const replyResult = await db.query(
-            `SELECT m.id, m.body, m.attachment_url, m.attachment_type, u.name as sender_name
-             FROM messages m JOIN users u ON u.id = m.sender_id
-             WHERE m.id = $1`,
-            [replyToId]
-          );
-          if (replyResult.rows.length > 0) {
-            const r = replyResult.rows[0];
-            replyTo = {
-              id: r.id,
-              body: r.body,
-              attachmentUrl: r.attachment_url,
-              attachmentType: r.attachment_type,
-              senderName: r.sender_name,
-            };
-          }
-        }
-
-        const message = {
-          id: msg.id,
+        const message = await deliverMessage(io, {
           conversationId,
-          senderId: socket.userId,
-          senderName: socket.userName,
+          sender: { id: socket.userId, name: socket.userName },
           body: sanitized,
           attachmentUrl: attachmentUrl || null,
           attachmentType: attachmentType || null,
           replyToId: replyToId || null,
-          replyTo,
-          createdAt: msg.created_at,
-        };
-
-        await db.query('UPDATE conversations SET updated_at = NOW() WHERE id = $1', [conversationId]);
-
-        await db.query(
-          'UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1',
-          [conversationId]
-        );
-
-        io.to(`conv:${conversationId}`).emit('message:new', message);
-
-        const participantIds = await getParticipantUserIds(conversationId);
-        const offlineParticipantIds = [];
-        for (const pid of participantIds) {
-          if (pid === socket.userId) continue;
-          const conv = await db.query(
-            `SELECT m.body, m.attachment_url, m.created_at FROM messages m
-             LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $2
-             WHERE m.conversation_id = $1 AND m.deleted_at IS NULL AND md.message_id IS NULL
-             ORDER BY m.created_at DESC LIMIT 1`,
-            [conversationId, pid]
-          );
-          io.to(getUserSocketKey(pid)).emit('conversation:updated', {
-            conversationId,
-            lastMessagePreview: conv.rows[0]?.body || '[Attachment]',
-            lastMessageAt: conv.rows[0]?.created_at || msg.created_at,
-          });
-
-          if (!isOnline(pid)) {
-            offlineParticipantIds.push(pid);
-          }
-        }
-
-        if (offlineParticipantIds.length > 0) {
-          const pushBody = sanitized ? sanitized : '[Attachment]';
-          for (const pid of offlineParticipantIds) {
-            sendPushToUser(pid, socket.userName, pushBody, {
-              type: 'chat',
-              conversationId: Number(conversationId),
-            });
-          }
-        }
+        });
 
         if (ack) ack({ message, clientTempId });
       } catch (err) {
@@ -419,7 +341,7 @@ function setupSocketIO(io) {
           return;
         }
 
-        const msgResult = await db.query('SELECT conversation_id, body, attachment_url, attachment_type FROM messages WHERE id = $1 AND deleted_at IS NULL', [messageId]);
+        const msgResult = await db.query('SELECT conversation_id, body, attachment_url, attachment_type, meta FROM messages WHERE id = $1 AND deleted_at IS NULL', [messageId]);
         if (msgResult.rows.length === 0) {
           if (ack) ack({ error: 'Message not found' });
           return;
@@ -436,33 +358,14 @@ function setupSocketIO(io) {
           return;
         }
 
-        const result = await db.query(
-          `INSERT INTO messages (conversation_id, sender_id, body, attachment_url, attachment_type)
-           VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-          [targetConversationId, socket.userId, msg.body, msg.attachment_url, msg.attachment_type]
-        );
-
-        const newMsg = result.rows[0];
-        const message = {
-          id: newMsg.id,
-          conversationId: Number(targetConversationId),
-          senderId: socket.userId,
-          senderName: socket.userName,
+        const message = await deliverMessage(io, {
+          conversationId: targetConversationId,
+          sender: { id: socket.userId, name: socket.userName },
           body: msg.body,
           attachmentUrl: msg.attachment_url,
           attachmentType: msg.attachment_type,
-          replyToId: null,
-          replyTo: null,
-          createdAt: newMsg.created_at,
-        };
-
-        await db.query('UPDATE conversations SET updated_at = NOW() WHERE id = $1', [targetConversationId]);
-        await db.query(
-          'UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1',
-          [targetConversationId]
-        );
-
-        io.to(`conv:${targetConversationId}`).emit('message:new', message);
+          meta: msg.meta,
+        });
 
         if (ack) ack({ ok: true, message });
       } catch (err) {

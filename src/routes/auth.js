@@ -4,8 +4,54 @@ const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { sanitizeText, validatePassword } = require('../middleware/sanitize');
+const { USERNAME_PATTERN } = require('../utils/mentions');
+const { notify } = require('../utils/notify');
+const {
+  DESIGNATIONS,
+  LEADERSHIP,
+  loadActor,
+  actorBestLevel,
+  isLeader,
+  isPortalAdmin,
+  displayTitle,
+  designationLevel,
+  BUSINESS_MANAGER_LEVEL,
+} = require('../utils/org');
 
 const router = express.Router();
+
+/** The signed-in user's profile plus their place in the hierarchy. */
+async function sessionUser(userId) {
+  const result = await db.query(
+    `SELECT u.id, u.name, u.username, u.email, u.role, u.business_id, u.status, u.created_at,
+            u.org_level, u.title, u.must_change_password, u.profile_picture,
+            b.name AS business_name, b.type AS business_type,
+            COALESCE((SELECT json_agg(json_build_object(
+                'business_id', ub.business_id, 'business_name', bb.name, 'business_color', bb.color,
+                'designation', ub.designation, 'title', ub.title) ORDER BY bb.sort_order, bb.name)
+              FROM user_businesses ub JOIN businesses bb ON bb.id = ub.business_id
+              WHERE ub.user_id = u.id), '[]') AS memberships
+     FROM users u
+     LEFT JOIN businesses b ON u.business_id = b.id
+     WHERE u.id = $1`,
+    [userId]
+  );
+  const user = result.rows[0];
+  if (!user) return null;
+  const actor = await loadActor(userId);
+  user.memberships = user.memberships.map((m) => ({
+    ...m,
+    designation_label: DESIGNATIONS[m.designation]?.label || 'Member',
+    level: designationLevel(m.designation),
+  }));
+  user.level = actorBestLevel(actor);
+  user.tier = user.org_level && LEADERSHIP[user.org_level] ? LEADERSHIP[user.org_level].label : null;
+  user.display_title = displayTitle(user, user.memberships[0]?.designation, user.memberships[0]?.title);
+  user.is_leader = isLeader(actor);
+  user.is_portal = isPortalAdmin(actor);
+  user.manages_business_ids = user.memberships.filter((m) => m.level <= BUSINESS_MANAGER_LEVEL).map((m) => m.business_id);
+  return user;
+}
 
 // POST /api/auth/signup
 router.post('/signup', async (req, res, next) => {
@@ -16,6 +62,9 @@ router.post('/signup', async (req, res, next) => {
 
     if (!name || !username || !password) {
       return res.status(400).json({ error: 'Name, username, and password are required' });
+    }
+    if (!USERNAME_PATTERN.test(username)) {
+      return res.status(400).json({ error: 'Username can use letters, numbers, dot, dash or underscore (3–30 characters, no spaces)' });
     }
     const pwError = validatePassword(password);
     if (pwError) {
@@ -42,19 +91,18 @@ router.post('/signup', async (req, res, next) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
 
-    // Notify all admins and super_admins about the new user
+    // Tell the people who can place newcomers in the organisation.
     const admins = await db.query(
-      `SELECT id FROM users WHERE role IN ('admin', 'super_admin')`
+      `SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND status != 'inactive'`
     );
-    for (const admin of admins.rows) {
-      await db.query(
-        `INSERT INTO notifications (user_id, type, message)
-         VALUES ($1, 'user_joined', $2)`,
-        [admin.id, `New user joined: ${name} (${username})`]
-      );
-    }
+    await notify(admins.rows.map((a) => a.id), {
+      type: 'user_joined',
+      title: '👤 New person signed up',
+      body: `${name} (@${username}) is waiting to be placed in a business.`,
+      data: { userId: user.id },
+    });
 
-    res.status(201).json({ token, user });
+    res.status(201).json({ token, user: await sessionUser(user.id) });
   } catch (err) {
     next(err);
   }
@@ -84,6 +132,9 @@ router.post('/login', async (req, res, next) => {
     if (!valid) {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
+    if (user.status === 'inactive') {
+      return res.status(403).json({ error: 'This account has been deactivated. Please contact your administrator.' });
+    }
 
     const token = jwt.sign(
       { id: user.id, username: user.username, role: user.role, business_id: user.business_id },
@@ -91,19 +142,7 @@ router.post('/login', async (req, res, next) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
 
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        name: user.name,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        business_id: user.business_id,
-        status: user.status,
-        created_at: user.created_at,
-      },
-    });
+    res.json({ token, user: await sessionUser(user.id) });
   } catch (err) {
     next(err);
   }
@@ -151,18 +190,11 @@ router.delete('/me', authenticate, async (req, res, next) => {
 // GET /api/auth/me — get current user from token
 router.get('/me', authenticate, async (req, res, next) => {
   try {
-    const result = await db.query(
-      `SELECT u.id, u.name, u.username, u.email, u.role, u.business_id, u.status, u.created_at,
-              b.name AS business_name, b.type AS business_type
-       FROM users u
-       LEFT JOIN businesses b ON u.business_id = b.id
-       WHERE u.id = $1`,
-      [req.user.id]
-    );
-    if (result.rows.length === 0) {
+    const user = await sessionUser(req.user.id);
+    if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
-    res.json({ user: result.rows[0] });
+    res.json({ user });
   } catch (err) {
     next(err);
   }

@@ -6,8 +6,10 @@ const stream = require('stream');
 const { promisify } = require('util');
 const db = require('../db');
 const { authenticate, requireAdmin } = require('../middleware/auth');
+const jwt = require('jsonwebtoken');
 const { DELETE_FOR_EVERYONE_WINDOW_MS, EDIT_WINDOW_MS } = require('../constants/chat');
 const cloudinary = require('../utils/cloudinary');
+const { deliverMessage, previewFor } = require('../services/chatDelivery');
 
 const router = express.Router();
 
@@ -51,11 +53,6 @@ function sanitizeBody(body) {
   if (trimmed.length === 0) return null;
   if (trimmed.length > MAX_MESSAGE_LENGTH) return trimmed.slice(0, MAX_MESSAGE_LENGTH);
   return trimmed.replace(/<[^>]*>/g, '');
-}
-
-async function getUserBusinesses(userId) {
-  const result = await db.query('SELECT business_id FROM user_businesses WHERE user_id = $1', [userId]);
-  return result.rows.map((r) => r.business_id);
 }
 
 async function isParticipant(conversationId, userId) {
@@ -108,7 +105,7 @@ async function buildConversationPreview(conversationId, userId, viewerRole) {
 
   const isSuperAdmin = viewerRole === 'super_admin';
   const participants = await db.query(
-    `SELECT u.id, u.name, u.role, u.status, u.business_id, u.profile_picture, u.last_seen
+    `SELECT u.id, u.name, u.username, u.role, u.status, u.business_id, u.profile_picture, u.last_seen
      FROM conversation_participants cp
      JOIN users u ON u.id = cp.user_id
      WHERE cp.conversation_id = $1 ${isSuperAdmin ? '' : "AND cp.is_invisible = FALSE"}
@@ -124,37 +121,24 @@ async function buildConversationPreview(conversationId, userId, viewerRole) {
   };
 }
 
-// GET /api/chat/users — list users available to start a chat with
+// GET /api/chat/users â€” list users available to start a chat with
 router.get('/users', authenticate, async (req, res, next) => {
   try {
-    const isAdmin = ['admin', 'super_admin'].includes(req.user.role);
-    let result;
-    if (isAdmin) {
-      result = await db.query(
-        `SELECT u.id, u.name, u.username, u.role, u.status
-         FROM users u
-         WHERE u.id != $1 AND u.status = 'active'
-         ORDER BY u.name`,
-        [req.user.id]
-      );
-    } else {
-      result = await db.query(
-        `SELECT DISTINCT u.id, u.name, u.username, u.role, u.status
-         FROM users u
-         JOIN user_businesses ub1 ON ub1.user_id = u.id
-         JOIN user_businesses ub2 ON ub2.business_id = ub1.business_id AND ub2.user_id = $1
-         WHERE u.id != $1 AND u.status = 'active'
-         ORDER BY u.name`,
-        [req.user.id]
-      );
-    }
+    // Internal app: everyone can start a chat with any active colleague, across businesses.
+    const result = await db.query(
+      `SELECT u.id, u.name, u.username, u.role, u.status, u.profile_picture, u.title, u.org_level
+       FROM users u
+       WHERE u.id != $1 AND u.status != 'inactive'
+       ORDER BY u.org_level NULLS LAST, u.name`,
+      [req.user.id]
+    );
     res.json({ users: result.rows });
   } catch (err) {
     next(err);
   }
 });
 
-// GET /api/chat/conversations — list current user's conversations
+// GET /api/chat/conversations â€” list current user's conversations
 router.get('/conversations', authenticate, async (req, res, next) => {
   try {
     const isSuperAdmin = req.user.role === 'super_admin';
@@ -172,7 +156,7 @@ router.get('/conversations', authenticate, async (req, res, next) => {
        last_msgs AS (
          SELECT DISTINCT ON (m.conversation_id)
            m.conversation_id, m.id, m.body, m.attachment_url, m.attachment_type,
-           m.sender_id, m.created_at, m.deleted_at
+           m.sender_id, m.created_at, m.deleted_at, m.meta
          FROM messages m
          WHERE m.deleted_at IS NULL
            AND NOT EXISTS (
@@ -197,7 +181,7 @@ router.get('/conversations', authenticate, async (req, res, next) => {
        conv_participants AS (
          SELECT cu.conversation_id,
            json_agg(json_build_object(
-             'id', u.id, 'name', u.name, 'role', u.role,
+             'id', u.id, 'name', u.name, 'username', u.username, 'role', u.role,
             'status', u.status, 'business_id', u.business_id,
             'profile_picture', u.profile_picture, 'last_seen', u.last_seen,
             'is_admin', cu.is_admin
@@ -222,6 +206,7 @@ router.get('/conversations', authenticate, async (req, res, next) => {
          lm.sender_id AS last_msg_sender_id,
          lm.created_at AS last_msg_created_at,
          lm.deleted_at AS last_msg_deleted_at,
+         lm.meta AS last_msg_meta,
          COALESCE(uc_cnt.cnt, 0) AS unread_count,
          cp_part.participants
        FROM user_convs uc
@@ -244,7 +229,7 @@ router.get('/conversations', authenticate, async (req, res, next) => {
       participants: row.participants || [],
       last_message: row.last_msg_id ? {
         id: row.last_msg_id,
-        body: row.last_msg_body,
+        body: row.last_msg_body || (row.last_msg_meta ? previewFor({ meta: row.last_msg_meta }) : null),
         attachment_url: row.last_msg_attachment_url,
         attachment_type: row.last_msg_attachment_type,
         sender_id: row.last_msg_sender_id,
@@ -261,7 +246,7 @@ router.get('/conversations', authenticate, async (req, res, next) => {
   }
 });
 
-// POST /api/chat/conversations — start a direct or group conversation
+// POST /api/chat/conversations â€” start a direct or group conversation
 router.post('/conversations', authenticate, async (req, res, next) => {
   try {
     const { type, participantIds, name, businessId } = req.body;
@@ -287,18 +272,12 @@ router.post('/conversations', authenticate, async (req, res, next) => {
       }
     }
 
-    const isAdmin = ['admin', 'super_admin'].includes(req.user.role);
-
-    if (!isAdmin) {
-      const userBusinesses = await getUserBusinesses(req.user.id);
-      for (const pid of participantIds) {
-        if (pid === req.user.id) continue;
-        const pBusinesses = await getUserBusinesses(pid);
-        const hasCommon = pBusinesses.some((b) => userBusinesses.includes(b));
-        if (!hasCommon) {
-          return res.status(403).json({ error: 'You can only message users within your assigned businesses' });
-        }
-      }
+    const activeCheck = await db.query(
+      `SELECT COUNT(*)::int AS cnt FROM users WHERE id = ANY($1::int[]) AND status != 'inactive'`,
+      [participantIds.map(Number)]
+    );
+    if (activeCheck.rows[0].cnt !== new Set(participantIds.map(Number)).size) {
+      return res.status(400).json({ error: 'One or more participants were not found' });
     }
 
     if (type === 'direct') {
@@ -371,7 +350,7 @@ router.post('/conversations', authenticate, async (req, res, next) => {
   }
 });
 
-// GET /api/chat/conversations/:id/messages — paginated message history
+// GET /api/chat/conversations/:id/messages â€” paginated message history
 router.get('/conversations/:id/messages', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -385,7 +364,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
     let query, params;
     if (after) {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.deleted_by, m.reply_to_id
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.deleted_by, m.reply_to_id, m.meta
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $4
                WHERE m.conversation_id = $1 AND m.id > $2 AND md.message_id IS NULL
@@ -393,7 +372,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
       params = [id, parseInt(after), lim, req.user.id];
     } else if (before) {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.deleted_by, m.reply_to_id
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.deleted_by, m.reply_to_id, m.meta
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $4
                WHERE m.conversation_id = $1 AND m.id < $2 AND md.message_id IS NULL
@@ -401,7 +380,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
       params = [id, parseInt(before), lim, req.user.id];
     } else {
       query = `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.deleted_by, m.reply_to_id
+                      m.body, m.attachment_url, m.attachment_type, m.created_at, m.edited_at, m.is_edited, m.deleted_at, m.deleted_by, m.reply_to_id, m.meta
                FROM messages m JOIN users u ON u.id = m.sender_id
                LEFT JOIN message_deletions md ON md.message_id = m.id AND md.user_id = $3
                WHERE m.conversation_id = $1 AND md.message_id IS NULL
@@ -459,7 +438,7 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
   }
 });
 
-// POST /api/chat/conversations/:id/messages — REST fallback send
+// POST /api/chat/conversations/:id/messages â€” REST fallback send
 router.post('/conversations/:id/messages', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -474,53 +453,15 @@ router.post('/conversations/:id/messages', authenticate, async (req, res, next) 
       return res.status(400).json({ error: 'Message body or attachment is required' });
     }
 
-    const result = await db.query(
-      `INSERT INTO messages (conversation_id, sender_id, body, attachment_url, attachment_type, reply_to_id)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
-      [id, req.user.id, sanitized, attachmentUrl || null, attachmentType || null, replyToId || null]
-    );
-
-    const msg = result.rows[0];
     const userResult = await db.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-
-    let replyTo = null;
-    if (replyToId) {
-      const replyResult = await db.query(
-        `SELECT m.id, m.body, m.attachment_url, m.attachment_type, u.name as sender_name
-         FROM messages m JOIN users u ON u.id = m.sender_id
-         WHERE m.id = $1`,
-        [replyToId]
-      );
-      if (replyResult.rows.length > 0) {
-        const r = replyResult.rows[0];
-        replyTo = {
-          id: r.id,
-          body: r.body,
-          attachmentUrl: r.attachment_url,
-          attachmentType: r.attachment_type,
-          senderName: r.sender_name,
-        };
-      }
-    }
-
-    const message = {
-      id: msg.id,
-      conversationId: parseInt(id),
-      senderId: req.user.id,
-      senderName: userResult.rows[0].name,
+    const message = await deliverMessage(req.app.get('io'), {
+      conversationId: id,
+      sender: { id: req.user.id, name: userResult.rows[0]?.name || 'Someone' },
       body: sanitized,
       attachmentUrl: attachmentUrl || null,
       attachmentType: attachmentType || null,
       replyToId: replyToId || null,
-      replyTo,
-      createdAt: msg.created_at,
-    };
-
-    await db.query('UPDATE conversations SET updated_at = NOW() WHERE id = $1', [id]);
-    await db.query(
-      'UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1 AND user_id != $2',
-      [id, req.user.id]
-    );
+    });
 
     res.status(201).json({ message, clientTempId });
   } catch (err) {
@@ -528,7 +469,7 @@ router.post('/conversations/:id/messages', authenticate, async (req, res, next) 
   }
 });
 
-// PATCH /api/chat/conversations/:id/read — mark read up to a message id
+// PATCH /api/chat/conversations/:id/read â€” mark read up to a message id
 router.patch('/conversations/:id/read', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -554,7 +495,7 @@ router.patch('/conversations/:id/read', authenticate, async (req, res, next) => 
   }
 });
 
-// DELETE /api/chat/conversations/:id — hide conversation for current user
+// DELETE /api/chat/conversations/:id â€” hide conversation for current user
 router.delete('/conversations/:id', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -586,7 +527,7 @@ router.delete('/conversations/:id', authenticate, async (req, res, next) => {
     );
 
     if (parseInt(remaining.rows[0].cnt, 10) === 0) {
-      // No unhidden participants left — permanently delete the conversation and all its messages
+      // No unhidden participants left â€” permanently delete the conversation and all its messages
       await db.query('DELETE FROM message_deletions WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = $1)', [id]);
       await db.query('DELETE FROM messages WHERE conversation_id = $1', [id]);
       await db.query('DELETE FROM conversation_participants WHERE conversation_id = $1', [id]);
@@ -604,7 +545,7 @@ router.delete('/conversations/:id', authenticate, async (req, res, next) => {
   }
 });
 
-// DELETE /api/chat/messages/:id?scope=me|everyone — WhatsApp-style message deletion
+// DELETE /api/chat/messages/:id?scope=me|everyone â€” WhatsApp-style message deletion
 router.delete('/messages/:id', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -676,7 +617,7 @@ router.delete('/messages/:id', authenticate, async (req, res, next) => {
   }
 });
 
-// POST /api/chat/upload — image/file/audio upload for attachments
+// POST /api/chat/upload â€” image/file/audio upload for attachments
 router.post('/upload', authenticate, upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) {
@@ -684,9 +625,31 @@ router.post('/upload', authenticate, upload.single('file'), async (req, res, nex
     }
     if (USE_CLOUDINARY) {
       const ext = path.extname(req.file.originalname || '');
-      const publicId = `chat/${Date.now()}_${Math.round(Math.random() * 1e9)}`;
-      const resourceType = req.file.mimetype.startsWith('image/') ? 'image' : 'raw';
       const isImage = req.file.mimetype.startsWith('image/');
+      const isAudio = req.file.mimetype.startsWith('audio/');
+      const isPdf = req.file.mimetype === 'application/pdf';
+      const publicId = `chat/${Date.now()}_${Math.round(Math.random() * 1e9)}`;
+
+      // PDFs: Cloudinary blocks PDF delivery, so convert to PNG image on upload
+      if (isPdf) {
+        const result = await new Promise((resolve, reject) => {
+          const uploadStream = cloudinary.uploader.upload_stream(
+            { public_id: publicId, resource_type: 'image', format: 'png' },
+            (err, result) => (err ? reject(err) : resolve(result)),
+          );
+          const bufferStream = new stream.PassThrough();
+          bufferStream.end(req.file.buffer);
+          bufferStream.pipe(uploadStream);
+        });
+        return res.status(201).json({
+          url: result.secure_url,
+          type: 'image/png',
+          filename: req.file.originalname,
+          size: req.file.size,
+        });
+      }
+
+      const resourceType = isImage ? 'image' : 'raw';
       const uploadOpts = {
         public_id: publicId,
         resource_type: resourceType,
@@ -725,7 +688,62 @@ router.post('/upload', authenticate, upload.single('file'), async (req, res, nex
   }
 });
 
-// PATCH /api/chat/messages/:id — edit message
+// GET /api/chat/attachment/:messageId?token=JWT â€” proxy Cloudinary raw files to client
+// Needed because Cloudinary blocks PDF delivery. PDFs are stored as .doc to bypass,
+// and this proxy streams them with the correct Content-Type from the message record.
+// Accepts token via query param since WebBrowser can't send Authorization headers.
+router.get('/attachment/:messageId', async (req, res, next) => {
+  try {
+    const token = req.query.token || (req.headers.authorization || '').replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    let userId;
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      userId = decoded.id;
+    } catch {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const { messageId } = req.params;
+    const msgResult = await db.query(
+      'SELECT attachment_url, attachment_type, conversation_id FROM messages WHERE id = $1 AND deleted_at IS NULL',
+      [messageId]
+    );
+    if (msgResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Attachment not found' });
+    }
+    const msg = msgResult.rows[0];
+    if (!(await isParticipant(msg.conversation_id, userId))) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    if (!msg.attachment_url) {
+      return res.status(404).json({ error: 'No attachment on this message' });
+    }
+
+    const url = msg.attachment_url;
+
+    // For Cloudinary raw files (PDFs stored as .doc), fetch and stream with correct Content-Type
+    if (url.includes('res.cloudinary.com') && url.includes('/raw/upload/')) {
+      const response = await fetch(url);
+      if (!response.ok) {
+        return res.status(response.status).json({ error: 'Failed to fetch attachment' });
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      res.setHeader('Content-Type', msg.attachment_type || 'application/octet-stream');
+      res.setHeader('Content-Disposition', 'inline');
+      return res.send(buffer);
+    }
+
+    // Non-Cloudinary files â€” redirect directly
+    res.redirect(url);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/chat/messages/:id â€” edit message
 router.patch('/messages/:id', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -768,7 +786,7 @@ router.patch('/messages/:id', authenticate, async (req, res, next) => {
   }
 });
 
-// PATCH /api/chat/conversations/:id/mute — toggle mute
+// PATCH /api/chat/conversations/:id/mute â€” toggle mute
 router.patch('/conversations/:id/mute', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -786,7 +804,7 @@ router.patch('/conversations/:id/mute', authenticate, async (req, res, next) => 
   }
 });
 
-// POST /api/chat/upload-profile-picture — upload user profile picture
+// POST /api/chat/upload-profile-picture â€” upload user profile picture
 router.post('/upload-profile-picture', authenticate, upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) {
@@ -816,7 +834,7 @@ router.post('/upload-profile-picture', authenticate, upload.single('file'), asyn
   }
 });
 
-// GET /api/chat/conversations/:id/pinned — get pinned message
+// GET /api/chat/conversations/:id/pinned â€” get pinned message
 router.get('/conversations/:id/pinned', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -837,7 +855,7 @@ router.get('/conversations/:id/pinned', authenticate, async (req, res, next) => 
   }
 });
 
-// PUT /api/chat/conversations/:id/pinned — pin a message (REST fallback)
+// PUT /api/chat/conversations/:id/pinned â€” pin a message (REST fallback)
 router.put('/conversations/:id/pinned', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -858,7 +876,7 @@ router.put('/conversations/:id/pinned', authenticate, async (req, res, next) => 
   }
 });
 
-// PATCH /api/chat/last-seen — update user's last seen timestamp (REST fallback)
+// PATCH /api/chat/last-seen â€” update user's last seen timestamp (REST fallback)
 router.patch('/last-seen', authenticate, async (req, res, next) => {
   try {
     await db.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [req.user.id]);
@@ -868,7 +886,7 @@ router.patch('/last-seen', authenticate, async (req, res, next) => {
   }
 });
 
-// DELETE /api/chat/conversations/:id/leave — leave a group conversation
+// DELETE /api/chat/conversations/:id/leave â€” leave a group conversation
 router.delete('/conversations/:id/leave', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
