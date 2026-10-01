@@ -17,6 +17,7 @@ const {
   designationLevel,
   BUSINESS_MANAGER_LEVEL,
 } = require('../utils/org');
+const { actorCanMonitor } = require('../services/monitor');
 
 const router = express.Router();
 
@@ -49,6 +50,8 @@ async function sessionUser(userId) {
   user.display_title = displayTitle(user, user.memberships[0]?.designation, user.memberships[0]?.title);
   user.is_leader = isLeader(actor);
   user.is_portal = isPortalAdmin(actor);
+  // Leadership and business heads can watch the to-dos of the people below them (Team Monitor).
+  user.can_monitor = actorCanMonitor(actor);
   user.manages_business_ids = user.memberships.filter((m) => m.level <= BUSINESS_MANAGER_LEVEL).map((m) => m.business_id);
   return user;
 }

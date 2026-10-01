@@ -14,6 +14,8 @@ const taskRoutes = require('./routes/tasks');
 const notificationRoutes = require('./routes/notifications');
 const chatRoutes = require('./routes/chat');
 const todoRoutes = require('./routes/todos');
+const todoTimelineRoutes = require('./routes/todoTimeline');
+const monitorRoutes = require('./routes/monitor');
 const orgRoutes = require('./routes/org');
 const approvalRoutes = require('./routes/approvals');
 const db = require('./db');
@@ -129,6 +131,8 @@ app.use('/api/tasks', taskRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/chat', chatLimiter, chatRoutes);
 app.use('/api/todos', todoRoutes);
+app.use('/api/todos', todoTimelineRoutes);
+app.use('/api/monitor', monitorRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/approvals', approvalRoutes);
 
