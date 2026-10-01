@@ -8,6 +8,9 @@ const { setMemberships, syncLeaderGroups, ensureBusinessGroup } = require('../se
  * Change names/usernames here before the first deploy if needed.
  */
 const SEED_MARKER = 'seed:organization-v1';
+// Second pass: the business accountants. Separate marker so deployments that already
+// ran v1 still pick these up on their next start.
+const ACCOUNTANTS_MARKER = 'seed:organization-v2-accountants';
 
 const BUSINESSES = [
   { name: 'VGrand Family Restaurant', type: 'restaurant', color: 'orange', aliases: ['vgrand family restaurant', 'vigrand family restaurant', 'v grand family restaurant', 'vgrand restaurant'] },
@@ -27,20 +30,21 @@ const PEOPLE = [
   { name: 'Ashok Kumar', username: 'ashok', memberships: [{ business: 'VGrand Infra', designation: 'head' }] },
 ];
 
+// Accountants per business. "Accountant Infra" is a placeholder name: rename it from the
+// Organisation screen once the real person is known.
+const ACCOUNTANTS = [
+  { name: 'Vasavi', username: 'vasavi', memberships: [{ business: 'VGrand Family Restaurant', designation: 'accountant' }] },
+  { name: 'Accountant Infra', username: 'infra.accountant', memberships: [{ business: 'VGrand Infra', designation: 'accountant' }] },
+  { name: 'Shafi', username: 'shafi', memberships: [{ business: 'BVL Mines & Minerals', designation: 'accountant' }] },
+  { name: 'Prudvi', username: 'prudvi', memberships: [{ business: 'BVL Mines & Minerals', designation: 'accountant' }] },
+];
+
 const ROLE_RANK = { user: 1, admin: 2, super_admin: 3 };
 
 const normalize = (s) => String(s || '').toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]/g, '');
 
-async function seedOrganization(q, { log = console.log } = {}) {
-  if (process.env.SEED_ORGANIZATION === 'false') return;
-  const done = await q.query('SELECT 1 FROM migrations WHERE filename = $1', [SEED_MARKER]);
-  if (done.rows.length) return;
-
-  log('Seeding VGrand organisation...');
-  const defaultPassword = process.env.SEED_DEFAULT_PASSWORD || 'Vgrand@2026';
-  const hash = await bcrypt.hash(defaultPassword, 10);
-
-  // Businesses: reuse an existing one when the name matches, otherwise create it.
+/** Reuse an existing business when the name matches, otherwise create it. */
+async function ensureBusinesses(q, log) {
   const existingBiz = await q.query('SELECT id, name FROM businesses');
   const businessIds = {};
   let order = 1;
@@ -60,9 +64,12 @@ async function seedOrganization(q, { log = console.log } = {}) {
     }
     order += 1;
   }
+  return businessIds;
+}
 
-  // People: place existing accounts with the same username, create the rest.
-  for (const person of PEOPLE) {
+/** Place existing accounts with the same username, create the rest. */
+async function placePeople(q, people, businessIds, hash, log) {
+  for (const person of people) {
     const role = roleForOrgLevel(person.orgLevel || null);
     const existing = await q.query('SELECT id, role FROM users WHERE LOWER(username) = LOWER($1)', [person.username]);
     let userId;
@@ -71,7 +78,9 @@ async function seedOrganization(q, { log = console.log } = {}) {
       userId = existing.rows[0].id;
       // Place the existing account but never downgrade the permissions it already has.
       if (ROLE_RANK[existing.rows[0].role] > ROLE_RANK[role]) effectiveRole = existing.rows[0].role;
-      await q.query('UPDATE users SET org_level = $1, role = $2 WHERE id = $3', [person.orgLevel || null, effectiveRole, userId]);
+      if (person.orgLevel) {
+        await q.query('UPDATE users SET org_level = $1, role = $2 WHERE id = $3', [person.orgLevel, effectiveRole, userId]);
+      }
       log(`  ~ placed existing account @${person.username}`);
     } else {
       const created = await q.query(
@@ -91,11 +100,34 @@ async function seedOrganization(q, { log = console.log } = {}) {
     }
     if (effectiveRole !== 'user') await syncLeaderGroups(q, userId, effectiveRole);
   }
-
-  for (const id of Object.values(businessIds)) await ensureBusinessGroup(q, id);
-
-  await q.query('INSERT INTO migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [SEED_MARKER]);
-  log(`  ✓ Organisation seeded. New accounts use the password "${defaultPassword}" and must change it on first login.`);
 }
 
-module.exports = { seedOrganization, BUSINESSES, PEOPLE };
+async function seedOrganization(q, { log = console.log } = {}) {
+  if (process.env.SEED_ORGANIZATION === 'false') return;
+  const defaultPassword = process.env.SEED_DEFAULT_PASSWORD || 'Vgrand@2026';
+
+  const done = await q.query('SELECT filename FROM migrations WHERE filename = ANY($1)', [[SEED_MARKER, ACCOUNTANTS_MARKER]]);
+  const ran = new Set(done.rows.map((r) => r.filename));
+  if (ran.has(SEED_MARKER) && ran.has(ACCOUNTANTS_MARKER)) return;
+
+  const hash = await bcrypt.hash(defaultPassword, 10);
+  const businessIds = await ensureBusinesses(q, log);
+
+  if (!ran.has(SEED_MARKER)) {
+    log('Seeding VGrand organisation...');
+    await placePeople(q, PEOPLE, businessIds, hash, log);
+    await q.query('INSERT INTO migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [SEED_MARKER]);
+    log(`  ✓ Organisation seeded. New accounts use the password "${defaultPassword}" and must change it on first login.`);
+  }
+
+  if (!ran.has(ACCOUNTANTS_MARKER)) {
+    log('Seeding business accountants...');
+    await placePeople(q, ACCOUNTANTS, businessIds, hash, log);
+    await q.query('INSERT INTO migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [ACCOUNTANTS_MARKER]);
+    log('  ✓ Accountants seeded.');
+  }
+
+  for (const id of Object.values(businessIds)) await ensureBusinessGroup(q, id);
+}
+
+module.exports = { seedOrganization, BUSINESSES, PEOPLE, ACCOUNTANTS };

@@ -122,6 +122,7 @@ Each socket joins `user:<id>` (personal room) on connect and `conv:<id>` rooms v
 | PUT | `/:id` | Edit / reassign |
 | PUT | `/:id/status` | `pending` · `in_progress` · `completed` (→ `in_review` if approval needed) · `on_hold` |
 | POST | `/:id/approve`, `/:id/reject` | Review decision (`note`) |
+| POST | `/share` | Share task(s) into chats: `{ conversation_ids, task_ids, note? }` (chat message with `meta.kind = 'task'`; a snapshot, so it never grants access to the task) |
 | POST | `/:id/comments` | Comment (`@mentions` notify) |
 | PUT | `/:id/warn` | Warn the assignee (must be senior) |
 | DELETE | `/:id` | Delete (creator or senior) |

@@ -4,6 +4,7 @@ const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
 const { notify } = require('../utils/notify');
 const { resolveMentions } = require('../utils/mentions');
+const { deliverMessage } = require('../services/chatDelivery');
 const {
   loadActor,
   actorLevelIn,
@@ -209,6 +210,62 @@ router.get('/assignees', authenticate, async (req, res, next) => {
       [businessId]
     );
     res.json({ users: result.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/tasks/share — { conversation_ids: [], task_ids: [], note? }
+// Drops a task card into chats. The card is a snapshot; opening it still goes through
+// the normal visibility rules, so sharing never grants access to the task itself.
+router.post('/share', authenticate, async (req, res, next) => {
+  try {
+    const conversationIds = [...new Set((req.body.conversation_ids || []).map(Number).filter(Boolean))].slice(0, 20);
+    const taskIds = [...new Set((req.body.task_ids || []).map(Number).filter(Boolean))].slice(0, 10);
+    if (!conversationIds.length || !taskIds.length) {
+      return res.status(400).json({ error: 'Pick at least one chat and one task' });
+    }
+    const actor = await withActor(req, res);
+    if (!actor) return;
+
+    const items = [];
+    for (const id of taskIds) {
+      const { task } = await getTaskForActor(id, actor);
+      if (task) {
+        items.push({
+          id: task.id,
+          title: task.title,
+          description: task.description || '',
+          status: task.status,
+          priority: task.priority,
+          due_date: task.due_date,
+          business_name: task.business_name,
+          assigned_user_name: task.assigned_user_name || null,
+          created_by_name: task.created_by_name,
+        });
+      }
+    }
+    if (!items.length) return res.status(404).json({ error: 'Task not found or not visible to you' });
+
+    const allowed = await db.query(
+      `SELECT conversation_id FROM conversation_participants
+       WHERE user_id = $1 AND conversation_id = ANY($2::int[])`,
+      [req.user.id, conversationIds]
+    );
+    if (!allowed.rows.length) return res.status(403).json({ error: 'You are not in those chats' });
+
+    const meta = { kind: 'task', task: items[0], tasks: items, shared_by: { id: actor.id, name: actor.name } };
+    const note = sanitizeText(req.body.note, 2000) || null;
+    const io = req.app.get('io');
+    for (const row of allowed.rows) {
+      await deliverMessage(io, {
+        conversationId: row.conversation_id,
+        sender: { id: actor.id, name: actor.name },
+        body: note,
+        meta,
+      });
+    }
+    res.status(201).json({ shared: allowed.rows.length });
   } catch (err) {
     next(err);
   }
