@@ -80,6 +80,7 @@ async function monitorablePeople(actorId) {
       tier: u.org_level && LEADERSHIP[u.org_level] ? LEADERSHIP[u.org_level].label : null,
       display_title: displayTitle(u, u.memberships[0]?.designation, u.memberships[0]?.title),
       businesses: u.memberships.map((m) => m.business_name).filter(Boolean),
+      business_ids: u.memberships.map((m) => Number(m.business_id)).filter(Boolean),
     });
   }
   people.sort((a, b) => (a.level ?? 99) - (b.level ?? 99) || a.name.localeCompare(b.name));

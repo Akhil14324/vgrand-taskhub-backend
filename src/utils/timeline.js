@@ -142,6 +142,7 @@ function completionSnapshot(todo, now = Date.now()) {
     title: todo.title,
     assignee_id: todo.assignee_id ?? todo.created_by,
     is_subtask: !!todo.parent_id,
+    business_id: todo.business_id || null,
     lead_s: m.lead_s,
     response_s: m.response_s,
     cycle_s: m.cycle_s,

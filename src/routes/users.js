@@ -307,6 +307,10 @@ const PREFERENCE_RULES = {
   showCompleted: (v) => typeof v === 'boolean',
   reduceMotion: (v) => typeof v === 'boolean',
   confirmBeforeDelete: (v) => typeof v === 'boolean',
+  morningDigest: (v) => typeof v === 'boolean',
+  sounds: (v) => typeof v === 'boolean',
+  haptics: (v) => typeof v === 'boolean',
+  celebrations: (v) => typeof v === 'boolean',
 };
 
 // PUT /api/users/me/preferences — merge a few personal settings; they change the app for this account only

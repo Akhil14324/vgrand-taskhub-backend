@@ -21,6 +21,13 @@ const db = require('./db');
 const { runMigrations } = require('./migrations/run');
 const { scheduleOverdueNotifications } = require('./jobs/overdueNotifications');
 const { scheduleTodoReminders } = require('./jobs/todoReminders');
+const { scheduleNudges } = require('./jobs/nudges');
+const engageRoutes = require('./routes/engage');
+const templateRoutes = require('./routes/templates');
+const insightRoutes = require('./routes/insights');
+const goalRoutes = require('./routes/goals');
+const collabRoutes = require('./routes/collab');
+const standupRoutes = require('./routes/standup');
 const { setIO } = require('./utils/notify');
 const { setupSocketIO } = require('./socket');
 const { requestId } = require('./middleware/requestId');
@@ -131,6 +138,12 @@ app.use('/api/chat', chatLimiter, chatRoutes);
 app.use('/api/todos', todoRoutes);
 app.use('/api/todos', todoTimelineRoutes);
 app.use('/api/monitor', monitorRoutes);
+app.use('/api/engage', engageRoutes);
+app.use('/api/templates', templateRoutes);
+app.use('/api/insights', insightRoutes);
+app.use('/api/goals', goalRoutes);
+app.use('/api/collab', collabRoutes);
+app.use('/api/standup', standupRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/approvals', approvalRoutes);
 
@@ -173,6 +186,7 @@ if (require.main === module) {
       });
       scheduleOverdueNotifications();
       scheduleTodoReminders();
+      scheduleNudges();
     } catch (err) {
       console.error('Failed to start server:', err);
       process.exit(1);

@@ -371,139 +371,150 @@ router.post('/reorder', authenticate, async (req, res, next) => {
 //                     business_id?, assign_to?, requires_approval?, source_business_id? }
 // With a business_id it is a business to-do: set directly by someone who manages that business, otherwise
 // proposed for review. Sub-tasks (any depth) belong to the same business as their parent.
+/**
+ * Creates one to-do (or sub-task) for `actor` from a request-shaped body; shared by POST / and templates.
+ * Returns { status, error } on a refusal, otherwise { status: 201, todo }. `quiet` skips the business
+ * notifications and the realtime announcement (a template announces once, at the end).
+ */
+async function createTodoCore(actor, body, { quiet = false } = {}) {
+  const title = sanitizeText(body.title, 500);
+  if (!title) return { status: 400, error: 'What needs to be done?' };
+  const notes = sanitizeText(body.notes, 5000);
+
+  let parent = null;
+  const parentId = parseInt(body.parent_id, 10) || null;
+  if (parentId) {
+    parent = await getTodoFor(parentId, actor.id, actor);
+    if (!parent) return { status: 404, error: 'To-do not found' };
+    if (!parent.permissions.can_add_subtask) return { status: 403, error: 'You cannot add to this to-do' };
+    if ((await depthOf(parent.id)) + 1 > MAX_DEPTH) {
+      return { status: 400, error: `Sub-tasks can go ${MAX_DEPTH} levels deep` };
+    }
+  }
+
+  const businessId = parent ? parent.business_id : (parseInt(body.business_id, 10) || null);
+  let business = null;
+  if (businessId) {
+    business = (await db.query('SELECT id, name FROM businesses WHERE id = $1', [businessId])).rows[0];
+    if (!business) return { status: 404, error: 'Business not found' };
+  }
+
+  const place = businessId
+    ? { listId: null, sectionId: null }
+    : await resolvePlacement(actor.id, parseInt(body.list_id, 10) || null, parseInt(body.section_id, 10) || null);
+  if (place.error) return { status: 404, error: place.error };
+
+  const assignTo = parseInt(body.assign_to ?? body.assigned_user_id, 10) || null;
+  if (businessId && assignTo && !(await isAssignable(assignTo, businessId))) {
+    return { status: 400, error: 'That person is not part of this business' };
+  }
+
+  let reviewState = 'accepted';
+  if (parent) reviewState = parent.review_state;
+  else if (businessId && !(isLeader(actor) || managesBusiness(actor, businessId))) reviewState = 'proposed';
+
+  let assigneeId = actor.id;
+  if (businessId) {
+    if (assignTo) assigneeId = assignTo;
+    else if (parent) assigneeId = parent.assignee_id || null;
+    else assigneeId = reviewState === 'proposed' ? actor.id : null;
+  }
+
+  const topLevelBusiness = !!businessId && !parent;
+  const requiresApproval = topLevelBusiness
+    ? (body.requires_approval !== undefined
+      ? !!body.requires_approval
+      : !!(assigneeId && assigneeId !== actor.id))
+    : false;
+  let sourceBusinessId = topLevelBusiness ? (parseInt(body.source_business_id, 10) || null) : null;
+  if (topLevelBusiness && !sourceBusinessId && !actor.memberships.has(businessId) && !isLeader(actor)) {
+    sourceBusinessId = [...actor.memberships.keys()][0] || null;
+  }
+
+  const recurrence = RECURRENCES.includes(body.recurrence) ? body.recurrence : null;
+  const dueDate = parseDate(body.due_date) || (recurrence ? todayInAppZone() : null);
+  const dueTime = parseTime(body.due_time);
+
+  const inserted = await db.query(
+    `INSERT INTO todos (created_by, title, notes, due_date, due_time, priority, recurrence,
+                        parent_id, labels, deadline_date, duration_minutes, reminder_offsets,
+                        assignee_id, assigned_at, business_id, source_business_id, requires_approval, review_state)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::int,
+             CASE WHEN $13::int IS NOT NULL THEN NOW() END, $14, $15, $16, $17)
+     RETURNING id, title, business_id`,
+    [
+      actor.id, title, notes || '', dueDate, dueTime, parsePriority(body.priority), recurrence,
+      parent ? parent.id : null, parseLabels(body.labels), parseDate(body.deadline_date),
+      parseDuration(body.duration_minutes), dueTime ? parseOffsets(body.reminder_offsets) : [],
+      assigneeId, businessId, sourceBusinessId, requiresApproval, reviewState,
+    ]
+  );
+  const todo = inserted.rows[0];
+
+  if (parent) {
+    await attachSubtaskMembers(todo.id, parent, actor.id);
+    await ensureMember(todo.id, actor.id, actor.id);
+    if (assigneeId) await ensureMember(todo.id, assigneeId, actor.id);
+  } else if (businessId) {
+    await ensureMember(todo.id, actor.id, actor.id);
+    if (assigneeId && assigneeId !== actor.id) await ensureMember(todo.id, assigneeId, actor.id);
+  } else {
+    await db.query(
+      'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by) VALUES ($1, $2, $3, $4, $2)',
+      [todo.id, actor.id, place.listId, place.sectionId]
+    );
+  }
+
+  await logEvent({
+    todoId: todo.id, userId: actor.id, subjectId: assigneeId || actor.id, kind: 'created',
+    meta: { title, parent_id: parent ? parent.id : null, business_id: businessId, review_state: reviewState },
+  });
+
+  const added = await addMentionedMembers(todo, `${title} ${notes || ''}`, body.mention_ids, actor, {
+    quietFor: assignTo || null,
+  });
+
+  if (!businessId) {
+    // "Assign to @ravi": the person who is accountable, not just a collaborator.
+    if (assignTo && added.includes(assignTo)) await assignTodo(todo, assignTo, actor);
+  } else if (!quiet) {
+    const urgent = parsePriority(body.priority) === 1 ? 'Urgent: ' : '';
+    if (reviewState === 'proposed') {
+      const approvers = await nextApprovers(businessId, actorLevelIn(actor, businessId), actor.id);
+      await notify(approvers, {
+        type: 'todo_proposed',
+        title: `${actor.name} proposed a task`,
+        body: `${title} · ${business.name}`,
+        data: { todoId: todo.id },
+      });
+    } else if (assigneeId && assigneeId !== actor.id) {
+      await notify([assigneeId], {
+        type: 'todo_assigned',
+        title: `${urgent}${actor.name} assigned you a task`,
+        body: `${title} · ${business.name}`,
+        data: { todoId: todo.id },
+      });
+    } else if (!assigneeId && !parent) {
+      await notify(await businessMemberIds(businessId, { excludeId: actor.id }), {
+        type: 'todo_added',
+        title: `${urgent}New task for ${business.name}`,
+        body: `${title} — from ${actor.name}`,
+        data: { todoId: todo.id },
+      });
+    }
+  }
+
+  if (!quiet) await announce(todo.id, 'created');
+  return { status: 201, todo: await getTodoFor(todo.id, actor.id, actor), id: todo.id };
+}
+
 router.post('/', authenticate, async (req, res, next) => {
   try {
     const actor = await actorOf(req, res);
     if (!actor) return;
-    const title = sanitizeText(req.body.title, 500);
-    if (!title) return res.status(400).json({ error: 'What needs to be done?' });
-    const notes = sanitizeText(req.body.notes, 5000);
-
-    let parent = null;
-    const parentId = parseInt(req.body.parent_id, 10) || null;
-    if (parentId) {
-      parent = await getTodoFor(parentId, actor.id, actor);
-      if (!parent) return res.status(404).json({ error: 'To-do not found' });
-      if (!parent.permissions.can_add_subtask) return res.status(403).json({ error: 'You cannot add to this to-do' });
-      if ((await depthOf(parent.id)) + 1 > MAX_DEPTH) {
-        return res.status(400).json({ error: `Sub-tasks can go ${MAX_DEPTH} levels deep` });
-      }
-    }
-
-    const businessId = parent ? parent.business_id : (parseInt(req.body.business_id, 10) || null);
-    let business = null;
-    if (businessId) {
-      business = (await db.query('SELECT id, name FROM businesses WHERE id = $1', [businessId])).rows[0];
-      if (!business) return res.status(404).json({ error: 'Business not found' });
-    }
-
-    const place = businessId
-      ? { listId: null, sectionId: null }
-      : await resolvePlacement(actor.id, parseInt(req.body.list_id, 10) || null, parseInt(req.body.section_id, 10) || null);
-    if (place.error) return res.status(404).json({ error: place.error });
-
-    const assignTo = parseInt(req.body.assign_to ?? req.body.assigned_user_id, 10) || null;
-    if (businessId && assignTo && !(await isAssignable(assignTo, businessId))) {
-      return res.status(400).json({ error: 'That person is not part of this business' });
-    }
-
-    let reviewState = 'accepted';
-    if (parent) reviewState = parent.review_state;
-    else if (businessId && !(isLeader(actor) || managesBusiness(actor, businessId))) reviewState = 'proposed';
-
-    let assigneeId = actor.id;
-    if (businessId) {
-      if (assignTo) assigneeId = assignTo;
-      else if (parent) assigneeId = parent.assignee_id || null;
-      else assigneeId = reviewState === 'proposed' ? actor.id : null;
-    }
-
-    const topLevelBusiness = !!businessId && !parent;
-    const requiresApproval = topLevelBusiness
-      ? (req.body.requires_approval !== undefined
-        ? !!req.body.requires_approval
-        : !!(assigneeId && assigneeId !== actor.id))
-      : false;
-    let sourceBusinessId = topLevelBusiness ? (parseInt(req.body.source_business_id, 10) || null) : null;
-    if (topLevelBusiness && !sourceBusinessId && !actor.memberships.has(businessId) && !isLeader(actor)) {
-      sourceBusinessId = [...actor.memberships.keys()][0] || null;
-    }
-
-    const recurrence = RECURRENCES.includes(req.body.recurrence) ? req.body.recurrence : null;
-    const dueDate = parseDate(req.body.due_date) || (recurrence ? todayInAppZone() : null);
-    const dueTime = parseTime(req.body.due_time);
-
-    const inserted = await db.query(
-      `INSERT INTO todos (created_by, title, notes, due_date, due_time, priority, recurrence,
-                          parent_id, labels, deadline_date, duration_minutes, reminder_offsets,
-                          assignee_id, assigned_at, business_id, source_business_id, requires_approval, review_state)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::int,
-               CASE WHEN $13::int IS NOT NULL THEN NOW() END, $14, $15, $16, $17)
-       RETURNING id, title, business_id`,
-      [
-        actor.id, title, notes || '', dueDate, dueTime, parsePriority(req.body.priority), recurrence,
-        parent ? parent.id : null, parseLabels(req.body.labels), parseDate(req.body.deadline_date),
-        parseDuration(req.body.duration_minutes), dueTime ? parseOffsets(req.body.reminder_offsets) : [],
-        assigneeId, businessId, sourceBusinessId, requiresApproval, reviewState,
-      ]
-    );
-    const todo = inserted.rows[0];
-
-    if (parent) {
-      await attachSubtaskMembers(todo.id, parent, actor.id);
-      await ensureMember(todo.id, actor.id, actor.id);
-      if (assigneeId) await ensureMember(todo.id, assigneeId, actor.id);
-    } else if (businessId) {
-      await ensureMember(todo.id, actor.id, actor.id);
-      if (assigneeId && assigneeId !== actor.id) await ensureMember(todo.id, assigneeId, actor.id);
-    } else {
-      await db.query(
-        'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by) VALUES ($1, $2, $3, $4, $2)',
-        [todo.id, actor.id, place.listId, place.sectionId]
-      );
-    }
-
-    await logEvent({
-      todoId: todo.id, userId: actor.id, subjectId: assigneeId || actor.id, kind: 'created',
-      meta: { title, parent_id: parent ? parent.id : null, business_id: businessId, review_state: reviewState },
-    });
-
-    const added = await addMentionedMembers(todo, `${title} ${notes || ''}`, req.body.mention_ids, actor, {
-      quietFor: assignTo || null,
-    });
-
-    if (!businessId) {
-      // "Assign to @ravi": the person who is accountable, not just a collaborator.
-      if (assignTo && added.includes(assignTo)) await assignTodo(todo, assignTo, actor);
-    } else {
-      const urgent = parsePriority(req.body.priority) === 1 ? 'Urgent: ' : '';
-      if (reviewState === 'proposed') {
-        const approvers = await nextApprovers(businessId, actorLevelIn(actor, businessId), actor.id);
-        await notify(approvers, {
-          type: 'todo_proposed',
-          title: `${actor.name} proposed a task`,
-          body: `${title} · ${business.name}`,
-          data: { todoId: todo.id },
-        });
-      } else if (assigneeId && assigneeId !== actor.id) {
-        await notify([assigneeId], {
-          type: 'todo_assigned',
-          title: `${urgent}${actor.name} assigned you a task`,
-          body: `${title} · ${business.name}`,
-          data: { todoId: todo.id },
-        });
-      } else if (!assigneeId && !parent) {
-        await notify(await businessMemberIds(businessId, { excludeId: actor.id }), {
-          type: 'todo_added',
-          title: `${urgent}New task for ${business.name}`,
-          body: `${title} — from ${actor.name}`,
-          data: { todoId: todo.id },
-        });
-      }
-    }
-
-    await announce(todo.id, 'created');
-    res.status(201).json({ todo: await getTodoFor(todo.id, actor.id, actor) });
+    const out = await createTodoCore(actor, req.body);
+    if (out.error) return res.status(out.status).json({ error: out.error });
+    res.status(201).json({ todo: out.todo });
   } catch (err) {
     next(err);
   }
@@ -1305,9 +1316,15 @@ router.delete('/:id(\\d+)/members/:userId', authenticate, async (req, res, next)
 // ---------------------------------------------------------------------------
 // Comments (a conversation about the work; the description lives in `notes`)
 // ---------------------------------------------------------------------------
+// $2 is the viewer: "mine" on a reaction says whether they have used it.
 const COMMENT_SELECT = `
-  SELECT c.id, c.todo_id, c.user_id, c.body, c.kind, c.created_at,
-         u.name AS user_name, u.username AS user_username, u.profile_picture AS user_picture
+  SELECT c.id, c.todo_id, c.user_id, c.body, c.kind, c.parent_id, c.created_at,
+         u.name AS user_name, u.username AS user_username, u.profile_picture AS user_picture,
+         COALESCE((SELECT json_agg(json_build_object('kind', r.kind, 'count', r.n, 'mine', r.mine) ORDER BY r.first)
+                   FROM (SELECT kind, COUNT(*)::int AS n, BOOL_OR(user_id = $2) AS mine, MIN(created_at) AS first
+                         FROM todo_comment_reactions WHERE comment_id = c.id GROUP BY kind) r), '[]'::json) AS reactions,
+         COALESCE((SELECT json_agg(json_build_object('id', a.id, 'url', a.url, 'filename', a.filename, 'mime', a.mime, 'size', a.size_bytes) ORDER BY a.id)
+                   FROM todo_attachments a WHERE a.comment_id = c.id), '[]'::json) AS attachments
   FROM todo_comments c LEFT JOIN users u ON u.id = c.user_id`;
 
 router.get('/:id(\\d+)/comments', authenticate, async (req, res, next) => {
@@ -1316,28 +1333,64 @@ router.get('/:id(\\d+)/comments', authenticate, async (req, res, next) => {
     if (!actor) return;
     const existing = await visibleTodo(req, res, actor);
     if (!existing) return;
-    const result = await db.query(`${COMMENT_SELECT} WHERE c.todo_id = $1 ORDER BY c.created_at, c.id`, [existing.id]);
+    const result = await db.query(`${COMMENT_SELECT} WHERE c.todo_id = $1 ORDER BY c.created_at, c.id`, [existing.id, actor.id]);
     res.json({ comments: result.rows });
   } catch (err) {
     next(err);
   }
 });
 
-// POST /api/todos/:id/comments — { body, mention_ids? }
+// POST /api/todos/:id/comments — { body, mention_ids?, parent_id?, attachment_ids? }
+// A reply names the comment it answers; replying to a reply joins the same thread.
 router.post('/:id(\\d+)/comments', authenticate, async (req, res, next) => {
   try {
     const actor = await actorOf(req, res);
     if (!actor) return;
     const existing = await visibleTodo(req, res, actor);
     if (!existing) return;
-    const body = sanitizeText(req.body.body, 3000);
-    if (!body) return res.status(400).json({ error: 'Write a comment first' });
+    const body = sanitizeText(req.body.body, 3000) || '';
+    const attachmentIds = (Array.isArray(req.body.attachment_ids) ? req.body.attachment_ids : []).map(Number).filter(Number.isInteger).slice(0, 10);
+    if (!body && !attachmentIds.length) return res.status(400).json({ error: 'Write a comment first' });
+
+    let parent = null;
+    if (req.body.parent_id) {
+      const p = await db.query('SELECT id, user_id, parent_id FROM todo_comments WHERE id = $1 AND todo_id = $2', [Number(req.body.parent_id), existing.id]);
+      if (!p.rows.length) return res.status(400).json({ error: 'The comment you are replying to is gone' });
+      parent = { id: p.rows[0].parent_id || p.rows[0].id, author: p.rows[0].user_id };
+    }
 
     const inserted = await db.query(
-      'INSERT INTO todo_comments (todo_id, user_id, body) VALUES ($1, $2, $3) RETURNING id',
-      [existing.id, actor.id, body]
+      'INSERT INTO todo_comments (todo_id, user_id, body, parent_id) VALUES ($1, $2, $3, $4) RETURNING id',
+      [existing.id, actor.id, body, parent?.id || null]
     );
+    if (attachmentIds.length) {
+      await db.query(
+        'UPDATE todo_attachments SET comment_id = $1, draft = FALSE WHERE id = ANY($2::int[]) AND todo_id = $3 AND user_id = $4 AND comment_id IS NULL',
+        [inserted.rows[0].id, attachmentIds, existing.id, actor.id]
+      );
+    }
     const mentioned = await addMentionedMembers({ id: existing.id, title: existing.title }, body, req.body.mention_ids, actor);
+    // Everyone named with @ hears about it, even if they were already on the to-do.
+    const named = (await resolveMentions(body, req.body.mention_ids)).map((m) => m.id).filter((id) => id !== actor.id);
+    const stillToTell = named.filter((id) => !mentioned.includes(id));
+    if (stillToTell.length) {
+      await notify(stillToTell, {
+        type: 'todo_mention',
+        title: `${actor.name} mentioned you`,
+        body: `${existing.title}: ${body.slice(0, 120)}`,
+        data: { todoId: existing.id },
+      });
+    }
+    // The person being replied to is told too, unless a mention already did.
+    const replyTo = parent && parent.author && parent.author !== actor.id && !named.includes(parent.author) ? parent.author : null;
+    if (replyTo) {
+      await notify([replyTo], {
+        type: 'todo_reply',
+        title: `${actor.name} replied to you`,
+        body: `${existing.title}: ${body.slice(0, 120)}`,
+        data: { todoId: existing.id },
+      });
+    }
 
     const members = await memberIds(existing.id);
     // People who asked a question (e.g. a manager monitoring) hear about the answer too.
@@ -1350,10 +1403,10 @@ router.post('/:id(\\d+)/comments', authenticate, async (req, res, next) => {
       title: `${actor.name} commented`,
       body: `${existing.title}: ${body.slice(0, 120)}`,
       data: { todoId: existing.id },
-    }, { exclude: [actor.id, ...mentioned] });
+    }, { exclude: [actor.id, ...mentioned, ...named, ...(replyTo ? [replyTo] : [])] });
     await announce(existing.id, 'commented');
 
-    const comment = await db.query(`${COMMENT_SELECT} WHERE c.id = $1`, [inserted.rows[0].id]);
+    const comment = await db.query(`${COMMENT_SELECT} WHERE c.id = $1`, [inserted.rows[0].id, actor.id]);
     res.status(201).json({ comment: comment.rows[0] });
   } catch (err) {
     next(err);
@@ -1539,3 +1592,5 @@ router.delete('/filters/:id', authenticate, async (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.createTodoCore = createTodoCore;
+module.exports.announce = announce;
