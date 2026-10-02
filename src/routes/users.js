@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireAdmin, requireSuperAdmin } = require('../middleware/auth');
 const { sanitizeText, validatePassword } = require('../middleware/sanitize');
+const { USERNAME_PATTERN } = require('../utils/mentions');
 const { loadActor, actorBestLevel } = require('../utils/org');
 const { setMemberships, syncLeaderGroups } = require('../services/org');
 const { notify } = require('../utils/notify');
@@ -295,18 +296,35 @@ router.get('/me/warnings', authenticate, async (req, res, next) => {
   }
 });
 
-// PUT /api/users/me (authenticate only) — update name
+// PUT /api/users/me (authenticate only) — update name and/or username (usernames are unique, any casing)
 router.put('/me', authenticate, async (req, res, next) => {
   try {
     const trimmed = sanitizeText(req.body.name, 100);
     if (!trimmed) {
       return res.status(400).json({ error: 'Name is required' });
     }
-    const result = await db.query(
-      `UPDATE users SET name = $1, updated_at = NOW() WHERE id = $2
-       RETURNING id, name, username, role, business_id, status, created_at`,
-      [trimmed, req.user.id]
-    );
+    let username = null;
+    if (req.body.username !== undefined && req.body.username !== null) {
+      username = sanitizeText(req.body.username, 100);
+      if (!USERNAME_PATTERN.test(username || '')) {
+        return res.status(400).json({ error: 'Username can use letters, numbers, dot, dash or underscore (3–30 characters, no spaces)' });
+      }
+      const taken = await db.query('SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id <> $2', [username, req.user.id]);
+      if (taken.rows.length > 0) {
+        return res.status(409).json({ error: 'That username is already taken' });
+      }
+    }
+    let result;
+    try {
+      result = await db.query(
+        `UPDATE users SET name = $1, username = COALESCE($3, username), updated_at = NOW() WHERE id = $2
+         RETURNING id, name, username, role, business_id, status, created_at`,
+        [trimmed, req.user.id, username]
+      );
+    } catch (err) {
+      if (err.code === '23505') return res.status(409).json({ error: 'That username is already taken' });
+      throw err;
+    }
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }

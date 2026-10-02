@@ -4,6 +4,7 @@ const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
 const { notify, emitToUsers } = require('../utils/notify');
 const { loadActor } = require('../utils/org');
+const { resolveMentions } = require('../utils/mentions');
 const { getTodoFor, listTodos, memberIds, audienceIds } = require('../services/todoQueries');
 const { buildSegments } = require('../utils/segments');
 const { todayInAppZone } = require('../utils/recurrence');
@@ -49,6 +50,28 @@ function refuseUnlessWorkable(res, todo) {
     return true;
   }
   return false;
+}
+
+/**
+ * What a blocker tags: people (picked, or typed as @username in the note), to-dos the caller can see and
+ * businesses. Returns [{ type, id, label }], unknown or hidden ones dropped.
+ */
+async function resolveTags(raw, note, actor) {
+  const list = Array.isArray(raw) ? raw.slice(0, 20) : [];
+  const idsOf = (type) => list.filter((t) => t && t.type === type).map((t) => parseInt(t.id, 10)).filter(Boolean);
+  const out = [];
+  (await resolveMentions(note, idsOf('user'))).forEach((u) => out.push({ type: 'user', id: u.id, label: u.name }));
+
+  const businessIds = idsOf('business');
+  if (businessIds.length) {
+    const rows = await db.query('SELECT id, name FROM businesses WHERE id = ANY($1::int[])', [businessIds]);
+    rows.rows.forEach((b) => out.push({ type: 'business', id: b.id, label: b.name }));
+  }
+  for (const id of [...new Set(idsOf('todo'))]) {
+    const t = await getTodoFor(id, actor.id, actor);
+    if (t) out.push({ type: 'todo', id: t.id, label: t.title });
+  }
+  return out;
 }
 
 const iso = (ms) => (ms == null ? null : new Date(ms).toISOString());
@@ -253,7 +276,8 @@ router.post('/:id(\\d+)/updates', authenticate, async (req, res, next) => {
   }
 });
 
-// POST /api/todos/:id/blockers — { kind, note?, blocked_by_user_id?, blocked_by_todo_id? }
+// POST /api/todos/:id/blockers — { kind, note?, blocked_by_user_id?, blocked_by_todo_id?, mentions?: [{ type, id }] }
+// kinds: dependency (a to-do and/or a person), waiting_on (a decision from someone senior), issue, dead_stop
 router.post('/:id(\\d+)/blockers', authenticate, async (req, res, next) => {
   try {
     const todo = await openTodoFor(req, res);
@@ -264,38 +288,47 @@ router.post('/:id(\\d+)/blockers', authenticate, async (req, res, next) => {
     if (!BLOCKER_KINDS.includes(kind)) return res.status(400).json({ error: 'Pick what is blocking it' });
     const note = sanitizeText(req.body.note, 1000);
 
+    // A dependency is another to-do (finish that first) and/or a person (they have to do their part first).
     let blockedByTodo = null;
-    if (kind === 'dependency') {
-      const depId = parseInt(req.body.blocked_by_todo_id, 10);
-      blockedByTodo = depId ? await getTodoFor(depId, req.actor.id, req.actor) : null;
-      if (!blockedByTodo) return res.status(400).json({ error: 'Pick the to-do it is waiting on' });
-      if (blockedByTodo.id === todo.id) return res.status(400).json({ error: 'A to-do cannot wait on itself' });
-      if (blockedByTodo.is_done) return res.status(400).json({ error: 'That to-do is already finished' });
-    }
     let blockedByUser = null;
-    if (kind === 'waiting_on') {
-      const userId = parseInt(req.body.blocked_by_user_id, 10);
+    const userId = parseInt(req.body.blocked_by_user_id, 10);
+    if (kind === 'dependency' || kind === 'waiting_on') {
       blockedByUser = userId
         ? (await db.query(`SELECT id, name FROM users WHERE id = $1 AND status != 'inactive'`, [userId])).rows[0]
         : null;
-      if (!blockedByUser && !note) return res.status(400).json({ error: 'Say who or what it is waiting on' });
     }
-    if (kind !== 'dependency' && kind !== 'waiting_on' && !note) {
+    if (kind === 'dependency') {
+      const depId = parseInt(req.body.blocked_by_todo_id, 10);
+      if (depId) {
+        blockedByTodo = await getTodoFor(depId, req.actor.id, req.actor);
+        if (!blockedByTodo) return res.status(400).json({ error: 'Pick the to-do it is waiting on' });
+        if (blockedByTodo.id === todo.id) return res.status(400).json({ error: 'A to-do cannot wait on itself' });
+        if (blockedByTodo.is_done) return res.status(400).json({ error: 'That to-do is already finished' });
+      }
+      if (!blockedByTodo && !blockedByUser) return res.status(400).json({ error: 'Pick the to-do or the person it is waiting on' });
+    }
+    if (kind === 'waiting_on' && !blockedByUser && !note) {
+      return res.status(400).json({ error: 'Say who needs to decide, or what is needed' });
+    }
+    if ((kind === 'issue' || kind === 'dead_stop') && !note) {
       return res.status(400).json({ error: 'Describe the problem so others can help' });
     }
 
+    const tags = await resolveTags(req.body.mentions, note, req.actor);
+
     const inserted = await db.query(
-      `INSERT INTO todo_blockers (todo_id, kind, note, blocked_by_user_id, blocked_by_todo_id, raised_by)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [todo.id, kind, note || '', blockedByUser ? blockedByUser.id : null, blockedByTodo ? blockedByTodo.id : null, req.actor.id]
+      `INSERT INTO todo_blockers (todo_id, kind, note, blocked_by_user_id, blocked_by_todo_id, raised_by, mentions)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [todo.id, kind, note || '', blockedByUser ? blockedByUser.id : null, blockedByTodo ? blockedByTodo.id : null, req.actor.id, JSON.stringify(tags)]
     );
 
     const moved = await setStatus(todo.id, 'blocked');
-    const detail = blockedByTodo ? blockedByTodo.title : blockedByUser ? blockedByUser.name : null;
+    const detail = [blockedByTodo?.title, blockedByUser?.name].filter(Boolean).join(' · ') || null;
+    const tagged = tags.length ? `Tagged ${tags.map((t) => t.label).join(', ')}` : null;
     await logEvent({
       todoId: todo.id, userId: req.actor.id, subjectId: todo.assignee_id, kind: 'blocker_raised',
-      to: BLOCKER_LABELS[kind], note: [detail, note].filter(Boolean).join(' — ') || null,
-      meta: { blocker_id: inserted.rows[0].id, kind, blocked_by_user_id: blockedByUser?.id || null, blocked_by_todo_id: blockedByTodo?.id || null },
+      to: BLOCKER_LABELS[kind], note: [detail, note, tagged].filter(Boolean).join(' — ') || null,
+      meta: { blocker_id: inserted.rows[0].id, kind, blocked_by_user_id: blockedByUser?.id || null, blocked_by_todo_id: blockedByTodo?.id || null, mentions: tags },
     });
     if (moved.changed) {
       await logEvent({ todoId: todo.id, userId: req.actor.id, subjectId: todo.assignee_id, kind: 'status', from: moved.from, to: 'blocked' });
@@ -306,14 +339,45 @@ router.post('/:id(\\d+)/blockers', authenticate, async (req, res, next) => {
       title: kind === 'dead_stop' ? `${req.actor.name} hit a dead stop` : `${req.actor.name} is blocked`,
       body: `${todo.title}${detail ? ` — ${detail}` : ''}${note ? `: ${note.slice(0, 100)}` : ''}`,
     }, [req.actor.id]);
-    if (blockedByUser && blockedByUser.id !== req.actor.id) {
-      await notify([blockedByUser.id], {
-        type: 'todo_blocked',
-        title: `${req.actor.name} is waiting on you`,
-        body: `${todo.title}${note ? `: ${note.slice(0, 100)}` : ''}`,
-        data: { todoId: todo.id },
+
+    // Everyone brought in hears about it once: the person it waits on, whoever owns a to-do it waits
+    // on or tags, tagged people, and every member of a tagged business.
+    const told = new Set([req.actor.id, ...(await memberIds(todo.id))]);
+    const tellOnce = async (ids, payload) => {
+      const fresh = [...new Set(ids.filter(Boolean))].filter((id) => !told.has(id));
+      fresh.forEach((id) => told.add(id));
+      if (fresh.length) await notify(fresh, { type: 'todo_blocked', data: { todoId: todo.id }, ...payload });
+    };
+    if (blockedByUser && blockedByUser.id !== req.actor.id) told.delete(blockedByUser.id); // the sharper message wins
+    const snippet = note ? `: ${note.slice(0, 100)}` : '';
+    if (blockedByUser) {
+      await tellOnce([blockedByUser.id], {
+        title: kind === 'waiting_on' ? `${req.actor.name} needs your decision` : `${req.actor.name} is waiting on you`,
+        body: `${todo.title}${snippet}`,
       });
     }
+    if (blockedByTodo) {
+      await tellOnce([blockedByTodo.assignee_id, blockedByTodo.created_by], {
+        title: `${req.actor.name} is waiting on a to-do of yours`,
+        body: `${todo.title} depends on "${blockedByTodo.title}"`,
+      });
+    }
+    const taggedTodos = tags.filter((t) => t.type === 'todo').map((t) => t.id);
+    if (taggedTodos.length) {
+      const owners = await db.query('SELECT assignee_id FROM todos WHERE id = ANY($1::int[])', [taggedTodos]);
+      await tellOnce(owners.rows.map((r) => r.assignee_id), {
+        title: `${req.actor.name} linked a to-do of yours to a blocker`,
+        body: `${todo.title}${snippet}`,
+      });
+    }
+    const taggedBusinesses = tags.filter((t) => t.type === 'business').map((t) => t.id);
+    const businessPeople = taggedBusinesses.length
+      ? (await db.query('SELECT DISTINCT user_id FROM user_businesses WHERE business_id = ANY($1::int[])', [taggedBusinesses])).rows.map((r) => r.user_id)
+      : [];
+    await tellOnce([...tags.filter((t) => t.type === 'user').map((t) => t.id), ...businessPeople], {
+      title: `${req.actor.name} tagged you on a blocker`,
+      body: `${todo.title}${snippet}`,
+    });
     await broadcast(todo.id);
     res.status(201).json({ todo: await getTodoFor(todo.id, req.actor.id, req.actor) });
   } catch (err) {
