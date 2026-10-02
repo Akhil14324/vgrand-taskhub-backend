@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { sanitizeText, validatePassword } = require('../middleware/sanitize');
-const { USERNAME_PATTERN } = require('../utils/mentions');
+const { USERNAME_PATTERN, USERNAME_RULE, cleanUsername, suggestUsername } = require('../utils/mentions');
 const { notify } = require('../utils/notify');
 const {
   DESIGNATIONS,
@@ -26,7 +26,7 @@ const router = express.Router();
 async function sessionUser(userId) {
   const result = await db.query(
     `SELECT u.id, u.name, u.username, u.email, u.role, u.business_id, u.status, u.created_at,
-            u.org_level, u.title, u.must_change_password, u.profile_picture,
+            u.org_level, u.title, u.must_change_password, u.profile_picture, u.preferences,
             b.name AS business_name, b.type AS business_type,
             COALESCE((SELECT json_agg(json_build_object(
                 'business_id', ub.business_id, 'business_name', bb.name, 'business_color', bb.color,
@@ -61,14 +61,14 @@ async function sessionUser(userId) {
 router.post('/signup', async (req, res, next) => {
   try {
     const name = sanitizeText(req.body.name, 100);
-    const username = sanitizeText(req.body.username, 100);
     const { password } = req.body;
-
-    if (!name || !username || !password) {
-      return res.status(400).json({ error: 'Name, username, and password are required' });
+    if (!name || !password) {
+      return res.status(400).json({ error: 'Name and password are required' });
     }
+    // Lowercase only; left empty, a free one is made from the name.
+    const username = cleanUsername(req.body.username) || await suggestUsername(name);
     if (!USERNAME_PATTERN.test(username)) {
-      return res.status(400).json({ error: 'Username can use letters, numbers, dot, dash or underscore (3–30 characters, no spaces)' });
+      return res.status(400).json({ error: USERNAME_RULE });
     }
     const pwError = validatePassword(password);
     if (pwError) {

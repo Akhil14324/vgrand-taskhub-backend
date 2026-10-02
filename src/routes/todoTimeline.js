@@ -277,7 +277,7 @@ router.post('/:id(\\d+)/updates', authenticate, async (req, res, next) => {
 });
 
 // POST /api/todos/:id/blockers — { kind, note?, blocked_by_user_id?, blocked_by_todo_id?, mentions?: [{ type, id }] }
-// kinds: dependency (a to-do and/or a person), waiting_on (a decision from someone senior), issue, dead_stop
+// kinds: dependency (a to-do and/or a person), waiting_on (a decision or suggestion from anyone), issue, dead_stop
 router.post('/:id(\\d+)/blockers', authenticate, async (req, res, next) => {
   try {
     const todo = await openTodoFor(req, res);

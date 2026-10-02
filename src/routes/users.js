@@ -3,7 +3,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate, requireAdmin, requireSuperAdmin } = require('../middleware/auth');
 const { sanitizeText, validatePassword } = require('../middleware/sanitize');
-const { USERNAME_PATTERN } = require('../utils/mentions');
+const { USERNAME_PATTERN, USERNAME_RULE, cleanUsername } = require('../utils/mentions');
 const { loadActor, actorBestLevel } = require('../utils/org');
 const { setMemberships, syncLeaderGroups } = require('../services/org');
 const { notify } = require('../utils/notify');
@@ -296,7 +296,37 @@ router.get('/me/warnings', authenticate, async (req, res, next) => {
   }
 });
 
-// PUT /api/users/me (authenticate only) — update name and/or username (usernames are unique, any casing)
+// Personal settings an account may keep. Anything else is ignored; each value is checked here.
+const PREFERENCE_RULES = {
+  theme: (v) => ['system', 'light', 'dark'].includes(v),
+  density: (v) => ['comfortable', 'compact'].includes(v),
+  textSize: (v) => ['small', 'normal', 'large'].includes(v),
+  defaultView: (v) => ['today', 'upcoming', 'inbox'].includes(v),
+  startPage: (v) => ['home', 'todos', 'chat'].includes(v),
+  viewMode: (v) => ['simple', 'full'].includes(v),
+  showCompleted: (v) => typeof v === 'boolean',
+  reduceMotion: (v) => typeof v === 'boolean',
+  confirmBeforeDelete: (v) => typeof v === 'boolean',
+};
+
+// PUT /api/users/me/preferences — merge a few personal settings; they change the app for this account only
+router.put('/me/preferences', authenticate, async (req, res, next) => {
+  try {
+    const patch = {};
+    for (const [key, ok] of Object.entries(PREFERENCE_RULES)) {
+      if (req.body[key] !== undefined && ok(req.body[key])) patch[key] = req.body[key];
+    }
+    const result = await db.query(
+      `UPDATE users SET preferences = preferences || $1::jsonb WHERE id = $2 RETURNING preferences`,
+      [JSON.stringify(patch), req.user.id]
+    );
+    res.json({ preferences: result.rows[0]?.preferences || {} });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/users/me (authenticate only) — update name and/or username (unique, lowercase)
 router.put('/me', authenticate, async (req, res, next) => {
   try {
     const trimmed = sanitizeText(req.body.name, 100);
@@ -305,9 +335,9 @@ router.put('/me', authenticate, async (req, res, next) => {
     }
     let username = null;
     if (req.body.username !== undefined && req.body.username !== null) {
-      username = sanitizeText(req.body.username, 100);
-      if (!USERNAME_PATTERN.test(username || '')) {
-        return res.status(400).json({ error: 'Username can use letters, numbers, dot, dash or underscore (3–30 characters, no spaces)' });
+      username = cleanUsername(req.body.username);
+      if (!USERNAME_PATTERN.test(username)) {
+        return res.status(400).json({ error: USERNAME_RULE });
       }
       const taken = await db.query('SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id <> $2', [username, req.user.id]);
       if (taken.rows.length > 0) {

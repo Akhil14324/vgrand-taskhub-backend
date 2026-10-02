@@ -3,7 +3,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { sanitizeText, validatePassword } = require('../middleware/sanitize');
-const { USERNAME_PATTERN } = require('../utils/mentions');
+const { USERNAME_PATTERN, USERNAME_RULE, cleanUsername, suggestUsername } = require('../utils/mentions');
 const { notify } = require('../utils/notify');
 const {
   LEADERSHIP,
@@ -220,12 +220,13 @@ router.post('/people', authenticate, requirePortal, async (req, res, next) => {
   const client = await db.pool.connect();
   try {
     const name = sanitizeText(req.body.name, 100);
-    const username = sanitizeText(req.body.username, 30);
     const orgLevel = req.body.org_level ? parseInt(req.body.org_level) : null;
     const title = sanitizeText(req.body.title, 100) || null;
-    if (!name || !username) return res.status(400).json({ error: 'Name and username are required' });
+    if (!name) return res.status(400).json({ error: 'Name is required' });
+    // Lowercase only; left empty, a free one is made from the name.
+    const username = cleanUsername(req.body.username) || await suggestUsername(name, client);
     if (!USERNAME_PATTERN.test(username)) {
-      return res.status(400).json({ error: 'Username can use letters, numbers, dot, dash or underscore (3–30 characters)' });
+      return res.status(400).json({ error: USERNAME_RULE });
     }
     const levelError = validateOrgLevel(req.actor, orgLevel);
     if (levelError) return res.status(403).json({ error: levelError });

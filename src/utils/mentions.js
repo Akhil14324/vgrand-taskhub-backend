@@ -2,7 +2,25 @@ const db = require('../db');
 
 // Usernames are letters, digits, dot, underscore and hyphen (see USERNAME_PATTERN).
 const MENTION_REGEX = /(^|[^A-Za-z0-9_.-])@([A-Za-z0-9._-]{2,50})/g;
-const USERNAME_PATTERN = /^[A-Za-z0-9._-]{3,30}$/;
+const USERNAME_PATTERN = /^[a-z0-9._-]{3,30}$/;
+const USERNAME_RULE = 'Username must be lowercase letters, numbers, dot, dash or underscore (3–30 characters, no spaces)';
+
+/** Usernames are always stored lowercase, so "Akhil" and "akhil" are the same name. */
+function cleanUsername(raw) {
+  return String(raw ?? '').trim().toLowerCase();
+}
+
+/** A free, lowercase username derived from a person's name: "V Akhil" -> "vakhil", then "vakhil2", ... */
+async function suggestUsername(name, exec = db) {
+  let base = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 24);
+  if (base.length < 3) base = (base + 'user').slice(0, 24);
+  for (let i = 0; i < 200; i++) {
+    const candidate = i === 0 ? base : `${base}${i + 1}`;
+    const taken = await exec.query('SELECT 1 FROM users WHERE LOWER(username) = $1', [candidate]);
+    if (taken.rows.length === 0) return candidate;
+  }
+  return `${base}${Date.now() % 100000}`;
+}
 
 /** Extract @usernames from free text (lower-cased, unique). */
 function extractMentions(text) {
@@ -31,4 +49,4 @@ async function resolveMentions(text, explicitIds = []) {
   return result.rows;
 }
 
-module.exports = { extractMentions, resolveMentions, USERNAME_PATTERN };
+module.exports = { extractMentions, resolveMentions, USERNAME_PATTERN, USERNAME_RULE, cleanUsername, suggestUsername };
