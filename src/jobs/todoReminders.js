@@ -1,6 +1,9 @@
 const db = require('../db');
 const { notify } = require('../utils/notify');
-const { APP_TIMEZONE } = require('../utils/recurrence');
+const { APP_TIMEZONE, todayInAppZone } = require('../utils/recurrence');
+
+// Hour (in APP_TIMEZONE) from which "today is your deadline" goes out.
+const DEADLINE_NOTICE_HOUR = 8;
 
 const INTERVAL_MS = 60 * 1000;
 
@@ -25,15 +28,47 @@ async function sendTodoReminders() {
       const members = await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1', [todo.id]);
       await notify(members.rows.map((m) => m.user_id), {
         type: 'todo_reminder',
-        title: `⏰ Reminder · ${todo.at.replace(/^0/, '')}`,
+        title: `Reminder · ${todo.at.replace(/^0/, '')}`,
         body: todo.title,
         data: { todoId: todo.id },
       });
     }
 
     await sendEarlyReminders();
+    await sendDeadlineDayNotices();
   } catch (err) {
     console.error('[todo-reminders] failed:', err.message);
+  }
+}
+
+/**
+ * "Today is your deadline": once per to-do, on the morning of its deadline (and, if the deadline is
+ * set later in the day or the server was down, as soon as it is noticed). Goes to the people on the
+ * to-do; a business task goes to its assignee and creator, or everyone involved when it is open.
+ */
+async function sendDeadlineDayNotices() {
+  const hour = (await db.query('SELECT EXTRACT(HOUR FROM NOW() AT TIME ZONE $1)::int AS h', [APP_TIMEZONE])).rows[0].h;
+  if (hour < DEADLINE_NOTICE_HOUR) return;
+  const today = todayInAppZone();
+  // The UPDATE is the claim: only one server instance gets the row back.
+  const due = await db.query(
+    `UPDATE todos t SET deadline_notified_on = t.deadline_date
+     WHERE t.is_done = FALSE AND t.deadline_date = $1::date
+       AND t.deadline_notified_on IS DISTINCT FROM t.deadline_date
+       AND t.review_state <> 'rejected'
+     RETURNING t.id, t.title, t.business_id, t.assignee_id, t.created_by`,
+    [today]
+  );
+  for (const todo of due.rows) {
+    let recipients;
+    if (todo.business_id && todo.assignee_id) recipients = [...new Set([todo.assignee_id, todo.created_by])];
+    else recipients = (await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1', [todo.id])).rows.map((m) => m.user_id);
+    await notify(recipients, {
+      type: 'todo_deadline',
+      title: 'Today is your deadline',
+      body: todo.title,
+      data: { todoId: todo.id },
+    });
   }
 }
 
@@ -68,7 +103,7 @@ async function sendEarlyReminders() {
     const members = await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1', [row.id]);
     await notify(members.rows.map((m) => m.user_id), {
       type: 'todo_reminder',
-      title: `⏰ In ${describeOffset(row.minutes)} · ${row.at.replace(/^0/, '')}`,
+      title: `In ${describeOffset(row.minutes)} · ${row.at.replace(/^0/, '')}`,
       body: row.title,
       data: { todoId: row.id },
     });
@@ -80,4 +115,4 @@ function scheduleTodoReminders() {
   setInterval(sendTodoReminders, INTERVAL_MS);
 }
 
-module.exports = { scheduleTodoReminders, sendTodoReminders };
+module.exports = { scheduleTodoReminders, sendTodoReminders, sendDeadlineDayNotices };

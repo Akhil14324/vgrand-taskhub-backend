@@ -118,8 +118,7 @@ async function ownsList(listId, userId) {
 async function resolvePlacement(userId, listId, sectionId) {
   if (sectionId) {
     const result = await db.query(
-      `SELECT s.id, s.list_id FROM todo_sections s JOIN todo_lists l ON l.id = s.list_id
-       WHERE s.id = $1 AND l.owner_id = $2`,
+      'SELECT s.id, s.list_id FROM todo_sections s WHERE s.id = $1 AND s.owner_id = $2',
       [sectionId, userId]
     );
     if (!result.rows.length) return { error: 'Section not found' };
@@ -189,11 +188,7 @@ router.get('/', authenticate, async (req, res, next) => {
     const manageable = new Set([...actor.memberships.keys()].filter((id) => managesBusiness(actor, id)));
     const [lists, sections, filters, todos, businesses] = await Promise.all([
       db.query('SELECT * FROM todo_lists WHERE owner_id = $1 ORDER BY sort_order, id', [actor.id]),
-      db.query(
-        `SELECT s.* FROM todo_sections s JOIN todo_lists l ON l.id = s.list_id
-         WHERE l.owner_id = $1 ORDER BY s.sort_order, s.id`,
-        [actor.id]
-      ),
+      db.query('SELECT s.* FROM todo_sections s WHERE s.owner_id = $1 ORDER BY s.sort_order, s.id', [actor.id]),
       db.query('SELECT * FROM todo_filters WHERE owner_id = $1 ORDER BY sort_order, id', [actor.id]),
       listTodos(actor.id, {
         actor,
@@ -1101,6 +1096,84 @@ router.post('/:id(\\d+)/request-delete', authenticate, async (req, res, next) =>
   }
 });
 
+// POST /api/todos/:id/move-to-business — { business_id, assign_to? }
+// Turns my own personal to-do (with everything below it) into a task of a business. A manager's task is
+// accepted straight away; anyone else's becomes a proposal the managers review.
+router.post('/:id(\\d+)/move-to-business', authenticate, async (req, res, next) => {
+  try {
+    const actor = await actorOf(req, res);
+    if (!actor) return;
+    const existing = await visibleTodo(req, res, actor);
+    if (!existing) return;
+    if (existing.business_id) return res.status(400).json({ error: 'This is already a business task' });
+    if (existing.parent_id) return res.status(400).json({ error: 'Move the main to-do; its sub-tasks go with it' });
+    if (existing.created_by !== actor.id) return res.status(403).json({ error: 'Only the person who created this can move it' });
+
+    const businessId = parseInt(req.body.business_id, 10) || null;
+    const business = businessId
+      ? (await db.query('SELECT id, name FROM businesses WHERE id = $1', [businessId])).rows[0]
+      : null;
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (!isLeader(actor) && !actor.memberships.has(businessId)) {
+      return res.status(403).json({ error: 'You are not part of this business' });
+    }
+
+    const assignTo = parseInt(req.body.assign_to, 10) || null;
+    if (assignTo && !(await isAssignable(assignTo, businessId))) {
+      return res.status(400).json({ error: 'That person is not part of this business' });
+    }
+    const manages = isLeader(actor) || managesBusiness(actor, businessId);
+    const reviewState = manages ? 'accepted' : 'proposed';
+    const assigneeId = reviewState === 'proposed' ? actor.id : (assignTo || actor.id);
+    const sourceBusinessId = !actor.memberships.has(businessId) && !isLeader(actor)
+      ? ([...actor.memberships.keys()][0] || null)
+      : null;
+
+    const below = await descendantIds(existing.id);
+    const all = [existing.id, ...below];
+    await db.query(
+      `UPDATE todos SET business_id = $1, review_state = $2, requires_approval = FALSE, source_business_id = $3
+       WHERE id = ANY($4::int[])`,
+      [businessId, reviewState, sourceBusinessId, all]
+    );
+    await db.query(
+      `UPDATE todos SET assignee_id = $1::int, assigned_at = COALESCE(assigned_at, NOW()) WHERE id = $2`,
+      [assigneeId, existing.id]
+    );
+    // A business task is seen through the business, not through anybody's own lists.
+    await db.query('UPDATE todo_members SET list_id = NULL, section_id = NULL WHERE todo_id = ANY($1::int[])', [all]);
+    await ensureMember(existing.id, assigneeId, actor.id, { withDescendants: true });
+
+    await logEvent({
+      todoId: existing.id, userId: actor.id, subjectId: assigneeId, kind: 'moved',
+      note: `Moved to ${business.name}`, meta: { business_id: businessId, review_state: reviewState },
+    });
+
+    if (reviewState === 'proposed') {
+      const approvers = await nextApprovers(businessId, actorLevelIn(actor, businessId), actor.id);
+      await notify(approvers, {
+        type: 'todo_proposed',
+        title: `${actor.name} proposed a task`,
+        body: `${existing.title} · ${business.name}`,
+        data: { todoId: existing.id },
+      });
+    } else if (assigneeId !== actor.id) {
+      await notify([assigneeId], {
+        type: 'todo_assigned',
+        title: `${actor.name} assigned you a task`,
+        body: `${existing.title} · ${business.name}`,
+        data: { todoId: existing.id },
+      });
+    }
+
+    // Everyone who could see it before and everyone in the business hears about it.
+    await announce(existing.id, 'updated');
+    res.json({ todo: await getTodoFor(existing.id, actor.id, actor) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /api/todos/:id/duplicate — copy (with everything below it) into my own list
 router.post('/:id(\\d+)/duplicate', authenticate, async (req, res, next) => {
   try {
@@ -1365,8 +1438,8 @@ router.post('/lists/:id/sections', authenticate, async (req, res, next) => {
     if (!(await ownsList(parseInt(req.params.id, 10), req.user.id))) return res.status(404).json({ error: 'List not found' });
     const order = await db.query('SELECT COALESCE(MAX(sort_order), 0) + 1 AS next FROM todo_sections WHERE list_id = $1', [req.params.id]);
     const result = await db.query(
-      'INSERT INTO todo_sections (list_id, name, sort_order) VALUES ($1, $2, $3) RETURNING *',
-      [req.params.id, name, order.rows[0].next]
+      'INSERT INTO todo_sections (list_id, owner_id, name, sort_order) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.params.id, req.user.id, name, order.rows[0].next]
     );
     res.status(201).json({ section: result.rows[0] });
   } catch (err) {
@@ -1374,13 +1447,31 @@ router.post('/lists/:id/sections', authenticate, async (req, res, next) => {
   }
 });
 
-router.put('/sections/:id', authenticate, async (req, res, next) => {
+// POST /api/todos/sections — a section of the Inbox (no list)
+router.post('/sections', authenticate, async (req, res, next) => {
+  try {
+    const name = sanitizeText(req.body.name, 120);
+    if (!name) return res.status(400).json({ error: 'Section name is required' });
+    const order = await db.query(
+      'SELECT COALESCE(MAX(sort_order), 0) + 1 AS next FROM todo_sections WHERE owner_id = $1 AND list_id IS NULL',
+      [req.user.id]
+    );
+    const result = await db.query(
+      'INSERT INTO todo_sections (list_id, owner_id, name, sort_order) VALUES (NULL, $1, $2, $3) RETURNING *',
+      [req.user.id, name, order.rows[0].next]
+    );
+    res.status(201).json({ section: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put('/sections/:id(\\d+)', authenticate, async (req, res, next) => {
   try {
     const name = sanitizeText(req.body.name, 120);
     if (!name) return res.status(400).json({ error: 'Section name is required' });
     const result = await db.query(
-      `UPDATE todo_sections s SET name = $1 FROM todo_lists l
-       WHERE s.id = $2 AND l.id = s.list_id AND l.owner_id = $3 RETURNING s.*`,
+      'UPDATE todo_sections SET name = $1 WHERE id = $2 AND owner_id = $3 RETURNING *',
       [name, req.params.id, req.user.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Section not found' });
@@ -1391,11 +1482,10 @@ router.put('/sections/:id', authenticate, async (req, res, next) => {
 });
 
 // DELETE /api/todos/sections/:id — its to-dos stay in the list, without a section
-router.delete('/sections/:id', authenticate, async (req, res, next) => {
+router.delete('/sections/:id(\\d+)', authenticate, async (req, res, next) => {
   try {
     const result = await db.query(
-      `DELETE FROM todo_sections s USING todo_lists l
-       WHERE s.id = $1 AND l.id = s.list_id AND l.owner_id = $2 RETURNING s.id`,
+      'DELETE FROM todo_sections WHERE id = $1 AND owner_id = $2 RETURNING id',
       [req.params.id, req.user.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Section not found' });

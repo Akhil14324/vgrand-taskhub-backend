@@ -1,4 +1,5 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('../db');
@@ -185,6 +186,47 @@ router.delete('/me', authenticate, async (req, res, next) => {
     client.release();
 
     res.json({ message: 'Account deleted successfully' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/forgot-password — TEMPORARY: sets a new password for a username with no proof of
+// identity (no old password, no email code), by the owner's choice until a real flow replaces it.
+// Switch it off by setting OPEN_PASSWORD_RESET=false on the host. Limited to 5 tries per 15 minutes per IP.
+const forgotLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many reset attempts, please try again later.' },
+});
+
+router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
+  try {
+    if (String(process.env.OPEN_PASSWORD_RESET || '').toLowerCase() === 'false') {
+      return res.status(404).json({ error: 'Password reset is turned off. Ask an administrator.' });
+    }
+    const username = sanitizeText(req.body.username, 255);
+    const { new_password } = req.body;
+    if (!username || !new_password) {
+      return res.status(400).json({ error: 'Username and new password are required' });
+    }
+    const passwordError = validatePassword(new_password);
+    if (passwordError) return res.status(400).json({ error: passwordError });
+
+    const found = await db.query('SELECT id, status FROM users WHERE LOWER(username) = LOWER($1)', [username]);
+    if (found.rows.length === 0) return res.status(404).json({ error: 'No account with that username' });
+    if (found.rows[0].status === 'inactive') {
+      return res.status(403).json({ error: 'This account has been deactivated. Please contact your administrator.' });
+    }
+
+    const hash = await bcrypt.hash(new_password, 10);
+    await db.query(
+      'UPDATE users SET password_hash = $1, must_change_password = FALSE, updated_at = NOW() WHERE id = $2',
+      [hash, found.rows[0].id]
+    );
+    res.json({ message: 'Password updated. You can sign in now.' });
   } catch (err) {
     next(err);
   }

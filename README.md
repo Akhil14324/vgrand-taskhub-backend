@@ -138,6 +138,8 @@ Statuses: `todo` · `in_progress` · `blocked` · `in_review` · `on_hold` · `d
 | POST | `/share` | `{ conversation_ids, todo_ids, title?, note? }` checklist card in chat |
 | POST | `/import`, `/reorder`, `/:id/duplicate` | Copy shared items, manual order, duplicate (personal) |
 | POST/PUT/DELETE | `/lists`, `/sections`, `/filters` | Lists, sections and saved filters |
+| POST | `/:id/move-to-business` | `{ business_id, assign_to? }` turn my personal to-do (and its sub-tasks) into a business task; a manager's is accepted, anyone else's becomes a proposal |
+| POST | `/sections` | `{ name }` a section of my Inbox (list sections use `/lists/:id/sections`) |
 
 The Team Monitor (`/api/monitor`) follows the hierarchy: leadership sees people strictly below them, business heads those below them in their business; nobody sees upward.
 
@@ -155,4 +157,4 @@ The Team Monitor (`/api/monitor`) follows the hierarchy: leadership sees people 
 
 ## Migrations
 
-SQL files in `src/migrations/` run in filename order and are tracked in the `migrations` table. `027_org_todos_approvals.sql` adds the hierarchy columns, task workflow, approvals, to-dos, notification data and FCM token support. `030_unify_tasks_into_todos.sql` makes a task a to-do that belongs to a business: it adds the business, review, approval and warning columns to `todos` and **copies** existing tasks (with their comments, history, warnings, approvals, notifications and chat cards) into it. The old `tasks` and `task_activity` tables are left in place, unused, and can be dropped by a later migration once you are happy with the copy. `031_todo_board_order.sql` stores each person's own board ordering.
+SQL files in `src/migrations/` run in filename order and are tracked in the `migrations` table. `027_org_todos_approvals.sql` adds the hierarchy columns, task workflow, approvals, to-dos, notification data and FCM token support. `030_unify_tasks_into_todos.sql` makes a task a to-do that belongs to a business: it adds the business, review, approval and warning columns to `todos` and **copies** existing tasks (with their comments, history, warnings, approvals, notifications and chat cards) into it. The old `tasks` and `task_activity` tables are left in place, unused, and can be dropped by a later migration once you are happy with the copy. `031_todo_board_order.sql` stores each person's own board ordering. `032_inbox_sections.sql` lets a section belong to a person (`owner_id`) instead of a list, so the Inbox can have sections.
