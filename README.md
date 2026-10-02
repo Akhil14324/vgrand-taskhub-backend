@@ -1,6 +1,6 @@
 # vgrand-taskhub-backend
 
-Node/Express + PostgreSQL backend for TaskHub — the VGrand group's internal app for tasks, personal to-dos, the organisation hierarchy and real-time chat.
+Node/Express + PostgreSQL backend for TaskHub — the VGrand group's internal app for to-dos (personal and business), the organisation hierarchy and real-time chat.
 
 ## Features
 
@@ -66,7 +66,7 @@ See `.env.example`. Notable ones:
 
 `src/utils/notify.js` → `notify(userIds, { type, title, body, data })` stores an in-app notification, emits `notification:new` to each user's socket room and sends a push. `src/utils/push.js` sends **data-only** FCM messages to web tokens (the PWA service worker decides whether to show a system notification or an in-app banner) and Expo pushes to native tokens. Chat messages push without being stored; @mentions are stored and push even when a chat is muted.
 
-`data` carries deep-link ids: `conversationId`, `taskId`, `todoId`, `approvalId`.
+`data` carries deep-link ids: `conversationId`, `todoId`, `approvalId`.
 
 Jobs: `jobs/overdueNotifications.js` (daily) and `jobs/todoReminders.js` (every minute, for to-dos with a due time).
 
@@ -93,8 +93,7 @@ Each socket joins `user:<id>` (personal room) on connect and `conv:<id>` rooms v
 - `presence:update` — `{ userId, online }`; `presence:snapshot` — `{ userIds }` sent on connect
 - `conversation:updated` — `{ conversationId, messageId, lastMessagePreview, lastMessageAt }` (personal room)
 - `notification:new` — the stored notification row (personal room)
-- `todo:changed` — `{ todoId, action }` (personal rooms of the to-do's members)
-- `task:changed` — `{ taskId, businessId, action }` (broadcast)
+- `todo:changed` — `{ todoId, action }` (personal rooms of everyone who can see the to-do: its members and, for a business to-do, the whole business and leadership)
 
 ## REST Endpoints
 
@@ -110,44 +109,41 @@ Each socket joins `user:<id>` (personal room) on connect and `conv:<id>` rooms v
 | PATCH | `/conversations/:id/read` | Mark read up to message ID |
 | POST | `/upload` | Upload image/file attachment |
 
-### Tasks (`/api/tasks`)
+### To-dos and business tasks (`/api/todos`)
+
+There is one kind of item. A **to-do** with no `business_id` is personal (visible to the people on it, `todo_members`). A **business task** is a to-do with a `business_id`: everyone in that business sees it, leadership sees every business, and permissions follow the chain of command (`src/services/todoAccess.js`). Every response carries server-computed `permissions` flags (`can_edit`, `can_delete`, `can_change_status`, `can_assign`, `can_approve`, `can_review`, `can_warn`, `can_request_delete`, `can_add_subtask`, `can_comment`); clients never re-derive them.
+
+Statuses: `todo` · `in_progress` · `blocked` · `in_review` · `on_hold` · `done`. Sub-tasks nest to 8 levels; each has its own description (`notes`) and comments.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/?view=all\|mine\|delegated&status&business_id&priority&q` | Tasks you can see, with `permissions` flags |
-| GET | `/summary` | Badge counts (mine open, delegated, overdue, done this week) |
-| GET | `/assignees?business_id=` | People a task in that business can be assigned to |
-| GET | `/:id` | Task + activity timeline |
-| POST | `/` | Create (any business; `assigned_user_id`, `priority`, `requires_approval`) |
-| PUT | `/:id` | Edit / reassign |
-| PUT | `/:id/status` | `pending` · `in_progress` · `completed` (→ `in_review` if approval needed) · `on_hold` |
-| POST | `/:id/approve`, `/:id/reject` | Review decision (`note`) |
-| POST | `/share` | Share task(s) into chats: `{ conversation_ids, task_ids, note? }` (chat message with `meta.kind = 'task'`; a snapshot, so it never grants access to the task) |
-| POST | `/:id/comments` | Comment (`@mentions` notify) |
-| PUT | `/:id/warn` | Warn the assignee (must be senior) |
-| DELETE | `/:id` | Delete (creator or senior) |
-| POST | `/:id/request-delete` | Ask the chain of command to delete |
+| GET | `/` | My lists, sections, filters, the to-dos I can see (open, plus finished recently) and the businesses I belong to |
+| GET | `/:id` | One to-do I can see, with its direct sub-tasks |
+| POST | `/` | Create `{ title, notes, due_date, due_time, priority, list_id, section_id, recurrence, labels, parent_id, business_id, assign_to, requires_approval, mention_ids }`. With `business_id`: set directly by someone who manages the business, otherwise stored as a *proposal* (`review_state = 'proposed'`) |
+| PUT | `/:id` | Edit (needs `can_edit`); `list_id`/`section_id` move it in *my* lists only; `assigned_user_id` reassigns a business task |
+| POST | `/:id/toggle` | Tick / untick. Recurring ones roll to the next date; business work that needs review goes `in_review` instead of closing |
+| POST | `/:id/status` | `todo` · `in_progress` · `on_hold` (done and in review go through toggle, blocked through blockers) |
+| POST | `/:id/review` | `{ decision: accept|reject, note }` decide on a proposed business task |
+| POST | `/:id/approve`, `/:id/reject` | Review finished work (`note`) |
+| POST | `/:id/warn` | `{ message }` warn the assignee (must be senior) |
+| POST | `/:id/request-delete` | `{ reason }` ask the chain of command to delete |
+| DELETE | `/:id` | Personal: the creator deletes for everyone, others leave. Business: whoever set it, or a senior |
+| POST | `/:id/assign`, `/:id/updates`, `/:id/blockers` | Accountable person, progress checkpoint, blockers (see `routes/todoTimeline.js`) |
+| GET | `/:id/timeline` | History, comments, blockers and the numbers of one to-do |
+| GET | `/gantt?business_id=&scope=mine&assignee_id=&from=&to=` | Rows for the timeline chart: each to-do with the stretches it spent in one status with one person |
+| GET | `/assignees?business_id=` | People business work in that business can be given to |
+| GET/POST | `/:id/comments` | Comments (separate from the description) |
+| POST | `/board-order` | `{ ids }` my own order of cards on a board |
+| GET | `/completed`, `/insights` | Completion history, 7-day counts and streak |
+| POST | `/share` | `{ conversation_ids, todo_ids, title?, note? }` checklist card in chat |
+| POST | `/import`, `/reorder`, `/:id/duplicate` | Copy shared items, manual order, duplicate (personal) |
+| POST/PUT/DELETE | `/lists`, `/sections`, `/filters` | Lists, sections and saved filters |
 
-`PUT /:id/complete` and `PUT /:id/hold` remain for older clients.
+The Team Monitor (`/api/monitor`) follows the hierarchy: leadership sees people strictly below them, business heads those below them in their business; nobody sees upward.
 
 ### Approvals (`/api/approvals`)
 
-`GET /` (reviews + requests waiting on you, your own requests) · `POST /:id/decide` `{ decision: approve|reject, note }` · `DELETE /:id` (withdraw).
-
-### To-dos (`/api/todos`)
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/` | Your lists and to-dos (open + done in the last 30 days) |
-| GET | `/insights` | Completions per day (7 days) and streak |
-| POST | `/` | Create `{ title, notes, due_date, due_time, priority, list_id, recurrence, mention_ids }` — @usernames in the title add those people |
-| PUT | `/:id` | Edit; `list_id` moves it in *your* list only |
-| POST | `/:id/toggle` | Tick/untick (recurring ones roll to the next date) |
-| DELETE | `/:id` | Creator deletes for everyone; others leave it |
-| DELETE | `/:id/members/:userId` | Remove someone from a shared to-do |
-| POST | `/share` | `{ conversation_ids, todo_ids, title?, note? }` → checklist card in chat |
-| POST | `/import` | Copy shared items into your list |
-| POST/PUT/DELETE | `/lists`, `/lists/:id` | Manage lists |
+`GET /` → `{ requests, reviews, proposals, mine, count }`: deletion requests, finished work and proposed tasks waiting on you, and your own requests · `POST /:id/decide` `{ decision: approve|reject, note }` · `DELETE /:id` (withdraw).
 
 ### Organisation (`/api/org`)
 
@@ -159,4 +155,4 @@ Each socket joins `user:<id>` (personal room) on connect and `conv:<id>` rooms v
 
 ## Migrations
 
-SQL files in `src/migrations/` run in filename order and are tracked in the `migrations` table. `027_org_todos_approvals.sql` adds the hierarchy columns, task workflow, approvals, to-dos, notification data and FCM token support.
+SQL files in `src/migrations/` run in filename order and are tracked in the `migrations` table. `027_org_todos_approvals.sql` adds the hierarchy columns, task workflow, approvals, to-dos, notification data and FCM token support. `030_unify_tasks_into_todos.sql` makes a task a to-do that belongs to a business: it adds the business, review, approval and warning columns to `todos` and **copies** existing tasks (with their comments, history, warnings, approvals, notifications and chat cards) into it. The old `tasks` and `task_activity` tables are left in place, unused, and can be dropped by a later migration once you are happy with the copy. `031_todo_board_order.sql` stores each person's own board ordering.

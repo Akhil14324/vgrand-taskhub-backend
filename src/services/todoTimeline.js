@@ -1,7 +1,7 @@
 const db = require('../db');
 const { notify } = require('../utils/notify');
 const { computeMetrics, todoHealth } = require('../utils/timeline');
-const { memberIds } = require('./todoQueries');
+const { memberIds, descendantIds } = require('./todoQueries');
 
 const BLOCKER_KINDS = ['dependency', 'waiting_on', 'issue', 'dead_stop'];
 const BLOCKER_LABELS = {
@@ -122,7 +122,7 @@ async function buildTimeline(todo, now = Date.now()) {
  * Restarts the response clock for the new person. Returns false when nothing changed.
  */
 async function assignTodo(todo, userId, actor) {
-  const cur = (await db.query('SELECT assignee_id, status FROM todos WHERE id = $1', [todo.id])).rows[0];
+  const cur = (await db.query('SELECT assignee_id, status, business_id FROM todos WHERE id = $1', [todo.id])).rows[0];
   if (!cur || cur.assignee_id === userId) return false;
   const names = await db.query('SELECT id, name FROM users WHERE id = ANY($1::int[])', [[userId, cur.assignee_id].filter(Boolean)]);
   const nameOf = (id) => names.rows.find((u) => u.id === id)?.name || null;
@@ -133,8 +133,8 @@ async function assignTodo(todo, userId, actor) {
   );
   await db.query(
     `INSERT INTO todo_members (todo_id, user_id, list_id, added_by)
-     SELECT c.id, $2::int, NULL::int, $3::int FROM todos c WHERE c.parent_id = $1 ON CONFLICT DO NOTHING`,
-    [todo.id, userId, actor.id]
+     SELECT d, $2::int, NULL::int, $3::int FROM unnest($1::int[]) AS d ON CONFLICT DO NOTHING`,
+    [await descendantIds(todo.id), userId, actor.id]
   );
   await db.query('UPDATE todos SET assignee_id = $2, assigned_at = NOW(), started_at = NULL WHERE id = $1', [todo.id, userId]);
   await logEvent({
@@ -149,7 +149,7 @@ async function assignTodo(todo, userId, actor) {
   if (userId !== actor.id) {
     await notify([userId], {
       type: 'todo_assigned',
-      title: `📌 ${actor.name} assigned you a to-do`,
+      title: `${actor.name} assigned you a ${cur.business_id ? 'task' : 'to-do'}`,
       body: todo.title,
       data: { todoId: todo.id },
     });
@@ -175,7 +175,7 @@ async function releaseDependents(todoId, actor) {
     await restoreAfterBlockers(id, actor.id, row.assignee_id);
     await notifyMembers(id, {
       type: 'todo_unblocked',
-      title: '✅ Unblocked',
+      title: 'Unblocked',
       body: row.title,
     }, [actor.id]);
   }

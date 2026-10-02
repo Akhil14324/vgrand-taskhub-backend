@@ -14,17 +14,20 @@ function delayUntilMidnight() {
 
 async function sendOverdueNotifications() {
   try {
-    // Tasks that are overdue (due date is in the past), not completed, not on hold,
-    // and have not already received an overdue notification.
+    // Business to-dos that are overdue (due date is in the past), not finished, not on hold or in
+    // review, accepted, and have not already received an overdue notification. Personal to-dos have
+    // their own reminders (todoReminders.js).
     // CURRENT_DATE is evaluated in Postgres's session timezone; this assumes the DB
     // server and the application agree on what "today" is.
     const overdueTasks = await db.query(
-      `SELECT t.id, t.title, t.due_date, t.assigned_user_id, t.business_id, t.created_by,
+      `SELECT t.id, t.title, t.due_date, t.assignee_id, t.business_id, t.created_by,
               b.name AS business_name
-       FROM tasks t
+       FROM todos t
        JOIN businesses b ON b.id = t.business_id
        WHERE t.due_date < CURRENT_DATE
-         AND t.status NOT IN ('completed', 'on_hold', 'in_review')
+         AND t.is_done = FALSE
+         AND t.status NOT IN ('done', 'on_hold', 'in_review')
+         AND t.review_state = 'accepted'
          AND t.last_overdue_notification_at IS NULL`
     );
 
@@ -42,7 +45,7 @@ async function sendOverdueNotifications() {
 
     for (const task of overdueTasks.rows) {
       const message = formatOverdueMessage(task);
-      const data = { taskId: task.id };
+      const data = { todoId: task.id };
 
       // People who have to act: the assignee (or the whole business if unassigned),
       // whoever raised it, and the business heads/managers.
@@ -53,16 +56,16 @@ async function sendOverdueNotifications() {
         [task.business_id]
       );
       const managers = members.rows.filter((m) => levelWithDesignation(m, m.designation) <= 5).map((m) => m.id);
-      const doers = task.assigned_user_id ? [task.assigned_user_id] : members.rows.map((m) => m.id);
+      const doers = task.assignee_id ? [task.assignee_id] : members.rows.map((m) => m.id);
       const actNow = [...new Set([...doers, task.created_by, ...managers])];
 
-      await notify(actNow, { type: 'overdue', title: '⏰ Task overdue', body: message, data });
+      await notify(actNow, { type: 'overdue', title: 'Task overdue', body: message, data });
       // Leadership sees it in their feed without a buzz for every task.
-      await notify(leaderIds, { type: 'overdue', title: '⏰ Task overdue', body: message, data }, { push: false, exclude: actNow });
+      await notify(leaderIds, { type: 'overdue', title: 'Task overdue', body: message, data }, { push: false, exclude: actNow });
 
-      // Mark task as notified
+      // Mark as notified
       await db.query(
-        `UPDATE tasks SET last_overdue_notification_at = NOW() WHERE id = $1`,
+        `UPDATE todos SET last_overdue_notification_at = NOW() WHERE id = $1`,
         [task.id]
       );
     }

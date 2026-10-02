@@ -86,14 +86,21 @@ async function seedReviewAccount() {
         : task.due.startsWith('+')
           ? new Date(Date.now() + parseInt(task.due) * 86400000)
           : new Date(Date.now() - 86400000);
-      await client.query(
-        `INSERT INTO tasks (business_id, created_by, assigned_user_id, title, description, status, due_date, completed_by, completed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7,
-           CASE WHEN $6 = 'completed' THEN $2 ELSE NULL END,
-           CASE WHEN $6 = 'completed' THEN NOW() ELSE NULL END)
-         ON CONFLICT DO NOTHING`,
-        [businessId, adminId, reviewUserId, task.title, 'Sample task for App Review.', task.status, dueDate]
+      const done = task.status === 'completed';
+      const inserted = await client.query(
+        `INSERT INTO todos (business_id, created_by, assignee_id, assigned_at, title, notes, status, is_done,
+                            due_date, done_by, done_at)
+         SELECT $1, $2, $3, NOW(), $4, $5, $6, $7, $8, CASE WHEN $7 THEN $2 END, CASE WHEN $7 THEN NOW() END
+         WHERE NOT EXISTS (SELECT 1 FROM todos WHERE business_id = $1 AND title = $4)
+         RETURNING id`,
+        [businessId, adminId, reviewUserId, task.title, 'Sample task for App Review.', done ? 'done' : 'todo', done, dueDate]
       );
+      if (inserted.rows[0]) {
+        await client.query(
+          `INSERT INTO todo_members (todo_id, user_id, added_by) VALUES ($1, $2, $3), ($1, $4, $3) ON CONFLICT DO NOTHING`,
+          [inserted.rows[0].id, adminId, adminId, reviewUserId]
+        );
+      }
     }
 
     // 6. Seed a welcome notification.

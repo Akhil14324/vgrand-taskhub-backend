@@ -103,13 +103,13 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
     const result = await db.query(
       `SELECT b.*,
          COUNT(t.id) AS task_count,
-         COUNT(CASE WHEN t.status = 'completed' THEN 1 END) AS completed_count,
-         COUNT(CASE WHEN t.status = 'pending' THEN 1 END) AS pending_count,
+         COUNT(CASE WHEN t.status = 'done' THEN 1 END) AS completed_count,
+         COUNT(CASE WHEN t.status = 'todo' THEN 1 END) AS pending_count,
          COUNT(CASE WHEN t.status = 'on_hold' THEN 1 END) AS on_hold_count,
          COUNT(CASE WHEN t.is_warned = true THEN 1 END) AS warned_count,
          (SELECT COUNT(*) FROM user_businesses ub WHERE ub.business_id = b.id) AS user_count
        FROM businesses b
-       LEFT JOIN tasks t ON t.business_id = b.id
+       LEFT JOIN todos t ON t.business_id = b.id AND t.parent_id IS NULL AND t.review_state = 'accepted'
        GROUP BY b.id
        ORDER BY b.sort_order, b.name ASC
        LIMIT $1 OFFSET $2`,

@@ -6,13 +6,13 @@ const { extractMentions } = require('../utils/mentions');
 function previewFor({ body, attachmentType, meta }) {
   if (meta?.kind === 'todos') {
     const count = meta.items?.length || 0;
-    return count === 1 ? `📋 To-do: ${meta.items[0].title}` : `📋 Shared ${count} to-dos${meta.title ? ` · ${meta.title}` : ''}`;
+    return count === 1 ? `To-do: ${meta.items[0].title}` : `Shared ${count} to-dos${meta.title ? ` · ${meta.title}` : ''}`;
   }
-  if (meta?.kind === 'task') return `🗂️ Task: ${meta.task?.title || ''}`;
+  if (meta?.kind === 'task') return `Task: ${meta.task?.title || ''}`;
   if (body) return body.length > 140 ? `${body.slice(0, 137)}…` : body;
-  if (attachmentType?.startsWith('image/')) return '📷 Photo';
-  if (attachmentType?.startsWith('audio/')) return '🎤 Voice message';
-  return '📎 Attachment';
+  if (attachmentType?.startsWith('image/')) return 'Photo';
+  if (attachmentType?.startsWith('audio/')) return 'Voice message';
+  return 'Attachment';
 }
 
 async function loadReplyTo(replyToId) {

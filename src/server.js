@@ -10,7 +10,6 @@ const { Server } = require('socket.io');
 const authRoutes = require('./routes/auth');
 const businessRoutes = require('./routes/businesses');
 const userRoutes = require('./routes/users');
-const taskRoutes = require('./routes/tasks');
 const notificationRoutes = require('./routes/notifications');
 const chatRoutes = require('./routes/chat');
 const todoRoutes = require('./routes/todos');
@@ -127,7 +126,6 @@ app.get('/api/health', async (req, res) => {
 app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/businesses', businessRoutes);
 app.use('/api/users', userRoutes);
-app.use('/api/tasks', taskRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/chat', chatLimiter, chatRoutes);
 app.use('/api/todos', todoRoutes);

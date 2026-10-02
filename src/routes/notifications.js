@@ -118,7 +118,7 @@ router.get('/push-status', authenticate, async (req, res, next) => {
 // POST /api/notifications/test — send yourself a test push
 router.post('/test', authenticate, async (req, res, next) => {
   try {
-    await sendPushToUser(req.user.id, '🔔 Notifications are working', 'You will get alerts for tasks, to-dos, mentions and chats here.', { type: 'test' });
+    await sendPushToUser(req.user.id, 'Notifications are working', 'You will get alerts for tasks, to-dos, mentions and chats here.', { type: 'test' });
     res.json({ message: 'Test notification sent' });
   } catch (err) {
     next(err);

@@ -100,7 +100,7 @@ router.post('/signup', async (req, res, next) => {
     );
     await notify(admins.rows.map((a) => a.id), {
       type: 'user_joined',
-      title: '👤 New person signed up',
+      title: 'New person signed up',
       body: `${name} (@${username}) is waiting to be placed in a business.`,
       data: { userId: user.id },
     });

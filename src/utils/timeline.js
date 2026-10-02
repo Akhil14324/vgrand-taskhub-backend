@@ -14,9 +14,9 @@ const LEVEL_RANK = { none: 0, green: 1, orange: 2, red: 3 };
 const toMs = (v) => (v == null ? null : new Date(v).getTime());
 const secs = (fromMs, toMsValue) => Math.max(0, Math.round((toMsValue - fromMs) / 1000));
 
-/** Seconds spent in each of todo / in_progress / blocked, including the span in progress now. */
+/** Seconds spent in each open status, including the span in progress now. */
 function statusSeconds(todo, now = Date.now()) {
-  const acc = { todo: 0, in_progress: 0, blocked: 0, ...(todo.status_seconds || {}) };
+  const acc = { todo: 0, in_progress: 0, blocked: 0, in_review: 0, on_hold: 0, ...(todo.status_seconds || {}) };
   for (const key of Object.keys(acc)) acc[key] = Math.round(Number(acc[key]) || 0);
   if (!todo.is_done && acc[todo.status] !== undefined && todo.status_since) {
     acc[todo.status] += secs(toMs(todo.status_since), now);
@@ -30,7 +30,7 @@ function statusSeconds(todo, now = Date.now()) {
  *  response assigned → first started
  *  cycle    started (or assigned, if never started) → done / now
  *  blocked  time spent blocked
- *  active   cycle − blocked
+ *  active   cycle − time spent blocked, on hold or waiting for review
  */
 function computeMetrics(todo, now = Date.now()) {
   const end = todo.is_done && todo.done_at ? toMs(todo.done_at) : now;
@@ -45,7 +45,7 @@ function computeMetrics(todo, now = Date.now()) {
     response_s: started ? secs(assigned, started) : null,
     cycle_s: cycle,
     blocked_s: st.blocked,
-    active_s: Math.max(0, cycle - st.blocked),
+    active_s: Math.max(0, cycle - st.blocked - st.on_hold - st.in_review),
     status_s: st,
     estimate_s: todo.duration_minutes ? todo.duration_minutes * 60 : null,
   };

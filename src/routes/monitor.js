@@ -5,7 +5,7 @@ const { sanitizeText } = require('../middleware/sanitize');
 const { notify, emitToUsers } = require('../utils/notify');
 const { loadActor } = require('../utils/org');
 const { todayInAppZone } = require('../utils/recurrence');
-const { TODO_SELECT, getTodoFor, memberIds } = require('../services/todoQueries');
+const { listTodos, getTodoFor, memberIds } = require('../services/todoQueries');
 const { buildTimeline } = require('../services/todoTimeline');
 const {
   actorCanMonitor,
@@ -70,13 +70,12 @@ router.get('/people/:id', authenticate, requireMonitor, async (req, res, next) =
     const [stats, week, todos, activity] = await Promise.all([
       statsForPeople([personId], days),
       weeklyCompletions(personId),
-      db.query(
-        `${TODO_SELECT}
-         WHERE tm.user_id = $1 AND (t.is_done = FALSE OR t.done_at > NOW() - INTERVAL '30 days')
-         ORDER BY t.is_done, t.due_date ASC NULLS LAST, t.priority ASC, t.created_at DESC
-         LIMIT 400`,
-        [personId]
-      ),
+      // Everything on the person's own list: personal to-dos and the business tasks they are on.
+      listTodos(personId, {
+        listOnly: true,
+        where: `(t.is_done = FALSE OR t.done_at > NOW() - INTERVAL '30 days' OR t.due_date >= CURRENT_DATE - 30)`,
+        tail: 'ORDER BY t.is_done, t.due_date ASC NULLS LAST, t.priority ASC, t.created_at DESC LIMIT 400',
+      }),
       db.query(
         `SELECT e.id, e.todo_id, e.kind, e.user_id, u.name AS user_name, e.from_value, e.to_value, e.note, e.meta, e.created_at,
                 COALESCE(t.title, e.meta->>'title') AS todo_title
@@ -95,7 +94,7 @@ router.get('/people/:id', authenticate, requireMonitor, async (req, res, next) =
       stats: stats.get(personId),
       week,
       today: todayInAppZone(),
-      todos: todos.rows,
+      todos,
       activity: activity.rows,
     });
   } catch (err) {
@@ -142,7 +141,7 @@ router.post('/todos/:id/questions', authenticate, requireMonitor, async (req, re
     // The accountable person first; everyone else on the to-do hears about it too.
     await notify([todo.assignee_id, ...members].filter(Boolean), {
       type: 'todo_question',
-      title: `❓ ${asker.name} has a question`,
+      title: `${asker.name} has a question`,
       body: `${todo.title}: ${message.slice(0, 140)}`,
       data: { todoId },
     }, { exclude: [req.user.id] });

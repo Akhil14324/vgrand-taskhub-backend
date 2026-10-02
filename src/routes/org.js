@@ -93,11 +93,11 @@ router.get('/structure', authenticate, async (req, res, next) => {
       db.query(`${PERSON_SELECT} WHERE u.status != 'inactive' GROUP BY u.id ORDER BY u.org_level NULLS LAST, u.name`),
       db.query(
         `SELECT b.id, b.name, b.type, b.color, b.description, b.sort_order,
-           COUNT(t.id) FILTER (WHERE t.status != 'completed')::int AS open_tasks,
-           COUNT(t.id) FILTER (WHERE t.status = 'completed')::int AS done_tasks,
-           COUNT(t.id) FILTER (WHERE t.due_date < CURRENT_DATE AND t.status NOT IN ('completed', 'on_hold'))::int AS overdue_tasks
+           COUNT(t.id) FILTER (WHERE t.status != 'done')::int AS open_tasks,
+           COUNT(t.id) FILTER (WHERE t.status = 'done')::int AS done_tasks,
+           COUNT(t.id) FILTER (WHERE t.due_date < CURRENT_DATE AND t.status NOT IN ('done', 'on_hold'))::int AS overdue_tasks
          FROM businesses b
-         LEFT JOIN tasks t ON t.business_id = b.id
+         LEFT JOIN todos t ON t.business_id = b.id AND t.parent_id IS NULL AND t.review_state = 'accepted'
          GROUP BY b.id
          ORDER BY b.sort_order, b.name`
       ),
@@ -254,7 +254,7 @@ router.post('/people', authenticate, requirePortal, async (req, res, next) => {
 
     await notify([userId], {
       type: 'assignment',
-      title: `👋 Welcome to TaskHub, ${name.split(' ')[0]}!`,
+      title: `Welcome to TaskHub, ${name.split(' ')[0]}`,
       body: `${req.actor.name} added you to the organisation.`,
       data: {},
     }, { push: false });
@@ -320,7 +320,7 @@ router.put('/people/:id', authenticate, requirePortal, async (req, res, next) =>
       const levelLabel = orgLevel && LEADERSHIP[orgLevel] ? LEADERSHIP[orgLevel].label : null;
       await notify([targetId], {
         type: 'assignment',
-        title: '🏢 Your position was updated',
+        title: 'Your position was updated',
         body: levelLabel
           ? `${req.actor.name} made you ${levelLabel}.`
           : `${req.actor.name} updated your role and businesses.`,
@@ -415,7 +415,7 @@ router.put('/businesses/:id/members/:userId', authenticate, async (req, res, nex
     if (!current.rows[0].designation && userId !== actor.id) {
       await notify([userId], {
         type: 'assignment',
-        title: `🏢 You joined ${biz.rows[0]?.name || 'a business'}`,
+        title: `You joined ${biz.rows[0]?.name || 'a business'}`,
         body: `${actor.name} added you as ${DESIGNATIONS[designation].label}.`,
         data: {},
       });

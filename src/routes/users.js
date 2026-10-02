@@ -127,7 +127,7 @@ router.put('/:id/assign', authenticate, requireAdmin, async (req, res, next) => 
 
     await notify([Number(id)], {
       type: 'assignment',
-      title: '🏢 Your businesses changed',
+      title: 'Your businesses changed',
       body: bizNames.length ? `You are now part of: ${bizNames.join(', ')}` : 'You have been unassigned from all businesses',
       data: {},
     });
@@ -171,7 +171,7 @@ router.put('/:id/role', authenticate, requireSuperAdmin, async (req, res, next) 
 
     await notify([Number(id)], {
       type: 'assignment',
-      title: role === 'admin' ? '⭐ You were promoted to Director' : 'Your role changed',
+      title: role === 'admin' ? 'You were promoted to Director' : 'Your role changed',
       body: role === 'admin'
         ? 'You can now see and manage tasks across every business.'
         : 'Your role has been changed to a regular member.',
@@ -217,11 +217,11 @@ router.get('/me/stats', authenticate, async (req, res, next) => {
       const taskStats = await db.query(
         `SELECT
            COUNT(*) AS tasks_created,
-           COUNT(*) FILTER (WHERE status = 'completed') AS tasks_completed,
-           COUNT(*) FILTER (WHERE status = 'pending') AS tasks_pending,
+           COUNT(*) FILTER (WHERE status = 'done') AS tasks_completed,
+           COUNT(*) FILTER (WHERE status = 'todo') AS tasks_pending,
            COUNT(*) FILTER (WHERE status = 'on_hold') AS tasks_on_hold
-         FROM tasks
-         WHERE created_by = $1 OR assigned_user_id = $1`,
+         FROM todos
+         WHERE business_id IS NOT NULL AND (created_by = $1 OR assignee_id = $1)`,
         [req.user.id]
       );
       const warningCount = await db.query(
@@ -244,7 +244,7 @@ router.get('/me/stats', authenticate, async (req, res, next) => {
       const [bizRes, userRes, taskRes] = await Promise.all([
         db.query('SELECT COUNT(*) AS cnt FROM businesses'),
         db.query("SELECT COUNT(*) AS cnt FROM users WHERE role != 'super_admin'"),
-        db.query('SELECT COUNT(*) AS cnt FROM tasks'),
+        db.query('SELECT COUNT(*) AS cnt FROM todos WHERE business_id IS NOT NULL'),
       ]);
       res.json({
         role: req.user.role,
@@ -279,10 +279,10 @@ router.get('/me/businesses', authenticate, async (req, res, next) => {
 router.get('/me/warnings', authenticate, async (req, res, next) => {
   try {
     const result = await db.query(
-      `SELECT w.id, t.title AS task_title, w.message, u.name AS sent_by_name,
+      `SELECT w.id, t.title AS task_title, w.todo_id, w.message, u.name AS sent_by_name,
               w.created_at, w.is_read
        FROM warnings w
-       JOIN tasks t ON w.task_id = t.id
+       JOIN todos t ON w.todo_id = t.id
        LEFT JOIN users u ON w.sent_by = u.id
        WHERE w.user_id = $1
        ORDER BY w.created_at DESC

@@ -15,7 +15,17 @@ const base = (over = {}) => ({
 
 test('statusSeconds adds the span in progress now', () => {
   const s = statusSeconds(base({ status: 'in_progress', status_since: at(2), status_seconds: { todo: 7200 } }), T0 + 5 * 3600 * 1000);
-  assert.deepEqual(s, { todo: 7200, in_progress: 3 * 3600, blocked: 0 });
+  assert.deepEqual(s, { todo: 7200, in_progress: 3 * 3600, blocked: 0, in_review: 0, on_hold: 0 });
+});
+
+test('time on hold or in review does not count as active work', () => {
+  const todo = base({
+    is_done: true, status: 'done', started_at: at(0), done_at: at(10),
+    status_seconds: { in_progress: 4 * 3600, on_hold: 3 * 3600, in_review: 3600 },
+  });
+  const m = computeMetrics(todo, T0 + 20 * 3600 * 1000);
+  assert.equal(m.cycle_s, 10 * 3600);
+  assert.equal(m.active_s, 6 * 3600);
 });
 
 test('statusSeconds stops counting once done', () => {
