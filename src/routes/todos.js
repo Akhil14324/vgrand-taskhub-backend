@@ -368,7 +368,9 @@ router.post('/reorder', authenticate, async (req, res, next) => {
 
 // POST /api/todos — { title, notes?, due_date?, due_time?, priority?, list_id?, section_id?, recurrence?,
 //                     mention_ids?, parent_id?, labels?, deadline_date?, duration_minutes?, reminder_offsets?,
-//                     business_id?, assign_to?, requires_approval?, source_business_id? }
+//                     business_id?, assign_to?, delegate_to?, requires_approval?, source_business_id? }
+// delegate_to (personal only): hand the to-do to another person. It goes to their list, not mine; the
+// response has no `todo`, only `assigned_to`.
 // With a business_id it is a business to-do: set directly by someone who manages that business, otherwise
 // proposed for review. Sub-tasks (any depth) belong to the same business as their parent.
 /**
@@ -399,7 +401,17 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
     if (!business) return { status: 404, error: 'Business not found' };
   }
 
-  const place = businessId
+  // "Assign": hand a personal to-do to anyone else. It lands in that person's
+  // Inbox and stays off the giver's own list.
+  const delegateId = !businessId && !parent ? (parseInt(body.delegate_to, 10) || null) : null;
+  let delegate = null;
+  if (delegateId) {
+    if (delegateId === actor.id) return { status: 400, error: 'Pick someone else to assign this to' };
+    delegate = await loadActor(delegateId);
+    if (!delegate || delegate.status === 'inactive') return { status: 404, error: 'Person not found' };
+  }
+
+  const place = businessId || delegate
     ? { listId: null, sectionId: null }
     : await resolvePlacement(actor.id, parseInt(body.list_id, 10) || null, parseInt(body.section_id, 10) || null);
   if (place.error) return { status: 404, error: place.error };
@@ -413,7 +425,7 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
   if (parent) reviewState = parent.review_state;
   else if (businessId && !(isLeader(actor) || managesBusiness(actor, businessId))) reviewState = 'proposed';
 
-  let assigneeId = actor.id;
+  let assigneeId = delegate ? delegate.id : actor.id;
   if (businessId) {
     if (assignTo) assigneeId = assignTo;
     else if (parent) assigneeId = parent.assignee_id || null;
@@ -458,6 +470,11 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
   } else if (businessId) {
     await ensureMember(todo.id, actor.id, actor.id);
     if (assigneeId && assigneeId !== actor.id) await ensureMember(todo.id, assigneeId, actor.id);
+  } else if (delegate) {
+    await db.query(
+      'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by) VALUES ($1, $2, NULL, NULL, $3)',
+      [todo.id, delegate.id, actor.id]
+    );
   } else {
     await db.query(
       'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by) VALUES ($1, $2, $3, $4, $2)',
@@ -469,6 +486,17 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
     todoId: todo.id, userId: actor.id, subjectId: assigneeId || actor.id, kind: 'created',
     meta: { title, parent_id: parent ? parent.id : null, business_id: businessId, review_state: reviewState },
   });
+
+  if (delegate) {
+    await notify([delegate.id], {
+      type: 'todo_assigned',
+      title: `${parsePriority(body.priority) === 1 ? 'Urgent: ' : ''}${actor.name} assigned you a to-do`,
+      body: title,
+      data: { todoId: todo.id },
+    });
+    if (!quiet) await announce(todo.id, 'created');
+    return { status: 201, todo: null, id: todo.id, assigned_to: { id: delegate.id, name: delegate.name } };
+  }
 
   const added = await addMentionedMembers(todo, `${title} ${notes || ''}`, body.mention_ids, actor, {
     quietFor: assignTo || null,
@@ -514,7 +542,7 @@ router.post('/', authenticate, async (req, res, next) => {
     if (!actor) return;
     const out = await createTodoCore(actor, req.body);
     if (out.error) return res.status(out.status).json({ error: out.error });
-    res.status(201).json({ todo: out.todo });
+    res.status(201).json({ todo: out.todo, assigned_to: out.assigned_to || undefined });
   } catch (err) {
     next(err);
   }
