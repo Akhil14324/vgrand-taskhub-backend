@@ -11,16 +11,12 @@ const SEED_MARKER = 'seed:organization-v1';
 // Second pass: the business accountants. Separate marker so deployments that already
 // ran v1 still pick these up on their next start.
 const ACCOUNTANTS_MARKER = 'seed:organization-v2-accountants';
-// Third pass: Central Office and Vgrand Health Care Pvt Ltd (created by ensureBusinesses).
-const BUSINESSES_V3_MARKER = 'seed:organization-v3-businesses';
 
 const BUSINESSES = [
   { name: 'VGrand Family Restaurant', type: 'restaurant', color: 'orange', aliases: ['vgrand family restaurant', 'vigrand family restaurant', 'v grand family restaurant', 'vgrand restaurant'] },
   { name: 'VGrand Infra', type: 'construction', color: 'blue', aliases: ['vgrand infra', 'vigrand infra', 'v grand infra', 'vgrand infrastructure'] },
   { name: 'VTech', type: 'it', color: 'purple', aliases: ['vtech', 'v tech', 'vgrand tech'] },
   { name: 'BVL Mines & Minerals', type: 'mines', color: 'amber', aliases: ['bvl mines and minerals', 'bvl mines & minerals', 'bvl rocks and minerals', 'bvl rocks & minerals', 'bvl'] },
-  { name: 'Central Office', type: 'other', color: 'indigo', aliases: ['central office', 'head office', 'vgrand central office'] },
-  { name: 'Vgrand Health Care Pvt Ltd', type: 'hospital', color: 'green', aliases: ['vgrand health care pvt ltd', 'vgrand healthcare pvt ltd', 'vgrand health care', 'vgrand healthcare', 'v grand health care'] },
 ];
 
 const PEOPLE = [
@@ -110,9 +106,9 @@ async function seedOrganization(q, { log = console.log } = {}) {
   if (process.env.SEED_ORGANIZATION === 'false') return;
   const defaultPassword = process.env.SEED_DEFAULT_PASSWORD || 'Vgrand@2026';
 
-  const done = await q.query('SELECT filename FROM migrations WHERE filename = ANY($1)', [[SEED_MARKER, ACCOUNTANTS_MARKER, BUSINESSES_V3_MARKER]]);
+  const done = await q.query('SELECT filename FROM migrations WHERE filename = ANY($1)', [[SEED_MARKER, ACCOUNTANTS_MARKER]]);
   const ran = new Set(done.rows.map((r) => r.filename));
-  if (ran.has(SEED_MARKER) && ran.has(ACCOUNTANTS_MARKER) && ran.has(BUSINESSES_V3_MARKER)) return;
+  if (ran.has(SEED_MARKER) && ran.has(ACCOUNTANTS_MARKER)) return;
 
   const hash = await bcrypt.hash(defaultPassword, 10);
   const businessIds = await ensureBusinesses(q, log);
@@ -129,11 +125,6 @@ async function seedOrganization(q, { log = console.log } = {}) {
     await placePeople(q, ACCOUNTANTS, businessIds, hash, log);
     await q.query('INSERT INTO migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [ACCOUNTANTS_MARKER]);
     log('  ✓ Accountants seeded.');
-  }
-
-  if (!ran.has(BUSINESSES_V3_MARKER)) {
-    await q.query('INSERT INTO migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [BUSINESSES_V3_MARKER]);
-    log('  ✓ Central Office and Vgrand Health Care added.');
   }
 
   for (const id of Object.values(businessIds)) await ensureBusinessGroup(q, id);

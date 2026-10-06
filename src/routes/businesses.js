@@ -1,6 +1,6 @@
 const express = require('express');
 const db = require('../db');
-const { authenticate, requireAdmin } = require('../middleware/auth');
+const { authenticate, requireAdmin, requireSuperAdmin } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
 
 const router = express.Router();
@@ -129,8 +129,8 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
   }
 });
 
-// POST /api/businesses (admin only)
-router.post('/', authenticate, requireAdmin, async (req, res, next) => {
+// POST /api/businesses (Chairman and Chief of Staff only)
+router.post('/', authenticate, requireSuperAdmin, async (req, res, next) => {
   try {
     const name = sanitizeText(req.body.name, 100);
     const type = sanitizeText(req.body.type, 50);
@@ -162,8 +162,8 @@ router.post('/', authenticate, requireAdmin, async (req, res, next) => {
   }
 });
 
-// PUT /api/businesses/:id (admin only)
-router.put('/:id', authenticate, requireAdmin, async (req, res, next) => {
+// PUT /api/businesses/:id (Chairman and Chief of Staff only)
+router.put('/:id', authenticate, requireSuperAdmin, async (req, res, next) => {
   try {
     const { id } = req.params;
     const name = sanitizeText(req.body.name, 100);
@@ -196,8 +196,8 @@ router.put('/:id', authenticate, requireAdmin, async (req, res, next) => {
   }
 });
 
-// DELETE /api/businesses/:id (admin only)
-router.delete('/:id', authenticate, requireAdmin, async (req, res, next) => {
+// DELETE /api/businesses/:id (Chairman and Chief of Staff only)
+router.delete('/:id', authenticate, requireSuperAdmin, async (req, res, next) => {
   try {
     const { id } = req.params;
 
