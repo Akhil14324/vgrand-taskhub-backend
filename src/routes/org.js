@@ -148,7 +148,7 @@ router.get('/structure', authenticate, async (req, res, next) => {
       leaders,
       businesses: businessNodes,
       unplaced,
-      me: { id: actor.id, level: actorBestLevel(actor), portal },
+      me: { id: actor.id, level: actorBestLevel(actor), portal, can_edit_businesses: actor.role === 'admin' || actor.role === 'super_admin' },
       ...catalog(),
     });
   } catch (err) {
