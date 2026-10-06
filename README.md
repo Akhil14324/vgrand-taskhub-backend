@@ -151,6 +151,12 @@ The Team Monitor (`/api/monitor`) follows the hierarchy: leadership sees people 
 
 `GET /structure` (org chart, everyone) · `GET /directory?q=` (people for @mentions/pickers) · `GET /catalog` · portal only: `GET/POST /people`, `PUT /people/:id`, `PUT /people/:id/password`, `DELETE /people/:id` · `PUT/DELETE /businesses/:id/members/:userId` (portal, or heads/managers for people junior to them).
 
+### Run with Claude (`/api/claude`)
+
+A to-do that mentions `@claude` (title, notes or a comment) gets a "Run with Claude" button (`components/todos/ClaudePanel.jsx`). Nothing runs by itself. Only the usernames in `CLAUDE_ALLOWED_USERNAMES` (default `akhil`) can see or use it: for everyone else `GET /todo/:id` answers `{ enabled: false }` and the other endpoints answer 404, so the app shows no Claude UI at all.
+
+`GET /todo/:id` (mention, permissions, last 5 runs) · `POST /todo/:id/run` `{ repo: 'mobile'|'backend' }` dispatches the `claude-task.yml` workflow of that repo through the GitHub API · `POST /runs/:id/approve` squash-merges the pull request into main · `POST /runs/:id/reject` closes it and deletes the branch · `POST /callback` is called by the workflow, no login, the raw body is signed (`X-Claude-Signature: sha256=<hmac>`, key `CLAUDE_WEBHOOK_SECRET`, `ts` within 10 minutes). Statuses: `queued` → `running` → `pr_ready` → `merged` / `rejected`, or `failed` / `no_changes` (a run with no answer for 60 minutes is shown as failed). Table `claude_runs` (migration 040). Env: `CLAUDE_WEBHOOK_SECRET`, `CLAUDE_ALLOWED_USERNAMES`, `CLAUDE_REPOS` (one `key=owner/repo` per project), a GitHub token per repo owner (`CLAUDE_GITHUB_TOKEN_<OWNER>`, else `CLAUDE_GITHUB_TOKEN`), optional `CLAUDE_BASE_BRANCH` (default: each repo's own default branch) and `CLAUDE_CALLBACK_URL` (see `.env.example`). The workflow (`.github/workflows/claude-task.yml`, the same file in both repos) needs the repo secrets `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`, uses the Claude subscription) and `CLAUDE_WEBHOOK_SECRET`, and Settings > Actions > "Allow GitHub Actions to create and approve pull requests".
+
 ### Notifications (`/api/notifications`)
 
 `GET /` · `GET /unread-count` · `PUT /:id/read` · `PUT /read-all` · `DELETE /read` · `POST /push-token` `{ token, platform, provider: fcm|expo }` · `DELETE /push-token` · `GET /push-status` · `POST /test`.

@@ -28,6 +28,7 @@ const insightRoutes = require('./routes/insights');
 const goalRoutes = require('./routes/goals');
 const collabRoutes = require('./routes/collab');
 const standupRoutes = require('./routes/standup');
+const claudeRoutes = require('./routes/claude');
 const { setIO } = require('./utils/notify');
 const { setupSocketIO } = require('./socket');
 const { requestId } = require('./middleware/requestId');
@@ -70,7 +71,8 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(express.json({ limit: '1mb' }));
+// The raw body is kept for the signed /api/claude/callback.
+app.use(express.json({ limit: '1mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 const globalLimiter = rateLimit({
@@ -144,6 +146,7 @@ app.use('/api/insights', insightRoutes);
 app.use('/api/goals', goalRoutes);
 app.use('/api/collab', collabRoutes);
 app.use('/api/standup', standupRoutes);
+app.use('/api/claude', claudeRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/approvals', approvalRoutes);
 
