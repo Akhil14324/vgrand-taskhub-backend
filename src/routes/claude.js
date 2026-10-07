@@ -49,7 +49,8 @@ const runLimiter = rateLimit({
 
 /** Where the workflow reports back to. CLAUDE_CALLBACK_URL wins; Railway's public domain is the fallback. */
 function callbackUrl() {
-  if (process.env.CLAUDE_CALLBACK_URL) return process.env.CLAUDE_CALLBACK_URL;
+  const configured = (process.env.CLAUDE_CALLBACK_URL || '').trim();
+  if (configured) return configured;
   if (process.env.RAILWAY_PUBLIC_DOMAIN) return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/api/claude/callback`;
   return null;
 }

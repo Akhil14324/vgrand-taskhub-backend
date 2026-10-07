@@ -60,6 +60,7 @@ jobs:
           cat > "$RUNNER_TEMP/report.sh" <<'SCRIPT'
           #!/usr/bin/env bash
           # report.sh <status> [pr_url] [summary]  — tells TaskHub how the run is going (body is HMAC-signed)
+          CALLBACK_URL="$(printf '%s' "$CALLBACK_URL" | tr -d '[:space:]')"
           status="$1"; pr_url="${2:-}"; summary="${3:-}"
           body=$(jq -cn --arg run_id "$RUN_ID" --arg status "$status" --arg pr_url "$pr_url" \
                         --arg summary "$summary" --arg ts "$(date +%s)000" \
