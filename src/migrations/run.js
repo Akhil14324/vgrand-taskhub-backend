@@ -69,6 +69,7 @@ async function runMigrations({ autoClose = true } = {}) {
   }
 
   await seedOrganization({ query: directQuery });
+  await seedOwner({ query: directQuery });
 
   if (autoClose) {
     await db.directPool.end();
