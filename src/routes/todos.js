@@ -1547,6 +1547,24 @@ router.post('/sections', authenticate, async (req, res, next) => {
   }
 });
 
+// PUT /api/todos/sections/order — { ids } the viewer's sections of one board (a list's, or the Inbox's) in
+// their new left-to-right order. Ids that are not mine are ignored.
+router.put('/sections/order', authenticate, async (req, res, next) => {
+  try {
+    const ids = (Array.isArray(req.body.ids) ? req.body.ids : []).map((v) => parseInt(v, 10)).filter(Boolean);
+    if (!ids.length) return res.status(400).json({ error: 'ids are required' });
+    await db.query(
+      `UPDATE todo_sections s SET sort_order = o.ord::int
+       FROM unnest($1::int[]) WITH ORDINALITY AS o(id, ord)
+       WHERE s.id = o.id AND s.owner_id = $2`,
+      [ids, req.user.id]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.put('/sections/:id(\\d+)', authenticate, async (req, res, next) => {
   try {
     const name = sanitizeText(req.body.name, 120);
