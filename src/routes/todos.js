@@ -68,6 +68,19 @@ function parseDuration(value) {
   return n >= 1 && n <= 14400 ? n : null;
 }
 
+const REMIND_REPEATS = ['daily', 'weekly', 'monthly'];
+
+/** The stand-alone reminder: a date, a time, and an optional repeat. Needs both date and time to count. */
+function parseReminder(body, current = {}) {
+  const date = body.remind_date !== undefined ? parseDate(body.remind_date) : (current.remind_date || null);
+  const time = body.remind_time !== undefined ? parseTime(body.remind_time) : (current.remind_time || null);
+  const repeat = body.remind_repeat !== undefined
+    ? (REMIND_REPEATS.includes(body.remind_repeat) ? body.remind_repeat : null)
+    : (current.remind_repeat || null);
+  if (!date || !time) return { date: null, time: null, repeat: null };
+  return { date, time, repeat };
+}
+
 function parseOffsets(value) {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.map(Number).filter((n) => REMINDER_OFFSETS.includes(n)))].sort((a, b) => a - b);
@@ -186,7 +199,7 @@ router.get('/', authenticate, async (req, res, next) => {
     const actor = await actorOf(req, res);
     if (!actor) return;
     const manageable = new Set([...actor.memberships.keys()].filter((id) => managesBusiness(actor, id)));
-    const [lists, sections, filters, todos, businesses] = await Promise.all([
+    const [lists, sections, filters, todos, businesses, favorites] = await Promise.all([
       db.query('SELECT * FROM todo_lists WHERE owner_id = $1 ORDER BY sort_order, id', [actor.id]),
       db.query('SELECT s.* FROM todo_sections s WHERE s.owner_id = $1 ORDER BY s.sort_order, s.id', [actor.id]),
       db.query('SELECT * FROM todo_filters WHERE owner_id = $1 ORDER BY sort_order, id', [actor.id]),
@@ -203,8 +216,10 @@ router.get('/', authenticate, async (req, res, next) => {
          WHERE $1::boolean OR b.id = ANY($2::int[]) ORDER BY b.sort_order, b.name`,
         [isLeader(actor), [...actor.memberships.keys()]]
       ),
+      db.query('SELECT kind, ref FROM todo_favorites WHERE owner_id = $1', [actor.id]),
     ]);
     res.json({
+      favorites: favorites.rows,
       lists: lists.rows,
       sections: sections.rows,
       filters: filters.rows,
@@ -447,18 +462,21 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
   const dueDate = parseDate(body.due_date) || (recurrence ? todayInAppZone() : null);
   const dueTime = parseTime(body.due_time);
 
+  const remind = parseReminder(body);
   const inserted = await db.query(
     `INSERT INTO todos (created_by, title, notes, due_date, due_time, priority, recurrence,
                         parent_id, labels, deadline_date, duration_minutes, reminder_offsets,
-                        assignee_id, assigned_at, business_id, source_business_id, requires_approval, review_state)
+                        assignee_id, assigned_at, business_id, source_business_id, requires_approval, review_state,
+                        remind_date, remind_time, remind_repeat)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::int,
-             CASE WHEN $13::int IS NOT NULL THEN NOW() END, $14, $15, $16, $17)
+             CASE WHEN $13::int IS NOT NULL THEN NOW() END, $14, $15, $16, $17, $18, $19, $20)
      RETURNING id, title, business_id`,
     [
       actor.id, title, notes || '', dueDate, dueTime, parsePriority(body.priority), recurrence,
       parent ? parent.id : null, parseLabels(body.labels), parseDate(body.deadline_date),
       parseDuration(body.duration_minutes), dueTime ? parseOffsets(body.reminder_offsets) : [],
       assigneeId, businessId, sourceBusinessId, requiresApproval, reviewState,
+      remind.date, remind.time, remind.repeat,
     ]
   );
   const todo = inserted.rows[0];
@@ -679,6 +697,9 @@ router.put('/:id(\\d+)', authenticate, async (req, res, next) => {
     const requiresApproval = existing.business_id && !existing.parent_id && req.body.requires_approval !== undefined
       ? !!req.body.requires_approval
       : existing.requires_approval;
+    const remind = parseReminder(req.body, existing);
+    const remindChanged = remind.date !== (existing.remind_date || null) || remind.time !== (existing.remind_time || null)
+      || remind.repeat !== (existing.remind_repeat || null);
     const scheduleChanged = dueDate !== existing.due_date || dueTime !== existing.due_time;
     const offsetsChanged = JSON.stringify(offsets) !== JSON.stringify(existing.reminder_offsets);
 
@@ -731,10 +752,13 @@ router.put('/:id(\\d+)', authenticate, async (req, res, next) => {
          labels = $7, deadline_date = $8, duration_minutes = $9, reminder_offsets = $10, requires_approval = $14,
          reminded_at = CASE WHEN $11::boolean THEN NULL ELSE reminded_at END,
          last_overdue_notification_at = CASE WHEN $11::boolean THEN NULL ELSE last_overdue_notification_at END,
-         reminders_sent = CASE WHEN $11::boolean OR $12::boolean THEN '{}'::int[] ELSE reminders_sent END
+         reminders_sent = CASE WHEN $11::boolean OR $12::boolean THEN '{}'::int[] ELSE reminders_sent END,
+         remind_date = $15, remind_time = $16, remind_repeat = $17,
+         remind_sent_at = CASE WHEN $18::boolean THEN NULL ELSE remind_sent_at END
        WHERE id = $13`,
       [title, notes || '', dueDate, dueTime, priority, recurrence, labels, deadline, duration, offsets,
-        scheduleChanged, offsetsChanged, existing.id, requiresApproval]
+        scheduleChanged, offsetsChanged, existing.id, requiresApproval,
+        remind.date, remind.time, remind.repeat, remindChanged]
     );
     if (newParent !== undefined) {
       await db.query('UPDATE todos SET parent_id = $1 WHERE id = $2', [newParent, existing.id]);
@@ -1213,6 +1237,29 @@ router.post('/:id(\\d+)/move-to-business', authenticate, async (req, res, next) 
   }
 });
 
+/**
+ * Copies a personal to-do (and everything below it) into the actor's own lists. The copy lands in
+ * `placement` ({ listId, sectionId }) and starts open. Returns the new root id.
+ */
+async function duplicateTree(actor, src, placement, parentId = src.parent_id) {
+  const inserted = await db.query(
+    `INSERT INTO todos (created_by, title, notes, due_date, due_time, priority, recurrence,
+                        parent_id, labels, deadline_date, duration_minutes, reminder_offsets,
+                        assignee_id, assigned_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $1, NOW()) RETURNING id`,
+    [actor.id, src.title, src.notes || '', src.due_date, src.due_time, src.priority, src.recurrence,
+      parentId, src.labels || [], src.deadline_date, src.duration_minutes, src.reminder_offsets || []]
+  );
+  const id = inserted.rows[0].id;
+  await db.query(
+    'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by) VALUES ($1, $2, $3, $4, $2)',
+    [id, actor.id, placement.listId, placement.sectionId]
+  );
+  const children = await listTodos(actor.id, { actor, where: 't.parent_id = $5', params: [src.id], tail: 'ORDER BY t.id' });
+  for (const child of children) await duplicateTree(actor, child, placement, id);
+  return id;
+}
+
 // POST /api/todos/:id/duplicate — copy (with everything below it) into my own list
 router.post('/:id(\\d+)/duplicate', authenticate, async (req, res, next) => {
   try {
@@ -1221,31 +1268,7 @@ router.post('/:id(\\d+)/duplicate', authenticate, async (req, res, next) => {
     const src = await visibleTodo(req, res, actor);
     if (!src) return;
     if (src.business_id) return res.status(400).json({ error: 'Business tasks cannot be duplicated; create a new one instead' });
-
-    const copy = async (row, parentId) => {
-      const inserted = await db.query(
-        `INSERT INTO todos (created_by, title, notes, due_date, due_time, priority, recurrence,
-                            parent_id, labels, deadline_date, duration_minutes, reminder_offsets,
-                            assignee_id, assigned_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $1, NOW()) RETURNING id`,
-        [actor.id, row.title, row.notes || '', row.due_date, row.due_time, row.priority, row.recurrence,
-          parentId, row.labels || [], row.deadline_date, row.duration_minutes, row.reminder_offsets || []]
-      );
-      const id = inserted.rows[0].id;
-      await db.query(
-        'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by) VALUES ($1, $2, $3, $4, $2)',
-        [id, actor.id, src.list_id, src.section_id]
-      );
-      return id;
-    };
-    const copyTree = async (row, parentId) => {
-      const id = await copy(row, parentId);
-      const children = await listTodos(actor.id, { actor, where: 't.parent_id = $5', params: [row.id], tail: 'ORDER BY t.id' });
-      for (const child of children) await copyTree(child, id);
-      return id;
-    };
-
-    const newId = await copyTree(src, src.parent_id);
+    const newId = await duplicateTree(actor, src, { listId: src.list_id, sectionId: src.section_id });
     announceTo([actor.id], newId, 'created');
     res.status(201).json({ todo: await getTodoFor(newId, actor.id, actor) });
   } catch (err) {
@@ -1512,40 +1535,50 @@ router.delete('/lists/:id', authenticate, async (req, res, next) => {
 // ---------------------------------------------------------------------------
 // Sections (inside one of my lists)
 // ---------------------------------------------------------------------------
-router.post('/lists/:id/sections', authenticate, async (req, res, next) => {
+/**
+ * Make room for a new section: `position` is the zero-based place it should take among the owner's
+ * sections of the same board (a list's, or the Inbox's). Returns the sort_order to give it.
+ */
+async function sectionSlot(userId, listId, position) {
+  const rows = (await db.query(
+    'SELECT id FROM todo_sections WHERE owner_id = $1 AND list_id IS NOT DISTINCT FROM $2::int ORDER BY sort_order, id',
+    [userId, listId]
+  )).rows;
+  const at = Number.isInteger(position) ? Math.max(0, Math.min(position, rows.length)) : rows.length;
+  // Renumber everything after the gap so the new section fits exactly there.
+  if (at < rows.length) {
+    await db.query(
+      `UPDATE todo_sections s SET sort_order = o.ord::int + 1
+       FROM unnest($1::int[]) WITH ORDINALITY AS o(id, ord)
+       WHERE s.id = o.id AND o.ord > $2`,
+      [rows.map((r) => r.id), at]
+    );
+  }
+  return at + 1;
+}
+
+async function createSection(req, res, next, listId) {
   try {
     const name = sanitizeText(req.body.name, 120);
     if (!name) return res.status(400).json({ error: 'Section name is required' });
-    if (!(await ownsList(parseInt(req.params.id, 10), req.user.id))) return res.status(404).json({ error: 'List not found' });
-    const order = await db.query('SELECT COALESCE(MAX(sort_order), 0) + 1 AS next FROM todo_sections WHERE list_id = $1', [req.params.id]);
+    if (listId && !(await ownsList(listId, req.user.id))) return res.status(404).json({ error: 'List not found' });
+    const position = req.body.position === undefined || req.body.position === null ? null : parseInt(req.body.position, 10);
+    const slot = await sectionSlot(req.user.id, listId, Number.isNaN(position) ? null : position);
     const result = await db.query(
-      'INSERT INTO todo_sections (list_id, owner_id, name, sort_order) VALUES ($1, $2, $3, $4) RETURNING *',
-      [req.params.id, req.user.id, name, order.rows[0].next]
+      'INSERT INTO todo_sections (list_id, owner_id, name, description, sort_order) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [listId, req.user.id, name, sanitizeText(req.body.description, 1000) || '', slot]
     );
     res.status(201).json({ section: result.rows[0] });
   } catch (err) {
     next(err);
   }
-});
+}
+
+// POST /api/todos/lists/:id/sections — { name, description?, position? }
+router.post('/lists/:id/sections', authenticate, (req, res, next) => createSection(req, res, next, parseInt(req.params.id, 10)));
 
 // POST /api/todos/sections — a section of the Inbox (no list)
-router.post('/sections', authenticate, async (req, res, next) => {
-  try {
-    const name = sanitizeText(req.body.name, 120);
-    if (!name) return res.status(400).json({ error: 'Section name is required' });
-    const order = await db.query(
-      'SELECT COALESCE(MAX(sort_order), 0) + 1 AS next FROM todo_sections WHERE owner_id = $1 AND list_id IS NULL',
-      [req.user.id]
-    );
-    const result = await db.query(
-      'INSERT INTO todo_sections (list_id, owner_id, name, sort_order) VALUES (NULL, $1, $2, $3) RETURNING *',
-      [req.user.id, name, order.rows[0].next]
-    );
-    res.status(201).json({ section: result.rows[0] });
-  } catch (err) {
-    next(err);
-  }
-});
+router.post('/sections', authenticate, (req, res, next) => createSection(req, res, next, null));
 
 // PUT /api/todos/sections/order — { ids } the viewer's sections of one board (a list's, or the Inbox's) in
 // their new left-to-right order. Ids that are not mine are ignored.
@@ -1565,16 +1598,57 @@ router.put('/sections/order', authenticate, async (req, res, next) => {
   }
 });
 
+// PUT /api/todos/sections/:id — any of { name, description, archived }
 router.put('/sections/:id(\\d+)', authenticate, async (req, res, next) => {
   try {
-    const name = sanitizeText(req.body.name, 120);
+    const current = await db.query('SELECT * FROM todo_sections WHERE id = $1 AND owner_id = $2', [req.params.id, req.user.id]);
+    if (!current.rows.length) return res.status(404).json({ error: 'Section not found' });
+    const row = current.rows[0];
+    const name = req.body.name !== undefined ? sanitizeText(req.body.name, 120) : row.name;
     if (!name) return res.status(400).json({ error: 'Section name is required' });
+    const description = req.body.description !== undefined ? (sanitizeText(req.body.description, 1000) || '') : row.description;
+    const archived = req.body.archived !== undefined ? !!req.body.archived : row.archived;
     const result = await db.query(
-      'UPDATE todo_sections SET name = $1 WHERE id = $2 AND owner_id = $3 RETURNING *',
-      [name, req.params.id, req.user.id]
+      'UPDATE todo_sections SET name = $1, description = $2, archived = $3 WHERE id = $4 RETURNING *',
+      [name, description, archived, row.id]
     );
-    if (!result.rows.length) return res.status(404).json({ error: 'Section not found' });
     res.json({ section: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/todos/sections/:id/duplicate — the section (right after it) with copies of its open to-dos
+router.post('/sections/:id(\\d+)/duplicate', authenticate, async (req, res, next) => {
+  try {
+    const actor = await actorOf(req, res);
+    if (!actor) return;
+    const found = await db.query('SELECT * FROM todo_sections WHERE id = $1 AND owner_id = $2', [req.params.id, actor.id]);
+    if (!found.rows.length) return res.status(404).json({ error: 'Section not found' });
+    const src = found.rows[0];
+    const siblings = (await db.query(
+      'SELECT id FROM todo_sections WHERE owner_id = $1 AND list_id IS NOT DISTINCT FROM $2::int ORDER BY sort_order, id',
+      [actor.id, src.list_id]
+    )).rows;
+    const at = siblings.findIndex((r) => r.id === src.id) + 1;
+    const slot = await sectionSlot(actor.id, src.list_id, at);
+    const created = await db.query(
+      'INSERT INTO todo_sections (list_id, owner_id, name, description, sort_order) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [src.list_id, actor.id, `${src.name} copy`.slice(0, 120), src.description || '', slot]
+    );
+    const todos = await listTodos(actor.id, {
+      actor,
+      listOnly: true,
+      where: 't.parent_id IS NULL AND t.is_done = FALSE AND t.business_id IS NULL AND tm.section_id = $5',
+      params: [src.id],
+      tail: 'ORDER BY tm.sort_order NULLS LAST, t.id',
+    });
+    for (const todo of todos) {
+      // eslint-disable-next-line no-await-in-loop
+      await duplicateTree(actor, todo, { listId: src.list_id, sectionId: created.rows[0].id }, null);
+    }
+    announceTo([actor.id], 0, 'created');
+    res.status(201).json({ section: created.rows[0], copied: todos.length });
   } catch (err) {
     next(err);
   }
@@ -1627,10 +1701,91 @@ router.put('/filters/:id', authenticate, async (req, res, next) => {
   }
 });
 
+// POST /api/todos/filters/:id/duplicate
+router.post('/filters/:id(\\d+)/duplicate', authenticate, async (req, res, next) => {
+  try {
+    const src = await db.query('SELECT * FROM todo_filters WHERE id = $1 AND owner_id = $2', [req.params.id, req.user.id]);
+    if (!src.rows.length) return res.status(404).json({ error: 'Filter not found' });
+    const order = await db.query('SELECT COALESCE(MAX(sort_order), 0) + 1 AS next FROM todo_filters WHERE owner_id = $1', [req.user.id]);
+    const result = await db.query(
+      'INSERT INTO todo_filters (owner_id, name, config, sort_order) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.user.id, `${src.rows[0].name} copy`.slice(0, 120), JSON.stringify(src.rows[0].config), order.rows[0].next]
+    );
+    res.status(201).json({ filter: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.delete('/filters/:id', authenticate, async (req, res, next) => {
   try {
     const result = await db.query('DELETE FROM todo_filters WHERE id = $1 AND owner_id = $2 RETURNING id', [req.params.id, req.user.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Filter not found' });
+    res.json({ deleted: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Favourites (lists, filters and labels pinned to the top of the sidebar) and label rename
+// ---------------------------------------------------------------------------
+const FAVORITE_KINDS = ['list', 'filter', 'label'];
+
+// PUT /api/todos/favorites — { kind, ref, favorite }
+router.put('/favorites', authenticate, async (req, res, next) => {
+  try {
+    const kind = req.body.kind;
+    const ref = String(req.body.ref ?? '').slice(0, 120);
+    if (!FAVORITE_KINDS.includes(kind) || !ref) return res.status(400).json({ error: 'kind and ref are required' });
+    if (req.body.favorite) {
+      await db.query('INSERT INTO todo_favorites (owner_id, kind, ref) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [req.user.id, kind, ref]);
+    } else {
+      await db.query('DELETE FROM todo_favorites WHERE owner_id = $1 AND kind = $2 AND ref = $3', [req.user.id, kind, ref]);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/todos/labels/:name — { name } rename a label on every to-do I am on (a new name that exists merges)
+router.put('/labels/:name', authenticate, async (req, res, next) => {
+  try {
+    const from = parseLabels([req.params.name])[0];
+    const to = parseLabels([req.body.name])[0];
+    if (!from || !to) return res.status(400).json({ error: 'A label name is required' });
+    await db.query(
+      `UPDATE todos t
+       SET labels = (SELECT COALESCE(array_agg(DISTINCT CASE WHEN l = $2 THEN $3 ELSE l END), '{}') FROM unnest(t.labels) AS l)
+       WHERE $2 = ANY(t.labels)
+         AND EXISTS (SELECT 1 FROM todo_members m WHERE m.todo_id = t.id AND m.user_id = $1)`,
+      [req.user.id, from, to]
+    );
+    await db.query(
+      "UPDATE todo_favorites SET ref = $3 WHERE owner_id = $1 AND kind = 'label' AND ref = $2",
+      [req.user.id, from, to]
+    );
+    announceTo([req.user.id], 0, 'updated');
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/todos/labels/:name — take the label off every to-do I am on
+router.delete('/labels/:name', authenticate, async (req, res, next) => {
+  try {
+    const name = parseLabels([req.params.name])[0];
+    if (!name) return res.status(400).json({ error: 'A label name is required' });
+    await db.query(
+      `UPDATE todos t SET labels = array_remove(t.labels, $2)
+       WHERE $2 = ANY(t.labels)
+         AND EXISTS (SELECT 1 FROM todo_members m WHERE m.todo_id = t.id AND m.user_id = $1)`,
+      [req.user.id, name]
+    );
+    await db.query("DELETE FROM todo_favorites WHERE owner_id = $1 AND kind = 'label' AND ref = $2", [req.user.id, name]);
+    announceTo([req.user.id], 0, 'updated');
     res.json({ deleted: true });
   } catch (err) {
     next(err);

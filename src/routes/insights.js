@@ -10,7 +10,7 @@ const router = express.Router();
 async function requireLeadership(req, res, next) {
   try {
     const actor = await loadActor(req.user.id);
-    if (!actorCanMonitor(actor)) return res.status(403).json({ error: 'Only leadership and business heads can see this' });
+    if (!actor || !actor.can('insights')) return res.status(403).json({ error: 'You do not have access to this' });
     req.actor = actor;
     next();
   } catch (err) {

@@ -27,8 +27,8 @@ const router = express.Router();
 async function requirePortal(req, res, next) {
   try {
     const actor = await loadActor(req.user.id);
-    if (!isPortalAdmin(actor)) {
-      return res.status(403).json({ error: 'Only the Chairman and Chief of Staff can manage the organisation' });
+    if (!actor || !actor.can('manage_people')) {
+      return res.status(403).json({ error: 'You cannot manage people' });
     }
     req.actor = actor;
     next();
@@ -137,7 +137,7 @@ router.get('/structure', authenticate, async (req, res, next) => {
       return { ...b, heads: members.filter((m) => m.designation === 'head'), members };
     });
 
-    const portal = isPortalAdmin(actor);
+    const portal = actor.can('manage_people');
     const unplaced = portal
       ? persons
         .filter((p) => !p.org_level && p.memberships.length === 0 && globalLevel(p) !== 0)
@@ -148,7 +148,7 @@ router.get('/structure', authenticate, async (req, res, next) => {
       leaders,
       businesses: businessNodes,
       unplaced,
-      me: { id: actor.id, level: actorBestLevel(actor), portal, can_edit_businesses: actor.role === 'admin' || actor.role === 'super_admin' },
+      me: { id: actor.id, level: actorBestLevel(actor), portal, can_edit_businesses: actor.can('manage_businesses') },
       ...catalog(),
     });
   } catch (err) {
@@ -422,6 +422,42 @@ router.put('/businesses/:id/members/:userId', authenticate, async (req, res, nex
       });
     }
     res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/org/businesses/:id/members — { user_ids: [], designation? } put several people into a business at once.
+// Anyone can be in any number of businesses; people already in it keep their place.
+router.post('/businesses/:id/members', authenticate, async (req, res, next) => {
+  try {
+    const actor = await loadActor(req.user.id);
+    const businessId = parseInt(req.params.id, 10);
+    const designation = isValidDesignation(req.body.designation) ? req.body.designation : 'member';
+    if (!(await canPlaceInBusiness(actor, businessId, designation))) {
+      return res.status(403).json({ error: 'You can only place people below your own level' });
+    }
+    const biz = await db.query('SELECT name FROM businesses WHERE id = $1', [businessId]);
+    if (!biz.rows.length) return res.status(404).json({ error: 'Business not found' });
+    const ids = [...new Set((req.body.user_ids || []).map(Number).filter(Boolean))].slice(0, 200);
+    const added = [];
+    for (const userId of ids) {
+      const existing = await db.query('SELECT business_id, designation, title FROM user_businesses WHERE user_id = $1', [userId]);
+      if (existing.rows.some((m) => m.business_id === businessId)) continue;
+      const exists = await db.query("SELECT 1 FROM users WHERE id = $1 AND status != 'inactive'", [userId]);
+      if (!exists.rows.length) continue;
+      await setMemberships(db, userId, [...existing.rows, { business_id: businessId, designation, title: null }]);
+      added.push(userId);
+    }
+    if (added.length) {
+      await notify(added.filter((id) => id !== actor.id), {
+        type: 'assignment',
+        title: `You joined ${biz.rows[0].name}`,
+        body: `${actor.name} added you.`,
+        data: {},
+      });
+    }
+    res.json({ ok: true, added });
   } catch (err) {
     next(err);
   }

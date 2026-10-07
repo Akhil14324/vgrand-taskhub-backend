@@ -8,6 +8,7 @@ const { shift } = require('../utils/streak');
 const { streakFor, waitingOnUser, weekStart, weekStats } = require('../services/engagement');
 const { badgesFor, weekWall } = require('../services/wins');
 const { loadActor } = require('../utils/org');
+const { leaderboardFor, PERIODS } = require('../services/leaderboard');
 
 const router = express.Router();
 
@@ -34,6 +35,18 @@ router.get('/myday', authenticate, async (req, res, next) => {
       ),
     ]);
     res.json({ ...streak, waiting_on_you: waiting, kudos_this_week: received.rows[0].n });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/engage/leaderboard?period=week|month|quarter|all&business_id= — who finished what, with streaks
+router.get('/leaderboard', authenticate, async (req, res, next) => {
+  try {
+    const actor = await loadActor(req.user.id);
+    const period = Object.prototype.hasOwnProperty.call(PERIODS, req.query.period) ? req.query.period : 'week';
+    const businessId = parseInt(req.query.business_id, 10) || null;
+    res.json(await leaderboardFor(actor, { period, businessId }));
   } catch (err) {
     next(err);
   }

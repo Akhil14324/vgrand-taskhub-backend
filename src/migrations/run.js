@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const db = require('../db');
-const { seedOrganization } = require('../seed/organization');
+const { seedOrganization, seedOwner } = require('../seed/organization');
 
 async function ensureMigrationsTable(directQuery) {
   await directQuery(`

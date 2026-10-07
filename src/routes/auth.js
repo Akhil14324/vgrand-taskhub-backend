@@ -20,6 +20,7 @@ const {
 } = require('../utils/org');
 const { actorCanMonitor } = require('../services/monitor');
 
+const { PERMISSIONS } = require('../utils/permissions');
 const router = express.Router();
 
 /** The signed-in user's profile plus their place in the hierarchy. */
@@ -50,7 +51,9 @@ async function sessionUser(userId) {
   user.tier = user.org_level && LEADERSHIP[user.org_level] ? LEADERSHIP[user.org_level].label : null;
   user.display_title = displayTitle(user, user.memberships[0]?.designation, user.memberships[0]?.title);
   user.is_leader = isLeader(actor);
-  user.is_portal = isPortalAdmin(actor);
+  user.is_portal = actor.can('manage_people');
+  user.permissions = Object.fromEntries(PERMISSIONS.map((p) => [p.key, actor.can(p.key)]));
+  user.is_owner = actor.global === 0;
   // Leadership and business heads can watch the to-dos of the people below them (Team Monitor).
   user.can_monitor = actorCanMonitor(actor);
   user.manages_business_ids = user.memberships.filter((m) => m.level <= BUSINESS_MANAGER_LEVEL).map((m) => m.business_id);

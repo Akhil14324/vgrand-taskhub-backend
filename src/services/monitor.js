@@ -44,6 +44,9 @@ function bestLevel(u) {
 /** Can this actor use the monitor at all? */
 function actorCanMonitor(actor) {
   if (!actor) return false;
+  // A person's switch (Access screen) wins over the default for their level.
+  if (actor.perms && actor.perms.has('monitor')) return actor.perms.get('monitor');
+  if (actor.global === 0) return true;
   if (actor.global !== null && actor.global !== undefined && actor.global <= 3) return true;
   return [...actor.memberships.values()].some((d) => designationLevel(d) <= MONITOR_MAX_LEVEL);
 }
@@ -58,11 +61,16 @@ async function monitorablePeople(actorId) {
     [...actor.memberships.entries()].filter(([, d]) => designationLevel(d) <= MONITOR_MAX_LEVEL).map(([bid]) => Number(bid))
   );
 
+  const explicit = new Set(
+    (await db.query('SELECT target_id FROM monitor_access WHERE viewer_id = $1', [actor.id]).catch(() => ({ rows: [] })))
+      .rows.map((r) => r.target_id)
+  );
+
   const people = [];
   for (const u of directory) {
     if (u.id === actor.id) continue;
-    let allowed = false;
-    if (isLeaderTier && bestLevel(u) > actor.global) allowed = true;
+    let allowed = explicit.has(u.id);
+    if (!allowed && isLeaderTier && bestLevel(u) > actor.global) allowed = true;
     if (!allowed) {
       allowed = u.memberships.some((m) =>
         headOf.has(Number(m.business_id))

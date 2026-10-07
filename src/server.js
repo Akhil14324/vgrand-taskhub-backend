@@ -17,6 +17,7 @@ const todoTimelineRoutes = require('./routes/todoTimeline');
 const monitorRoutes = require('./routes/monitor');
 const orgRoutes = require('./routes/org');
 const approvalRoutes = require('./routes/approvals');
+const accessRoutes = require('./routes/access');
 const db = require('./db');
 const { runMigrations } = require('./migrations/run');
 const { scheduleOverdueNotifications } = require('./jobs/overdueNotifications');
@@ -149,6 +150,7 @@ app.use('/api/standup', standupRoutes);
 app.use('/api/claude', claudeRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/approvals', approvalRoutes);
+app.use('/api/access', accessRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });

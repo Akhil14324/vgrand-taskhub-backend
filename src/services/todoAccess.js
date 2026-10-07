@@ -29,12 +29,18 @@ function levelOf(row, prefix) {
   );
 }
 
-/** SQL parameters $1..$4 that every visibility-aware to-do query starts with. */
-async function viewerParams(userId, actor = null) {
+/**
+ * SQL parameters $1..$4 that every visibility-aware to-do query starts with. `seeAll` is for looking one
+ * to-do up (or the audit list): holders of view_all_todos then see any to-do, read-only. Lists that feed
+ * a person's own views never pass it.
+ */
+async function viewerParams(userId, actor = null, seeAll = false) {
   const a = actor || await loadActor(userId);
   if (!a) return [userId, false, [], []];
   const memberOf = [...a.memberships.keys()];
-  return [a.id, isLeader(a), memberOf, memberOf.filter((id) => managesBusiness(a, id))];
+  // A 0 in the business list is the "sees every to-do" switch (see VISIBLE in todoQueries.js).
+  const sees = seeAll && typeof a.can === 'function' && a.can('view_all_todos') ? [0] : [];
+  return [a.id, isLeader(a), [...sees, ...memberOf], memberOf.filter((id) => managesBusiness(a, id))];
 }
 
 /** Parameters that limit a query to what is literally on someone's own list (no business visibility). */

@@ -1,9 +1,21 @@
 const express = require('express');
+const { loadActor } = require('../utils/org');
 const db = require('../db');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
 
 const router = express.Router();
+
+/** Create / edit / delete businesses: the manage_businesses switch (Directors and above by default). */
+async function requireManageBusinesses(req, res, next) {
+  try {
+    const actor = await loadActor(req.user.id);
+    if (!actor || !actor.can('manage_businesses')) return res.status(403).json({ error: 'You cannot manage businesses' });
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
 
 async function createBusinessGroup(businessId, businessName, createdByUserId) {
   const client = await db.pool.connect();
@@ -130,7 +142,7 @@ router.get('/', authenticate, requireAdmin, async (req, res, next) => {
 });
 
 // POST /api/businesses (admin only)
-router.post('/', authenticate, requireAdmin, async (req, res, next) => {
+router.post('/', authenticate, requireManageBusinesses, async (req, res, next) => {
   try {
     const name = sanitizeText(req.body.name, 100);
     const type = sanitizeText(req.body.type, 50);
@@ -163,7 +175,7 @@ router.post('/', authenticate, requireAdmin, async (req, res, next) => {
 });
 
 // PUT /api/businesses/:id (admin only)
-router.put('/:id', authenticate, requireAdmin, async (req, res, next) => {
+router.put('/:id', authenticate, requireManageBusinesses, async (req, res, next) => {
   try {
     const { id } = req.params;
     const name = sanitizeText(req.body.name, 100);
@@ -197,7 +209,7 @@ router.put('/:id', authenticate, requireAdmin, async (req, res, next) => {
 });
 
 // DELETE /api/businesses/:id (admin only)
-router.delete('/:id', authenticate, requireAdmin, async (req, res, next) => {
+router.delete('/:id', authenticate, requireManageBusinesses, async (req, res, next) => {
   try {
     const { id } = req.params;
 

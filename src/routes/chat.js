@@ -229,7 +229,7 @@ router.get('/conversations', authenticate, async (req, res, next) => {
       participants: row.participants || [],
       last_message: row.last_msg_id ? {
         id: row.last_msg_id,
-        body: row.last_msg_body || (row.last_msg_meta ? previewFor({ meta: row.last_msg_meta }) : null),
+        body: (row.last_msg_meta ? previewFor({ meta: row.last_msg_meta }) : null) || row.last_msg_body,
         attachment_url: row.last_msg_attachment_url,
         attachment_type: row.last_msg_attachment_type,
         sender_id: row.last_msg_sender_id,

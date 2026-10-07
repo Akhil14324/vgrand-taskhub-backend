@@ -130,4 +130,39 @@ async function seedOrganization(q, { log = console.log } = {}) {
   for (const id of Object.values(businessIds)) await ensureBusinessGroup(q, id);
 }
 
-module.exports = { seedOrganization, BUSINESSES, PEOPLE, ACCOUNTANTS };
+const OWNER_MARKER = 'seed:owner-account-v1';
+const OWNER_USERNAME = 'owner';
+
+/**
+ * The owner login: a super admin with no place in the chain of command (level 0). It sees every to-do
+ * and every chat, and it can switch any module on or off for anyone. Created once; after that the
+ * password is the owner's to change, so a restart never resets it.
+ */
+async function seedOwner(q, { log = console.log } = {}) {
+  const done = await q.query('SELECT 1 FROM migrations WHERE filename = $1', [OWNER_MARKER]);
+  if (done.rows.length) return;
+  const password = process.env.OWNER_PASSWORD || 'Vgrand@2026';
+  const hash = await bcrypt.hash(password, 10);
+  const existing = await q.query('SELECT id FROM users WHERE LOWER(username) = $1', [OWNER_USERNAME]);
+  let userId;
+  if (existing.rows.length) {
+    userId = existing.rows[0].id;
+    await q.query(
+      `UPDATE users SET role = 'super_admin', org_level = NULL, status = 'active', password_hash = $2,
+              must_change_password = FALSE, updated_at = NOW() WHERE id = $1`,
+      [userId, hash]
+    );
+  } else {
+    const created = await q.query(
+      `INSERT INTO users (name, username, password_hash, role, status, org_level, must_change_password)
+       VALUES ('Owner', $1, $2, 'super_admin', 'active', NULL, FALSE) RETURNING id`,
+      [OWNER_USERNAME, hash]
+    );
+    userId = created.rows[0].id;
+  }
+  await syncLeaderGroups(q, userId, 'super_admin');
+  await q.query('INSERT INTO migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [OWNER_MARKER]);
+  log(`  ✓ Owner login ready: "${OWNER_USERNAME}"`);
+}
+
+module.exports = { seedOrganization, seedOwner, BUSINESSES, PEOPLE, ACCOUNTANTS };

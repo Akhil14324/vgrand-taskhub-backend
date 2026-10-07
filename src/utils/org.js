@@ -1,4 +1,5 @@
 const db = require('../db');
+const { hasPermission } = require('./permissions');
 
 /**
  * Chain of command.
@@ -16,13 +17,14 @@ const db = require('../db');
  */
 
 const LEADERSHIP = {
-  1: { key: 'chairman', label: 'Chairman' },
-  2: { key: 'chief_of_staff', label: 'Chief of Staff' },
-  3: { key: 'director', label: 'Director' },
+  // Role names are not shown to people: the three tiers are the leadership circle, told apart only by authority.
+  1: { key: 'chairman', label: 'Top authority' },
+  2: { key: 'chief_of_staff', label: 'Senior authority' },
+  3: { key: 'director', label: 'Authority' },
 };
 
 const DESIGNATIONS = {
-  head: { label: 'Business Head', level: 4 },
+  head: { label: 'Lead', level: 4 },
   manager: { label: 'Manager', level: 5 },
   accountant: { label: 'Accountant', level: 6 },
   supervisor: { label: 'Supervisor', level: 6 },
@@ -71,7 +73,7 @@ function levelWithDesignation(u, designation) {
 
 function displayTitle(u, designation, membershipTitle) {
   if (u?.title) return u.title;
-  if (u?.org_level && LEADERSHIP[u.org_level]) return LEADERSHIP[u.org_level].label;
+  if (u?.org_level && LEADERSHIP[u.org_level]) return 'Leadership circle';
   if (membershipTitle) return membershipTitle;
   if (designation && DESIGNATIONS[designation]) return DESIGNATIONS[designation].label;
   if (u?.role === 'super_admin') return 'Super Admin';
@@ -98,7 +100,17 @@ async function loadActor(userId) {
   if (!row) return null;
   const memberships = new Map();
   for (const m of row.memberships) memberships.set(Number(m.business_id), m.designation);
-  return { ...row, global: globalLevel(row), memberships };
+  // Per-person switches (see utils/permissions.js). Before the migration has run there is no table: no overrides.
+  const perms = new Map();
+  try {
+    const overrides = await db.query('SELECT permission, allowed FROM user_permissions WHERE user_id = $1', [userId]);
+    for (const p of overrides.rows) perms.set(p.permission, p.allowed);
+  } catch (err) {
+    if (err.code !== '42P01') throw err;
+  }
+  const actor = { ...row, global: globalLevel(row), memberships, perms };
+  actor.can = (key) => hasPermission(actor, key, actorBestLevel(actor));
+  return actor;
 }
 
 function actorLevelIn(actor, businessId) {

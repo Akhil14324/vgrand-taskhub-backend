@@ -14,6 +14,7 @@ const TODO_SELECT = `
   SELECT t.id, t.title, t.notes, t.due_date, to_char(t.due_time, 'HH24:MI') AS due_time,
          t.priority, t.recurrence, t.is_done, t.done_at, t.done_by, t.created_by, t.created_at, t.updated_at,
          t.parent_id, t.labels, t.deadline_date, t.duration_minutes, t.reminder_offsets,
+         t.remind_date, to_char(t.remind_time, 'HH24:MI') AS remind_time, t.remind_repeat,
          t.status, t.assignee_id, t.assigned_at, t.started_at, t.status_since, t.status_seconds,
          t.business_id, t.source_business_id, t.requires_approval, t.approved_by, t.approved_at,
          t.submitted_by, t.submitted_at, t.review_state, t.reviewed_by, t.reviewed_at, t.review_note, t.is_warned,
@@ -67,7 +68,7 @@ const TODO_SELECT = `
  * they belong to (leadership: every business). Proposals that were rejected stay visible only to the
  * people who manage that business, and to whoever raised them (they are on the to-do).
  */
-const VISIBLE = `(tm.user_id IS NOT NULL OR (t.business_id IS NOT NULL
+const VISIBLE = `(tm.user_id IS NOT NULL OR 0 = ANY($3::int[]) OR (t.business_id IS NOT NULL
     AND ($2::boolean OR t.business_id = ANY($3::int[]))
     AND (t.review_state <> 'rejected' OR $2::boolean OR t.business_id = ANY($4::int[]))))`;
 
@@ -75,9 +76,9 @@ const VISIBLE = `(tm.user_id IS NOT NULL OR (t.business_id IS NOT NULL
  * Decorated rows for a viewer. `where` may use $5 and up; `tail` is appended (ORDER BY / LIMIT).
  * Pass `listOnly: true` to see only what is on the viewer's own list.
  */
-async function listTodos(userId, { where = 'TRUE', params = [], tail = '', actor = null, listOnly = false } = {}) {
+async function listTodos(userId, { where = 'TRUE', params = [], tail = '', actor = null, listOnly = false, seeAll = false } = {}) {
   const a = actor || await loadActor(userId);
-  const viewer = listOnly ? listOnlyParams(userId) : await viewerParams(userId, a);
+  const viewer = listOnly ? listOnlyParams(userId) : await viewerParams(userId, a, seeAll);
   const result = await db.query(
     `${TODO_SELECT} WHERE ${VISIBLE} AND (${where}) ${tail}`,
     [...viewer, ...params]
@@ -89,7 +90,7 @@ async function listTodos(userId, { where = 'TRUE', params = [], tail = '', actor
 async function getTodoFor(todoId, userId, actor = null) {
   const id = parseInt(todoId, 10);
   if (!id) return null;
-  const rows = await listTodos(userId, { where: 't.id = $5', params: [id], actor });
+  const rows = await listTodos(userId, { where: 't.id = $5', params: [id], actor, seeAll: true });
   return rows[0] || null;
 }
 

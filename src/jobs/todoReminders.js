@@ -1,6 +1,6 @@
 const db = require('../db');
 const { notify } = require('../utils/notify');
-const { APP_TIMEZONE, todayInAppZone } = require('../utils/recurrence');
+const { APP_TIMEZONE, todayInAppZone, advance } = require('../utils/recurrence');
 
 // Hour (in APP_TIMEZONE) from which "today is your deadline" goes out.
 const DEADLINE_NOTICE_HOUR = 8;
@@ -35,6 +35,7 @@ async function sendTodoReminders() {
     }
 
     await sendEarlyReminders();
+    await sendCustomReminders();
     await sendDeadlineDayNotices();
   } catch (err) {
     console.error('[todo-reminders] failed:', err.message);
@@ -70,6 +71,51 @@ async function sendDeadlineDayNotices() {
       data: { todoId: todo.id },
     });
   }
+}
+
+/**
+ * The stand-alone reminder (remind_date + remind_time, optionally repeating every day / week / month).
+ * The UPDATE is the claim, so only one server instance fires it. A repeating reminder then moves to its
+ * next date (always after today, so a missed week does not fire a pile of old ones); a one-off is marked sent.
+ * Finished to-dos stay quiet, but a repeating one still moves on so it is ready if the to-do is reopened.
+ */
+async function sendCustomReminders() {
+  const due = await db.query(
+    `SELECT t.id, t.title, t.is_done, t.remind_date::text AS remind_date, t.remind_repeat,
+            to_char(t.remind_time, 'HH12:MI AM') AS at
+     FROM todos t
+     WHERE t.remind_date IS NOT NULL AND t.remind_time IS NOT NULL AND t.remind_sent_at IS NULL
+       AND ((t.remind_date + t.remind_time) AT TIME ZONE $1) <= NOW()`,
+    [APP_TIMEZONE]
+  );
+  for (const row of due.rows) {
+    const next = row.remind_repeat ? nextReminderDate(row.remind_date, row.remind_repeat) : null;
+    const claimed = await db.query(
+      `UPDATE todos SET remind_date = COALESCE($3::date, remind_date),
+              remind_sent_at = CASE WHEN $3::date IS NULL THEN NOW() ELSE NULL END
+       WHERE id = $1 AND remind_date = $2::date AND remind_sent_at IS NULL RETURNING id`,
+      [row.id, row.remind_date, next]
+    );
+    if (!claimed.rows.length || row.is_done) continue;
+    const members = await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1', [row.id]);
+    await notify(members.rows.map((m) => m.user_id), {
+      type: 'todo_reminder',
+      title: `Reminder · ${row.at.replace(/^0/, '')}`,
+      body: row.title,
+      data: { todoId: row.id, kind: 'reminder' },
+    });
+  }
+}
+
+/** The next time a repeating reminder should fire: its next date that is still ahead of today. */
+function nextReminderDate(ymd, repeat, today = todayInAppZone()) {
+  let next = advance(ymd, repeat);
+  let guard = 0;
+  while (next < today && guard < 1000) {
+    next = advance(next, repeat);
+    guard += 1;
+  }
+  return next;
 }
 
 function describeOffset(minutes) {
@@ -115,4 +161,4 @@ function scheduleTodoReminders() {
   setInterval(sendTodoReminders, INTERVAL_MS);
 }
 
-module.exports = { scheduleTodoReminders, sendTodoReminders, sendDeadlineDayNotices };
+module.exports = { scheduleTodoReminders, sendTodoReminders, sendDeadlineDayNotices, nextReminderDate };
