@@ -201,7 +201,12 @@ router.get('/', authenticate, async (req, res, next) => {
     const manageable = new Set([...actor.memberships.keys()].filter((id) => managesBusiness(actor, id)));
     const [lists, sections, filters, todos, businesses, favorites] = await Promise.all([
       db.query('SELECT * FROM todo_lists WHERE owner_id = $1 ORDER BY sort_order, id', [actor.id]),
-      db.query('SELECT s.* FROM todo_sections s WHERE s.owner_id = $1 ORDER BY s.sort_order, s.id', [actor.id]),
+      db.query(
+        `SELECT s.* FROM todo_sections s
+         WHERE (s.owner_id = $1 AND s.business_id IS NULL) OR s.business_id = ANY($3::int[]) OR ($2::boolean AND s.business_id IS NOT NULL)
+         ORDER BY s.sort_order, s.id`,
+        [actor.id, isLeader(actor), [...actor.memberships.keys()]]
+      ),
       db.query('SELECT * FROM todo_filters WHERE owner_id = $1 ORDER BY sort_order, id', [actor.id]),
       listTodos(actor.id, {
         actor,
@@ -480,6 +485,13 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
     ]
   );
   const todo = inserted.rows[0];
+  const wantedSection = businessId && !parent ? (parseInt(body.business_section_id, 10) || null) : null;
+  if (wantedSection) {
+    await db.query(
+      'UPDATE todos SET business_section_id = $1 WHERE id = $2 AND EXISTS (SELECT 1 FROM todo_sections WHERE id = $1 AND business_id = $3)',
+      [wantedSection, todo.id, businessId]
+    );
+  }
 
   if (parent) {
     await attachSubtaskMembers(todo.id, parent, actor.id);
@@ -697,6 +709,18 @@ router.put('/:id(\\d+)', authenticate, async (req, res, next) => {
     const requiresApproval = existing.business_id && !existing.parent_id && req.body.requires_approval !== undefined
       ? !!req.body.requires_approval
       : existing.requires_approval;
+    let businessSectionId = existing.business_section_id || null;
+    if (existing.business_id && req.body.business_section_id !== undefined) {
+      const wanted = parseInt(req.body.business_section_id, 10) || null;
+      if (wanted !== businessSectionId) {
+        if (!(existing.permissions.can_edit || existing.permissions.can_assign)) return res.status(403).json({ error: 'You cannot move this one' });
+        if (wanted) {
+          const ok = await db.query('SELECT 1 FROM todo_sections WHERE id = $1 AND business_id = $2', [wanted, existing.business_id]);
+          if (!ok.rows.length) return res.status(404).json({ error: 'Section not found' });
+        }
+        businessSectionId = wanted;
+      }
+    }
     const remind = parseReminder(req.body, existing);
     const remindChanged = remind.date !== (existing.remind_date || null) || remind.time !== (existing.remind_time || null)
       || remind.repeat !== (existing.remind_repeat || null);
@@ -754,11 +778,12 @@ router.put('/:id(\\d+)', authenticate, async (req, res, next) => {
          last_overdue_notification_at = CASE WHEN $11::boolean THEN NULL ELSE last_overdue_notification_at END,
          reminders_sent = CASE WHEN $11::boolean OR $12::boolean THEN '{}'::int[] ELSE reminders_sent END,
          remind_date = $15, remind_time = $16, remind_repeat = $17,
-         remind_sent_at = CASE WHEN $18::boolean THEN NULL ELSE remind_sent_at END
+         remind_sent_at = CASE WHEN $18::boolean THEN NULL ELSE remind_sent_at END,
+         business_section_id = $19
        WHERE id = $13`,
       [title, notes || '', dueDate, dueTime, priority, recurrence, labels, deadline, duration, offsets,
         scheduleChanged, offsetsChanged, existing.id, requiresApproval,
-        remind.date, remind.time, remind.repeat, remindChanged]
+        remind.date, remind.time, remind.repeat, remindChanged, businessSectionId]
     );
     if (newParent !== undefined) {
       await db.query('UPDATE todos SET parent_id = $1 WHERE id = $2', [newParent, existing.id]);
@@ -1539,11 +1564,13 @@ router.delete('/lists/:id', authenticate, async (req, res, next) => {
  * Make room for a new section: `position` is the zero-based place it should take among the owner's
  * sections of the same board (a list's, or the Inbox's). Returns the sort_order to give it.
  */
-async function sectionSlot(userId, listId, position) {
-  const rows = (await db.query(
-    'SELECT id FROM todo_sections WHERE owner_id = $1 AND list_id IS NOT DISTINCT FROM $2::int ORDER BY sort_order, id',
-    [userId, listId]
-  )).rows;
+async function sectionSlot(userId, listId, position, businessId = null) {
+  const rows = (businessId
+    ? await db.query('SELECT id FROM todo_sections WHERE business_id = $1 ORDER BY sort_order, id', [businessId])
+    : await db.query(
+      'SELECT id FROM todo_sections WHERE owner_id = $1 AND business_id IS NULL AND list_id IS NOT DISTINCT FROM $2::int ORDER BY sort_order, id',
+      [userId, listId]
+    )).rows;
   const at = Number.isInteger(position) ? Math.max(0, Math.min(position, rows.length)) : rows.length;
   // Renumber everything after the gap so the new section fits exactly there.
   if (at < rows.length) {
@@ -1580,18 +1607,82 @@ router.post('/lists/:id/sections', authenticate, (req, res, next) => createSecti
 // POST /api/todos/sections — a section of the Inbox (no list)
 router.post('/sections', authenticate, (req, res, next) => createSection(req, res, next, null));
 
-// PUT /api/todos/sections/order — { ids } the viewer's sections of one board (a list's, or the Inbox's) in
-// their new left-to-right order. Ids that are not mine are ignored.
+/**
+ * A section the caller may change: one of their own, or a section of a business they manage.
+ * Returns the row, or null.
+ */
+async function changeableSection(id, actor) {
+  const found = await db.query('SELECT * FROM todo_sections WHERE id = $1', [id]);
+  const section = found.rows[0];
+  if (!section) return null;
+  if (section.business_id) return isLeader(actor) || managesBusiness(actor, section.business_id) ? section : null;
+  return section.owner_id === actor.id ? section : null;
+}
+
+// POST /api/todos/businesses/:id/sections — { name, description?, position? } a section of a business (managers only)
+router.post('/businesses/:id(\\d+)/sections', authenticate, async (req, res, next) => {
+  try {
+    const actor = await actorOf(req, res);
+    if (!actor) return;
+    const businessId = parseInt(req.params.id, 10);
+    if (!(isLeader(actor) || managesBusiness(actor, businessId))) {
+      return res.status(403).json({ error: 'Only the people who manage this business can add sections' });
+    }
+    const name = sanitizeText(req.body.name, 120);
+    if (!name) return res.status(400).json({ error: 'Section name is required' });
+    const biz = await db.query('SELECT id FROM businesses WHERE id = $1', [businessId]);
+    if (!biz.rows.length) return res.status(404).json({ error: 'Business not found' });
+    const position = req.body.position === undefined || req.body.position === null ? null : parseInt(req.body.position, 10);
+    const slot = await sectionSlot(actor.id, null, Number.isNaN(position) ? null : position, businessId);
+    const result = await db.query(
+      'INSERT INTO todo_sections (list_id, owner_id, business_id, name, description, sort_order) VALUES (NULL, $1, $2, $3, $4, $5) RETURNING *',
+      [actor.id, businessId, name, sanitizeText(req.body.description, 1000) || '', slot]
+    );
+    emitToUsers(await businessAudience(businessId), 'todo:changed', { todoId: 0, action: 'section' });
+    res.status(201).json({ section: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Everyone who should hear that a business changed shape: its members and leadership. */
+async function businessAudience(businessId) {
+  const result = await db.query(
+    `SELECT user_id FROM user_businesses WHERE business_id = $1
+     UNION
+     SELECT id FROM users WHERE status != 'inactive' AND (org_level IS NOT NULL OR role IN ('admin', 'super_admin'))`,
+    [businessId]
+  );
+  return result.rows.map((r) => r.user_id);
+}
+
+// PUT /api/todos/sections/order — { ids } sections of one board (a list's, the Inbox's, or one business's) in their
+// new order. Ids the caller may not change are ignored.
 router.put('/sections/order', authenticate, async (req, res, next) => {
   try {
+    const actor = await actorOf(req, res);
+    if (!actor) return;
     const ids = (Array.isArray(req.body.ids) ? req.body.ids : []).map((v) => parseInt(v, 10)).filter(Boolean);
     if (!ids.length) return res.status(400).json({ error: 'ids are required' });
-    await db.query(
-      `UPDATE todo_sections s SET sort_order = o.ord::int
-       FROM unnest($1::int[]) WITH ORDINALITY AS o(id, ord)
-       WHERE s.id = o.id AND s.owner_id = $2`,
-      [ids, req.user.id]
-    );
+    const allowed = [];
+    let businessId = null;
+    for (const id of ids) {
+      // eslint-disable-next-line no-await-in-loop
+      const section = await changeableSection(id, actor);
+      if (section) {
+        allowed.push(id);
+        businessId = section.business_id || businessId;
+      }
+    }
+    if (allowed.length) {
+      await db.query(
+        `UPDATE todo_sections s SET sort_order = o.ord::int
+         FROM unnest($1::int[]) WITH ORDINALITY AS o(id, ord)
+         WHERE s.id = o.id`,
+        [allowed]
+      );
+      if (businessId) emitToUsers(await businessAudience(businessId), 'todo:changed', { todoId: 0, action: 'section' });
+    }
     res.json({ ok: true });
   } catch (err) {
     next(err);
@@ -1601,9 +1692,10 @@ router.put('/sections/order', authenticate, async (req, res, next) => {
 // PUT /api/todos/sections/:id — any of { name, description, archived }
 router.put('/sections/:id(\\d+)', authenticate, async (req, res, next) => {
   try {
-    const current = await db.query('SELECT * FROM todo_sections WHERE id = $1 AND owner_id = $2', [req.params.id, req.user.id]);
-    if (!current.rows.length) return res.status(404).json({ error: 'Section not found' });
-    const row = current.rows[0];
+    const actor = await actorOf(req, res);
+    if (!actor) return;
+    const row = await changeableSection(req.params.id, actor);
+    if (!row) return res.status(404).json({ error: 'Section not found' });
     const name = req.body.name !== undefined ? sanitizeText(req.body.name, 120) : row.name;
     if (!name) return res.status(400).json({ error: 'Section name is required' });
     const description = req.body.description !== undefined ? (sanitizeText(req.body.description, 1000) || '') : row.description;
@@ -1612,56 +1704,66 @@ router.put('/sections/:id(\\d+)', authenticate, async (req, res, next) => {
       'UPDATE todo_sections SET name = $1, description = $2, archived = $3 WHERE id = $4 RETURNING *',
       [name, description, archived, row.id]
     );
+    if (row.business_id) emitToUsers(await businessAudience(row.business_id), 'todo:changed', { todoId: 0, action: 'section' });
     res.json({ section: result.rows[0] });
   } catch (err) {
     next(err);
   }
 });
 
-// POST /api/todos/sections/:id/duplicate — the section (right after it) with copies of its open to-dos
+// POST /api/todos/sections/:id/duplicate — the section (right after it). A personal section is copied with its
+// open to-dos; a business section is copied empty (business tasks are not duplicated).
 router.post('/sections/:id(\\d+)/duplicate', authenticate, async (req, res, next) => {
   try {
     const actor = await actorOf(req, res);
     if (!actor) return;
-    const found = await db.query('SELECT * FROM todo_sections WHERE id = $1 AND owner_id = $2', [req.params.id, actor.id]);
-    if (!found.rows.length) return res.status(404).json({ error: 'Section not found' });
-    const src = found.rows[0];
-    const siblings = (await db.query(
-      'SELECT id FROM todo_sections WHERE owner_id = $1 AND list_id IS NOT DISTINCT FROM $2::int ORDER BY sort_order, id',
-      [actor.id, src.list_id]
-    )).rows;
+    const src = await changeableSection(req.params.id, actor);
+    if (!src) return res.status(404).json({ error: 'Section not found' });
+    const siblings = (await (src.business_id
+      ? db.query('SELECT id FROM todo_sections WHERE business_id = $1 ORDER BY sort_order, id', [src.business_id])
+      : db.query(
+        'SELECT id FROM todo_sections WHERE owner_id = $1 AND business_id IS NULL AND list_id IS NOT DISTINCT FROM $2::int ORDER BY sort_order, id',
+        [actor.id, src.list_id]
+      ))).rows;
     const at = siblings.findIndex((r) => r.id === src.id) + 1;
-    const slot = await sectionSlot(actor.id, src.list_id, at);
+    const slot = await sectionSlot(actor.id, src.list_id, at, src.business_id);
     const created = await db.query(
-      'INSERT INTO todo_sections (list_id, owner_id, name, description, sort_order) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [src.list_id, actor.id, `${src.name} copy`.slice(0, 120), src.description || '', slot]
+      'INSERT INTO todo_sections (list_id, owner_id, business_id, name, description, sort_order) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [src.list_id, actor.id, src.business_id, `${src.name} copy`.slice(0, 120), src.description || '', slot]
     );
-    const todos = await listTodos(actor.id, {
-      actor,
-      listOnly: true,
-      where: 't.parent_id IS NULL AND t.is_done = FALSE AND t.business_id IS NULL AND tm.section_id = $5',
-      params: [src.id],
-      tail: 'ORDER BY tm.sort_order NULLS LAST, t.id',
-    });
-    for (const todo of todos) {
-      // eslint-disable-next-line no-await-in-loop
-      await duplicateTree(actor, todo, { listId: src.list_id, sectionId: created.rows[0].id }, null);
+    let copied = 0;
+    if (!src.business_id) {
+      const todos = await listTodos(actor.id, {
+        actor,
+        listOnly: true,
+        where: 't.parent_id IS NULL AND t.is_done = FALSE AND t.business_id IS NULL AND tm.section_id = $5',
+        params: [src.id],
+        tail: 'ORDER BY tm.sort_order NULLS LAST, t.id',
+      });
+      for (const todo of todos) {
+        // eslint-disable-next-line no-await-in-loop
+        await duplicateTree(actor, todo, { listId: src.list_id, sectionId: created.rows[0].id }, null);
+      }
+      copied = todos.length;
+      announceTo([actor.id], 0, 'created');
+    } else {
+      emitToUsers(await businessAudience(src.business_id), 'todo:changed', { todoId: 0, action: 'section' });
     }
-    announceTo([actor.id], 0, 'created');
-    res.status(201).json({ section: created.rows[0], copied: todos.length });
+    res.status(201).json({ section: created.rows[0], copied });
   } catch (err) {
     next(err);
   }
 });
 
-// DELETE /api/todos/sections/:id — its to-dos stay in the list, without a section
+// DELETE /api/todos/sections/:id — its to-dos stay where they are, without a section
 router.delete('/sections/:id(\\d+)', authenticate, async (req, res, next) => {
   try {
-    const result = await db.query(
-      'DELETE FROM todo_sections WHERE id = $1 AND owner_id = $2 RETURNING id',
-      [req.params.id, req.user.id]
-    );
-    if (!result.rows.length) return res.status(404).json({ error: 'Section not found' });
+    const actor = await actorOf(req, res);
+    if (!actor) return;
+    const row = await changeableSection(req.params.id, actor);
+    if (!row) return res.status(404).json({ error: 'Section not found' });
+    await db.query('DELETE FROM todo_sections WHERE id = $1', [row.id]);
+    if (row.business_id) emitToUsers(await businessAudience(row.business_id), 'todo:changed', { todoId: 0, action: 'section' });
     res.json({ deleted: true });
   } catch (err) {
     next(err);

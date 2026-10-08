@@ -14,7 +14,7 @@ const TODO_SELECT = `
   SELECT t.id, t.title, t.notes, t.due_date, to_char(t.due_time, 'HH24:MI') AS due_time,
          t.priority, t.recurrence, t.is_done, t.done_at, t.done_by, t.created_by, t.created_at, t.updated_at,
          t.parent_id, t.labels, t.deadline_date, t.duration_minutes, t.reminder_offsets,
-         t.remind_date, to_char(t.remind_time, 'HH24:MI') AS remind_time, t.remind_repeat,
+         t.remind_date, to_char(t.remind_time, 'HH24:MI') AS remind_time, t.remind_repeat, t.business_section_id,
          t.status, t.assignee_id, t.assigned_at, t.started_at, t.status_since, t.status_seconds,
          t.business_id, t.source_business_id, t.requires_approval, t.approved_by, t.approved_at,
          t.submitted_by, t.submitted_at, t.review_state, t.reviewed_by, t.reviewed_at, t.review_note, t.is_warned,
