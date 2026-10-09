@@ -286,15 +286,19 @@ router.post('/conversations', authenticate, async (req, res, next) => {
       }
       const otherId = participantIds[0];
 
-      // Find the direct conversation the other user already participates in and that only
-      // contains messages between the two of you. Prefer the one with the most messages
-      // (the original conversation) in case duplicates were previously created.
+      // Find the direct conversation that belongs to exactly these two people: the other user is
+      // in it and nobody else is (a chat between the other user and a third person must never match).
+      // Prefer the one with the most messages (the original) in case duplicates were created.
       const existing = await db.query(
         `SELECT c.id,
            (SELECT COUNT(*) FROM conversation_participants WHERE conversation_id = c.id AND user_id = $1) AS has_current_user
          FROM conversations c
          JOIN conversation_participants cp_other ON cp_other.conversation_id = c.id AND cp_other.user_id = $2
          WHERE c.type = 'direct'
+           AND NOT EXISTS (
+             SELECT 1 FROM conversation_participants cp_x
+             WHERE cp_x.conversation_id = c.id AND cp_x.user_id NOT IN ($1, $2)
+           )
            AND NOT EXISTS (
              SELECT 1 FROM messages m
              WHERE m.conversation_id = c.id AND m.sender_id NOT IN ($1, $2)
