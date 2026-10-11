@@ -1148,6 +1148,39 @@ router.post('/:id(\\d+)/warn', authenticate, async (req, res, next) => {
   }
 });
 
+// POST /api/todos/:id/nudge — the bell: ping the person doing a business task. The app of an online
+// assignee flashes a full-screen alert; an offline one gets a loud push.
+const NUDGE_GAP_MS = 2 * 60 * 1000;
+const lastNudge = new Map();
+router.post('/:id(\\d+)/nudge', authenticate, async (req, res, next) => {
+  try {
+    const actor = await actorOf(req, res);
+    if (!actor) return;
+    const existing = await visibleTodo(req, res, actor);
+    if (!existing) return;
+    if (!existing.permissions.can_nudge) return res.status(400).json({ error: 'There is no one to remind on this task' });
+    const key = `${existing.id}:${actor.id}`;
+    const wait = NUDGE_GAP_MS - (Date.now() - (lastNudge.get(key) || 0));
+    if (wait > 0) return res.status(429).json({ error: `You just reminded them. Try again in ${Math.ceil(wait / 60000)} min.` });
+    lastNudge.set(key, Date.now());
+
+    const overdue = !!existing.due_date && existing.due_date < todayInAppZone();
+    const title = overdue ? 'Overdue task' : `${actor.name} is waiting on you`;
+    const body = overdue
+      ? `${existing.title} is overdue. ${actor.name} is reminding you.`
+      : `${actor.name} reminded you about: ${existing.title}`;
+    await notify([existing.assignee_id], {
+      type: 'todo_nudge',
+      title,
+      body,
+      data: { todoId: existing.id, alert: '1', overdue: overdue ? '1' : '0', from: actor.name },
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /api/todos/:id/request-delete — { reason } asks someone senior to delete a business to-do
 router.post('/:id(\\d+)/request-delete', authenticate, async (req, res, next) => {
   try {

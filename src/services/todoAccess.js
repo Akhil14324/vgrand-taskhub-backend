@@ -62,6 +62,7 @@ function personalPermissions(row) {
     can_approve: false,
     can_review: false,
     can_warn: false,
+    can_nudge: false,
     can_comment: true,
     can_add_subtask: isMember,
   };
@@ -108,6 +109,8 @@ function businessPermissions(row, actor) {
     can_approve: canApprove,
     can_review: row.review_state !== 'accepted' && !isCreator && manages && outranksCreator,
     can_warn: canWarn,
+    // The bell: anyone who can see an open business task may ping the person doing it.
+    can_nudge: row.review_state === 'accepted' && !row.is_done && row.status !== 'on_hold' && !!row.assignee_id && !isAssignee,
     can_comment: true,
     can_add_subtask: canWork,
   };

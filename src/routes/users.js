@@ -312,6 +312,7 @@ const PREFERENCE_RULES = {
   haptics: (v) => typeof v === 'boolean',
   celebrations: (v) => typeof v === 'boolean',
   reminderSound: (v) => typeof v === 'boolean',
+  waterReminder: (v) => typeof v === 'boolean',
 };
 
 // PUT /api/users/me/preferences — merge a few personal settings; they change the app for this account only
