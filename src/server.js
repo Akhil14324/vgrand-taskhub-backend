@@ -23,6 +23,7 @@ const { runMigrations } = require('./migrations/run');
 const { scheduleOverdueNotifications } = require('./jobs/overdueNotifications');
 const { scheduleTodoReminders } = require('./jobs/todoReminders');
 const { scheduleNudges } = require('./jobs/nudges');
+const { scheduleRoast } = require('./jobs/roast');
 const engageRoutes = require('./routes/engage');
 const templateRoutes = require('./routes/templates');
 const insightRoutes = require('./routes/insights');
@@ -192,6 +193,7 @@ if (require.main === module) {
       scheduleOverdueNotifications();
       scheduleTodoReminders();
       scheduleNudges();
+      scheduleRoast();
     } catch (err) {
       console.error('Failed to start server:', err);
       process.exit(1);

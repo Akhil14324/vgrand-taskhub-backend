@@ -7,6 +7,7 @@ const { USERNAME_PATTERN, USERNAME_RULE, cleanUsername } = require('../utils/men
 const { loadActor, actorBestLevel } = require('../utils/org');
 const { setMemberships, syncLeaderGroups } = require('../services/org');
 const { notify } = require('../utils/notify');
+const { cleanFeatures } = require('../utils/features');
 
 const router = express.Router();
 
@@ -313,6 +314,7 @@ const PREFERENCE_RULES = {
   celebrations: (v) => typeof v === 'boolean',
   reminderSound: (v) => typeof v === 'boolean',
   waterReminder: (v) => typeof v === 'boolean',
+  features: (v) => cleanFeatures(v) !== null,
 };
 
 // PUT /api/users/me/preferences — merge a few personal settings; they change the app for this account only
@@ -322,6 +324,7 @@ router.put('/me/preferences', authenticate, async (req, res, next) => {
     for (const [key, ok] of Object.entries(PREFERENCE_RULES)) {
       if (req.body[key] !== undefined && ok(req.body[key])) patch[key] = req.body[key];
     }
+    if (patch.features) patch.features = cleanFeatures(patch.features);
     const result = await db.query(
       `UPDATE users SET preferences = preferences || $1::jsonb WHERE id = $2 RETURNING preferences`,
       [JSON.stringify(patch), req.user.id]
