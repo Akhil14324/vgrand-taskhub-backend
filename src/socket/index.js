@@ -82,6 +82,7 @@ function setupSocketIO(io) {
         return next(new Error('Invalid or expired token'));
       }
       socket.userId = user.id;
+      socket.data.userId = user.id;
       socket.userName = user.name;
       socket.userRole = user.role;
       next();
@@ -171,6 +172,7 @@ function setupSocketIO(io) {
       try {
         const { conversationId } = data || {};
         if (!conversationId) return;
+        if (!(await isParticipant(conversationId, socket.userId))) return;
         socket.to(`conv:${conversationId}`).emit('typing:update', {
           conversationId,
           userId: socket.userId,

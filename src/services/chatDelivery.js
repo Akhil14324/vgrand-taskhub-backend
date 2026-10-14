@@ -15,13 +15,15 @@ function previewFor({ body, attachmentType, meta }) {
   return 'Attachment';
 }
 
-async function loadReplyTo(replyToId) {
+// A reply can only quote a message from the same conversation; otherwise anyone could read
+// another chat's text by replying to its message id.
+async function loadReplyTo(replyToId, conversationId) {
   if (!replyToId) return null;
   const result = await db.query(
     `SELECT m.id, m.body, m.attachment_url, m.attachment_type, u.name AS sender_name
      FROM messages m JOIN users u ON u.id = m.sender_id
-     WHERE m.id = $1`,
-    [replyToId]
+     WHERE m.id = $1 AND m.conversation_id = $2`,
+    [replyToId, conversationId]
   );
   const r = result.rows[0];
   if (!r) return null;
@@ -32,6 +34,20 @@ async function loadReplyTo(replyToId) {
     attachmentType: r.attachment_type,
     senderName: r.sender_name,
   };
+}
+
+/**
+ * Sockets stay in a conversation room after their owner is removed from it (left a group, moved
+ * out of a business). Drop them before anything is sent so a removed person hears nothing more.
+ */
+async function pruneRoom(io, convId) {
+  if (!io) return;
+  const room = `conv:${convId}`;
+  const sockets = await io.in(room).fetchSockets();
+  if (!sockets.length) return;
+  const { rows } = await db.query('SELECT user_id FROM conversation_participants WHERE conversation_id = $1', [convId]);
+  const allowed = new Set(rows.map((r) => r.user_id));
+  for (const s of sockets) if (!allowed.has(s.data?.userId)) s.leave(room);
 }
 
 /**
@@ -50,13 +66,14 @@ async function deliverMessage(io, {
   meta = null,
 }) {
   const convId = Number(conversationId);
+  const replyTo = await loadReplyTo(replyToId, convId);
+  const safeReplyId = replyTo ? replyTo.id : null;
   const inserted = await db.query(
     `INSERT INTO messages (conversation_id, sender_id, body, attachment_url, attachment_type, reply_to_id, meta)
      VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, created_at`,
-    [convId, sender.id, body, attachmentUrl, attachmentType, replyToId || null, meta]
+    [convId, sender.id, body, attachmentUrl, attachmentType, safeReplyId, meta]
   );
   const row = inserted.rows[0];
-  const replyTo = await loadReplyTo(replyToId);
 
   const message = {
     id: row.id,
@@ -66,7 +83,7 @@ async function deliverMessage(io, {
     body,
     attachmentUrl,
     attachmentType,
-    replyToId: replyToId || null,
+    replyToId: safeReplyId,
     replyTo,
     meta,
     createdAt: row.created_at,
@@ -75,6 +92,7 @@ async function deliverMessage(io, {
   await db.query('UPDATE conversations SET updated_at = NOW() WHERE id = $1', [convId]);
   await db.query('UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1', [convId]);
 
+  await pruneRoom(io, convId).catch((err) => console.error('[chat] prune failed:', err.message));
   if (io) io.to(`conv:${convId}`).emit('message:new', message);
 
   // Fan-out runs after the sender gets their ack; failures here must not fail the send.
@@ -135,4 +153,4 @@ async function fanOut(io, message) {
   }
 }
 
-module.exports = { deliverMessage, previewFor };
+module.exports = { deliverMessage, previewFor, pruneRoom };

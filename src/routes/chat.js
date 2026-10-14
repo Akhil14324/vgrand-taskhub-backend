@@ -9,7 +9,7 @@ const { authenticate, requireAdmin } = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
 const { DELETE_FOR_EVERYONE_WINDOW_MS, EDIT_WINDOW_MS } = require('../constants/chat');
 const cloudinary = require('../utils/cloudinary');
-const { deliverMessage, previewFor } = require('../services/chatDelivery');
+const { deliverMessage, previewFor, pruneRoom } = require('../services/chatDelivery');
 
 const router = express.Router();
 
@@ -193,7 +193,7 @@ router.get('/conversations', authenticate, async (req, res, next) => {
            UNION
            SELECT DISTINCT m.conversation_id, m.sender_id, FALSE AS is_admin
            FROM messages m
-           WHERE m.conversation_id IN (SELECT id FROM user_convs)
+           WHERE m.conversation_id IN (SELECT id FROM user_convs WHERE type = 'group')
          ) cu
          JOIN users u ON u.id = cu.user_id
          GROUP BY cu.conversation_id
@@ -284,51 +284,45 @@ router.post('/conversations', authenticate, async (req, res, next) => {
       if (allIds.length !== 2) {
         return res.status(400).json({ error: 'Direct chat must have exactly 2 participants' });
       }
-      const otherId = participantIds[0];
-
-      // Find the direct conversation that belongs to exactly these two people: the other user is
-      // in it and nobody else is (a chat between the other user and a third person must never match).
-      // Prefer the one with the most messages (the original) in case duplicates were created.
-      const existing = await db.query(
-        `SELECT c.id,
-           (SELECT COUNT(*) FROM conversation_participants WHERE conversation_id = c.id AND user_id = $1) AS has_current_user
-         FROM conversations c
-         JOIN conversation_participants cp_other ON cp_other.conversation_id = c.id AND cp_other.user_id = $2
-         WHERE c.type = 'direct'
-           AND NOT EXISTS (
-             SELECT 1 FROM conversation_participants cp_x
-             WHERE cp_x.conversation_id = c.id AND cp_x.user_id NOT IN ($1, $2)
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM messages m
-             WHERE m.conversation_id = c.id AND m.sender_id NOT IN ($1, $2)
-           )
-         ORDER BY (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) DESC
-         LIMIT 1`,
-        [req.user.id, otherId]
-      );
-
-      if (existing.rows.length > 0) {
-        const existingId = existing.rows[0].id;
-        const hasCurrentUser = parseInt(existing.rows[0].has_current_user, 10) > 0;
-
-        if (!hasCurrentUser) {
-          // Current user row was deleted/removed; re-add it
-          await db.query(
-            `INSERT INTO conversation_participants (conversation_id, user_id, is_admin)
-             VALUES ($1, $2, FALSE)
-             ON CONFLICT (conversation_id, user_id) DO UPDATE SET is_hidden = FALSE`,
-            [existingId, req.user.id]
-          );
-        }
-
-        await db.query(
-          'UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1 AND user_id = $2',
-          [existingId, req.user.id]
-        );
-        const preview = await buildConversationPreview(existingId, req.user.id, req.user.role);
-        return res.json({ conversation: preview });
+      const otherId = Number(participantIds[0]);
+      if (otherId === req.user.id) {
+        return res.status(400).json({ error: 'You cannot start a chat with yourself' });
       }
+      // One direct chat per pair, enforced by the unique direct_key (migration 044), so two taps
+      // at once cannot create two chats and a third person can never be put into one.
+      const directKey = `${Math.min(req.user.id, otherId)}:${Math.max(req.user.id, otherId)}`;
+      const created = await db.query(
+        `INSERT INTO conversations (type, name, business_id, created_by, direct_key)
+         VALUES ('direct', NULL, NULL, $1, $2)
+         ON CONFLICT (direct_key) WHERE direct_key IS NOT NULL DO NOTHING
+         RETURNING id`,
+        [req.user.id, directKey]
+      );
+      if (created.rows.length) {
+        const newId = created.rows[0].id;
+        await db.query(
+          `INSERT INTO conversation_participants (conversation_id, user_id, is_admin)
+           VALUES ($1, $2, FALSE), ($1, $3, FALSE) ON CONFLICT DO NOTHING`,
+          [newId, req.user.id, otherId]
+        );
+        const preview = await buildConversationPreview(newId, req.user.id, req.user.role);
+        return res.status(201).json({ conversation: preview });
+      }
+      const existing = await db.query('SELECT id FROM conversations WHERE direct_key = $1', [directKey]);
+      const existingId = existing.rows[0].id;
+      // Bring back a person who removed themselves (the trigger keeps it at two people).
+      await db.query(
+        `INSERT INTO conversation_participants (conversation_id, user_id, is_admin)
+         SELECT $1, $2, FALSE
+         WHERE NOT EXISTS (SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2)`,
+        [existingId, req.user.id]
+      );
+      await db.query(
+        'UPDATE conversation_participants SET is_hidden = FALSE WHERE conversation_id = $1 AND user_id = $2',
+        [existingId, req.user.id]
+      );
+      const preview = await buildConversationPreview(existingId, req.user.id, req.user.role);
+      return res.json({ conversation: preview });
     }
 
     const convResult = await db.query(
@@ -417,8 +411,8 @@ router.get('/conversations/:id/messages', authenticate, async (req, res, next) =
         const replyResult = await db.query(
           `SELECT m.id, m.body, m.attachment_url, m.attachment_type, u.name as sender_name
            FROM messages m JOIN users u ON u.id = m.sender_id
-           WHERE m.id = ANY($1::int[])`,
-          [replyIds]
+           WHERE m.id = ANY($1::int[]) AND m.conversation_id = $2`,
+          [replyIds, id]
         );
         const replyMap = {};
         replyResult.rows.forEach((r) => {
@@ -912,6 +906,7 @@ router.delete('/conversations/:id/leave', authenticate, async (req, res, next) =
       'DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
       [id, req.user.id]
     );
+    await pruneRoom(req.app.get('io'), Number(id)).catch(() => {});
     res.json({ ok: true });
   } catch (err) {
     next(err);
