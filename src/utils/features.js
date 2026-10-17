@@ -3,7 +3,7 @@
 const FEATURE_KEYS = [
   'water', 'stretch', 'focus', 'buddy', 'roulette', 'roast',
   'deadlines', 'labels', 'estimates', 'reminders',
-  'board', 'calendar', 'timeline', 'leaderboard', 'automation',
+  'board', 'calendar', 'timeline', 'leaderboard', 'automation', 'alarm',
 ];
 
 /** Returns the clean { key: boolean } object, or null if the value is not an object at all. */

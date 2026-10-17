@@ -1187,13 +1187,18 @@ router.post('/:id(\\d+)/nudge', authenticate, async (req, res, next) => {
     const body = overdue
       ? `${existing.title} is overdue. ${actor.name} is reminding you.`
       : `${actor.name} reminded you about: ${existing.title}`;
-    await notify([existing.assignee_id], {
+    // A business task reminds whoever is accountable; a shared personal to-do reminds everyone else on it.
+    const targets = existing.business_id
+      ? [existing.assignee_id]
+      : (existing.members || []).map((m) => m.id).filter((id) => id !== actor.id);
+    await notify(targets, {
       type: 'todo_nudge',
       title,
       body,
       data: { todoId: existing.id, alert: '1', overdue: overdue ? '1' : '0', from: actor.name },
     });
-    res.json({ ok: true });
+    const names = existing.business_id ? [existing.assignee_name] : (existing.members || []).filter((m) => m.id !== actor.id).map((m) => m.name);
+    res.json({ ok: true, names });
   } catch (err) {
     next(err);
   }

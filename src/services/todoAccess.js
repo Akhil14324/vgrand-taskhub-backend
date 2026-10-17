@@ -62,7 +62,8 @@ function personalPermissions(row) {
     can_approve: false,
     can_review: false,
     can_warn: false,
-    can_nudge: false,
+    // The bell on a shared to-do: remind the other people on it.
+    can_nudge: isMember && !row.is_done && (row.members || []).some((m) => m.id !== row._actor_id),
     can_comment: true,
     can_add_subtask: isMember,
   };
