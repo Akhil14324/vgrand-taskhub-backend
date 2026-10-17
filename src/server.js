@@ -31,6 +31,10 @@ const goalRoutes = require('./routes/goals');
 const collabRoutes = require('./routes/collab');
 const standupRoutes = require('./routes/standup');
 const claudeRoutes = require('./routes/claude');
+const automationRoutes = require('./routes/automation');
+const automationEngine = require('./services/automation/engine');
+const { isInternal, chainFromRequest } = require('./services/automation/internalApi');
+const { als } = require('./utils/automation/bus');
 const { setIO } = require('./utils/notify');
 const { setupSocketIO } = require('./socket');
 const { requestId } = require('./middleware/requestId');
@@ -82,6 +86,7 @@ const globalLimiter = rateLimit({
   max: 600,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => isInternal(req),
   message: { error: 'Too many requests, please try again later.' },
 });
 
@@ -90,7 +95,7 @@ const authLimiter = rateLimit({
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.method === 'GET' && req.path === '/me',
+  skip: (req) => (req.method === 'GET' && req.path === '/me') || isInternal(req),
   message: { error: 'Too many authentication attempts, please try again later.' },
 });
 
@@ -99,9 +104,16 @@ const chatLimiter = rateLimit({
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => isInternal(req),
   message: { error: 'Too many chat requests, please try again later.' },
 });
 
+// Calls an automation makes to this same server keep the chain of automations that led to them, so what
+// they cause cannot set the same automation off again.
+app.use('/api', (req, res, next) => {
+  const chain = isInternal(req) ? chainFromRequest(req) : null;
+  if (chain) als.run(chain, next); else next();
+});
 app.use('/api', globalLimiter);
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'uploads');
@@ -149,6 +161,7 @@ app.use('/api/goals', goalRoutes);
 app.use('/api/collab', collabRoutes);
 app.use('/api/standup', standupRoutes);
 app.use('/api/claude', claudeRoutes);
+app.use('/api/automation', automationRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/approvals', approvalRoutes);
 app.use('/api/access', accessRoutes);
@@ -194,6 +207,7 @@ if (require.main === module) {
       scheduleTodoReminders();
       scheduleNudges();
       scheduleRoast();
+      automationEngine.start();
     } catch (err) {
       console.error('Failed to start server:', err);
       process.exit(1);

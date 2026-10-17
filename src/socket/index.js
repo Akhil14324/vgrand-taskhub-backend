@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { sanitizeText } = require('../middleware/sanitize');
 const { deliverMessage } = require('../services/chatDelivery');
+const { publish } = require('../utils/automation/bus');
 
 const presenceMap = new Map();
 
@@ -93,6 +94,8 @@ function setupSocketIO(io) {
 
   io.on('connection', (socket) => {
     addPresence(socket.userId, socket.id);
+    // The first open connection of a person is "the app was opened" (a second tab is not).
+    if (presenceMap.get(socket.userId) && presenceMap.get(socket.userId).size === 1) publish('app_opened', { userId: socket.userId });
     // Personal room: conversation list updates, notifications, to-do and task changes.
     socket.join(getUserSocketKey(socket.userId));
 
@@ -389,6 +392,7 @@ function setupSocketIO(io) {
       if (!stillOnline) {
         db.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [socket.userId]).catch(() => {});
         io.emit('presence:update', { userId: socket.userId, online: false });
+        publish('app_closed', { userId: socket.userId });
       }
     });
   });

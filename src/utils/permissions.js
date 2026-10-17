@@ -12,6 +12,7 @@ const PERMISSIONS = [
   { key: 'manage_businesses', label: 'Manage businesses', description: 'Create, edit and delete businesses', defaultMaxLevel: 3 },
   { key: 'view_all_todos', label: 'See every to-do', description: 'See every personal to-do and business task, whoever owns it', defaultMaxLevel: 0 },
   { key: 'chat_audit', label: 'Read every chat', description: 'Open any conversation, including other people\'s direct chats', defaultMaxLevel: 0 },
+  { key: 'automation_web', label: 'Automations that call websites', description: 'Let their automations send requests to outside web addresses', defaultMaxLevel: 3 },
   { key: 'manage_access', label: 'Manage access', description: 'Switch these permissions on and off for people below them', defaultMaxLevel: 3 },
 ];
 

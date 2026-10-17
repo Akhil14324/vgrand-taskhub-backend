@@ -1,5 +1,6 @@
 const db = require('../db');
 const { sendPushToUsers } = require('./push');
+const { publish } = require('./automation/bus');
 
 let ioRef = null;
 
@@ -21,6 +22,9 @@ function uniqueIds(ids, exclude = []) {
 function emitToUsers(userIds, event, payload) {
   if (!ioRef) return;
   for (const id of uniqueIds(userIds)) ioRef.to(`user:${id}`).emit(event, payload);
+  if (event === 'todo:changed' && payload && payload.action === 'commented') {
+    publish('todo_event', { todoId: payload.todoId, kind: 'comment', audience: uniqueIds(userIds) });
+  }
 }
 
 /**
@@ -45,6 +49,9 @@ async function notify(userIds, { type, title, body, data = {} }, { store = true,
       );
       if (ioRef) {
         for (const row of result.rows) ioRef.to(`user:${row.user_id}`).emit('notification:new', row);
+      }
+      for (const row of result.rows) {
+        publish('notification', { userId: row.user_id, type: row.type, title: row.title || '', text: row.message || '' });
       }
     }
     if (push) {

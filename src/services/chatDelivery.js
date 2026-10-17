@@ -2,6 +2,7 @@ const db = require('../db');
 const { notify } = require('../utils/notify');
 const { sendPushToUsers } = require('../utils/push');
 const { extractMentions } = require('../utils/mentions');
+const { publish } = require('../utils/automation/bus');
 
 function previewFor({ body, attachmentType, meta }) {
   if (meta?.kind === 'todos') {
@@ -94,6 +95,8 @@ async function deliverMessage(io, {
 
   await pruneRoom(io, convId).catch((err) => console.error('[chat] prune failed:', err.message));
   if (io) io.to(`conv:${convId}`).emit('message:new', message);
+
+  publish('chat_message', { conversationId: convId, senderId: sender.id, senderName: sender.name, text: body || '' });
 
   // Fan-out runs after the sender gets their ack; failures here must not fail the send.
   fanOut(io, message).catch((err) => console.error('[chat] fan-out failed:', err.message));

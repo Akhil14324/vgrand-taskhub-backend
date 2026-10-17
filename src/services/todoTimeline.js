@@ -2,6 +2,7 @@ const db = require('../db');
 const { notify } = require('../utils/notify');
 const { computeMetrics, todoHealth } = require('../utils/timeline');
 const { memberIds, descendantIds } = require('./todoQueries');
+const { publish } = require('../utils/automation/bus');
 
 const BLOCKER_KINDS = ['dependency', 'waiting_on', 'issue', 'dead_stop'];
 const BLOCKER_LABELS = {
@@ -18,6 +19,8 @@ async function logEvent({ todoId, userId, subjectId, kind, from = null, to = nul
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [todoId || null, userId || null, subjectId || null, kind, from, to, note, meta ? JSON.stringify(meta) : null]
   );
+  // Automations listen to this one place instead of every route.
+  publish('todo_event', { todoId: todoId || null, userId: userId || null, subjectId: subjectId || null, kind, from, to, note, meta });
 }
 
 /**
