@@ -1,7 +1,7 @@
 // Per-person feature switches kept in users.preferences.features ({ key: boolean }). The list of keys
 // mirrors FEATURES in Taskhub-mobile/src/utils/features.js; unknown keys are dropped.
 const FEATURE_KEYS = [
-  'water', 'stretch', 'focus', 'roulette', 'roast',
+  'water', 'stretch', 'focus', 'buddy', 'roulette', 'roast',
   'deadlines', 'labels', 'estimates', 'reminders',
   'board', 'calendar', 'timeline', 'leaderboard',
 ];

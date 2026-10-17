@@ -421,15 +421,21 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
     if (!business) return { status: 404, error: 'Business not found' };
   }
 
-  // "Assign": hand a personal to-do to anyone else. It lands in that person's
-  // Inbox and stays off the giver's own list.
-  const delegateId = !businessId && !parent ? (parseInt(body.delegate_to, 10) || null) : null;
-  let delegate = null;
-  if (delegateId) {
-    if (delegateId === actor.id) return { status: 400, error: 'Pick someone else to assign this to' };
-    delegate = await loadActor(delegateId);
-    if (!delegate || delegate.status === 'inactive') return { status: 404, error: 'Person not found' };
+  // "Assign": hand a personal to-do to someone else (delegate_to) or to several people at once
+  // (delegate_ids, "@akhil @varun call the bank"). It lands in their Inboxes and stays off the giver's own
+  // list. With one person they are accountable; with several it is shared between them.
+  const wanted = !businessId && !parent
+    ? [...new Set([...(Array.isArray(body.delegate_ids) ? body.delegate_ids : []), body.delegate_to]
+      .map((v) => parseInt(v, 10)).filter((v) => v > 0))].slice(0, 25)
+    : [];
+  if (wanted.length === 1 && wanted[0] === actor.id) return { status: 400, error: 'Pick someone else to assign this to' };
+  const delegates = [];
+  for (const id of wanted.filter((v) => v !== actor.id)) {
+    const person = await loadActor(id);
+    if (!person || person.status === 'inactive') return { status: 404, error: 'Person not found' };
+    delegates.push(person);
   }
+  const delegate = delegates[0] || null;
 
   const place = businessId || delegate
     ? { listId: null, sectionId: null }
@@ -445,7 +451,7 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
   if (parent) reviewState = parent.review_state;
   else if (businessId && !(isLeader(actor) || managesBusiness(actor, businessId))) reviewState = 'proposed';
 
-  let assigneeId = delegate ? delegate.id : actor.id;
+  let assigneeId = delegates.length > 1 ? null : delegate ? delegate.id : actor.id;
   if (businessId) {
     if (assignTo) assigneeId = assignTo;
     else if (parent) assigneeId = parent.assignee_id || null;
@@ -501,10 +507,12 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
     await ensureMember(todo.id, actor.id, actor.id);
     if (assigneeId && assigneeId !== actor.id) await ensureMember(todo.id, assigneeId, actor.id);
   } else if (delegate) {
-    await db.query(
-      'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by) VALUES ($1, $2, NULL, NULL, $3)',
-      [todo.id, delegate.id, actor.id]
-    );
+    for (const person of delegates) {
+      await db.query(
+        'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by) VALUES ($1, $2, NULL, NULL, $3)',
+        [todo.id, person.id, actor.id]
+      );
+    }
   } else {
     await db.query(
       'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by) VALUES ($1, $2, $3, $4, $2)',
@@ -518,14 +526,24 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
   });
 
   if (delegate) {
-    await notify([delegate.id], {
-      type: 'todo_assigned',
-      title: `${parsePriority(body.priority) === 1 ? 'Urgent: ' : ''}${actor.name} assigned you a to-do`,
-      body: title,
-      data: { todoId: todo.id },
-    });
+    const urgent = parsePriority(body.priority) === 1 ? 'Urgent: ' : '';
+    for (const person of delegates) {
+      const others = delegates.filter((p) => p.id !== person.id).map((p) => p.name.split(' ')[0]);
+      await notify([person.id], {
+        type: 'todo_assigned',
+        title: delegates.length > 1
+          ? `${urgent}${actor.name} gave you and ${others.join(', ')} a to-do`
+          : `${urgent}${actor.name} assigned you a to-do`,
+        body: title,
+        data: { todoId: todo.id },
+      });
+    }
     if (!quiet) await announce(todo.id, 'created');
-    return { status: 201, todo: null, id: todo.id, assigned_to: { id: delegate.id, name: delegate.name } };
+    return {
+      status: 201, todo: null, id: todo.id,
+      assigned_to: { id: delegate.id, name: delegate.name },
+      assigned_names: delegates.map((p) => p.name),
+    };
   }
 
   const added = await addMentionedMembers(todo, `${title} ${notes || ''}`, body.mention_ids, actor, {
@@ -572,7 +590,7 @@ router.post('/', authenticate, async (req, res, next) => {
     if (!actor) return;
     const out = await createTodoCore(actor, req.body);
     if (out.error) return res.status(out.status).json({ error: out.error });
-    res.status(201).json({ todo: out.todo, assigned_to: out.assigned_to || undefined });
+    res.status(201).json({ todo: out.todo, assigned_to: out.assigned_to || undefined, assigned_names: out.assigned_names || undefined });
   } catch (err) {
     next(err);
   }
