@@ -424,10 +424,16 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
   // "Assign": hand a personal to-do to someone else (delegate_to) or to several people at once
   // (delegate_ids, "@akhil @varun call the bank"). It lands in their Inboxes and stays off the giver's own
   // list. With one person they are accountable; with several it is shared between them.
-  const wanted = !businessId && !parent
+  let wanted = !businessId && !parent
     ? [...new Set([...(Array.isArray(body.delegate_ids) ? body.delegate_ids : []), body.delegate_to]
       .map((v) => parseInt(v, 10)).filter((v) => v > 0))].slice(0, 25)
     : [];
+  // Safety net: a client that sent no people at all (directory not loaded yet, username typed in another
+  // case) still gets "@varun call the bank" handed to Varun, unless @me keeps it on the giver's list.
+  if (!wanted.length && !businessId && !parent && body.mention_ids === undefined
+      && !/(^|\s)@me(?=[\s,.!?]|$)/i.test(title)) {
+    wanted = (await resolveMentions(title)).map((m) => m.id).filter((id) => id !== actor.id).slice(0, 25);
+  }
   if (wanted.length === 1 && wanted[0] === actor.id) return { status: 400, error: 'Pick someone else to assign this to' };
   const delegates = [];
   for (const id of wanted.filter((v) => v !== actor.id)) {
@@ -900,12 +906,32 @@ async function finishTodo(existing, actor, { doneBy = actor.id } = {}) {
   return null;
 }
 
+/**
+ * A finished step (a direct sub-task of a top-level to-do) waits for the person who set the work to decide:
+ * go on, redo, stop, hand over or raise a roadblock (POST /:id/step-review in todoTimeline.js).
+ */
+async function requestStepReview(step, actor) {
+  if (!step.parent_id) return;
+  const parent = (await db.query('SELECT id, title, parent_id, created_by FROM todos WHERE id = $1', [step.parent_id])).rows[0];
+  if (!parent || parent.parent_id) return;
+  await db.query("UPDATE todos SET step_state = 'awaiting_review' WHERE id = $1", [step.id]);
+  await logEvent({ todoId: step.id, userId: actor.id, subjectId: step.assignee_id, kind: 'step_done', note: 'Waiting for a decision' });
+  if (parent.created_by && parent.created_by !== actor.id) {
+    await notify([parent.created_by], {
+      type: 'step_review',
+      title: `${actor.name} finished a step`,
+      body: `${step.title} (${parent.title}): go on, redo or stop?`,
+      data: { todoId: parent.id },
+    });
+  }
+}
+
 /** Reopen a finished to-do; a finished parent (at any level above) is reopened with it. */
 async function reopenTodo(existing, actor) {
   const target = existing.started_at ? 'in_progress' : 'todo';
   await db.query(
     `UPDATE todos SET is_done = FALSE, done_at = NULL, done_by = NULL, approved_by = NULL, approved_at = NULL,
-            submitted_by = NULL, submitted_at = NULL WHERE id = $1`,
+            submitted_by = NULL, submitted_at = NULL, step_state = NULL WHERE id = $1`,
     [existing.id]
   );
   await setStatus(existing.id, target);
@@ -987,6 +1013,7 @@ router.post('/:id(\\d+)/toggle', authenticate, async (req, res, next) => {
     } else {
       rolledTo = await finishTodo(existing, actor);
       if (existing.business_id) await ensureMember(existing.id, actor.id, actor.id);
+      if (!rolledTo) await requestStepReview(existing, actor);
     }
 
     const finished = !existing.is_done && existing.status !== 'in_review';

@@ -8,7 +8,7 @@ const PERMISSIONS = [
   { key: 'monitor', label: 'Team monitor', description: 'Watch the to-dos and numbers of people below them', defaultMaxLevel: 4 },
   { key: 'insights', label: 'Business health and workload', description: 'See health scores and how full each person is', defaultMaxLevel: 4 },
   { key: 'leaderboard_company', label: 'Company-wide leaderboard', description: 'See the leaderboard for every business, not just their own', defaultMaxLevel: 3 },
-  { key: 'manage_people', label: 'Manage people', description: 'Add, edit and remove people and reset passwords', defaultMaxLevel: 2 },
+  { key: 'manage_people', label: 'Manage people', description: 'Add, edit and remove people and reset passwords', defaultMaxLevel: 3 },
   { key: 'manage_businesses', label: 'Manage businesses', description: 'Create, edit and delete businesses', defaultMaxLevel: 3 },
   { key: 'view_all_todos', label: 'See every to-do', description: 'See every personal to-do and business task, whoever owns it', defaultMaxLevel: 0 },
   { key: 'chat_audit', label: 'Read every chat', description: 'Open any conversation, including other people\'s direct chats', defaultMaxLevel: 0 },

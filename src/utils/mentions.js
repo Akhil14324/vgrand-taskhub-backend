@@ -46,7 +46,19 @@ async function resolveMentions(text, explicitIds = []) {
        AND (LOWER(username) = ANY($1::text[]) OR id = ANY($2::int[]))`,
     [names, ids]
   );
-  return result.rows;
+  const rows = result.rows;
+  // A tag that is not a username ("@Varun" for "varunk") still reaches the person when it names exactly one
+  // active person by first name.
+  const known = new Set(rows.map((r) => String(r.username).toLowerCase()));
+  for (const n of names.filter((x) => !known.has(x) && x !== 'me' && x !== 'claude')) {
+    const hit = await db.query(
+      `SELECT id, name, username FROM users
+       WHERE status != 'inactive' AND LOWER(split_part(name, ' ', 1)) = $1`,
+      [n]
+    );
+    if (hit.rows.length === 1 && !rows.some((r) => r.id === hit.rows[0].id)) rows.push(hit.rows[0]);
+  }
+  return rows;
 }
 
 module.exports = { extractMentions, resolveMentions, USERNAME_PATTERN, USERNAME_RULE, cleanUsername, suggestUsername };

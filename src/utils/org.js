@@ -133,7 +133,7 @@ function isLeader(actor) {
 
 /** Super admin + chief of staff portal: full organisation management. */
 function isPortalAdmin(actor) {
-  return actor?.global !== null && actor?.global !== undefined && actor.global <= 2;
+  return actor?.global !== null && actor?.global !== undefined && actor.global <= 3;
 }
 
 /** Can the actor see/manage every task of this business? */
