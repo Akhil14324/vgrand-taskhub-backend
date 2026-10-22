@@ -6,10 +6,11 @@ const { sanitizeText } = require('../middleware/sanitize');
 const { loadActor } = require('../utils/org');
 const { getTodoFor } = require('../services/todoQueries');
 const { todayInAppZone, APP_TIMEZONE } = require('../utils/recurrence');
-const { chatJSON, transcribe, configured } = require('../utils/openai');
+const { chatJSON, visionJSON, transcribe, configured } = require('../utils/openai');
 
 // /api/ai: everything that uses GPT. Each call needs OPENAI_API_KEY on the server (see utils/openai.js).
 const router = express.Router();
+const image = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }).single('file');
 const audio = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } }).single('file');
 
 const clean = (v, n) => sanitizeText(v, n) || '';
@@ -108,6 +109,29 @@ router.post('/parse-tasks', authenticate, async (req, res, next) => {
   } catch (err) {
     fail(res, err, next);
   }
+});
+
+// POST /api/ai/photo — field "file" (a picture) and optional "hint": a handwritten note, whiteboard, invoice or
+// photo of a problem becomes a short summary and a list of tasks to confirm.
+router.post('/photo', authenticate, (req, res, next) => {
+  image(req, res, async (uploadErr) => {
+    try {
+      if (uploadErr) return res.status(400).json({ error: uploadErr.message });
+      if (!req.file || !req.file.mimetype.startsWith('image/')) return res.status(400).json({ error: 'Send a photo' });
+      const people = await peopleForPrompt();
+      const hint = clean(req.body.hint, 500);
+      const out = await visionJSON({
+        system: `You look at a photo taken at work (a handwritten note, whiteboard, invoice, bill, stock or equipment problem, a site) and turn it into things to do. ${datePrompt()} `
+          + `People who can be given a task: ${people.text}. Only create tasks the photo actually calls for; if a name written in it matches a person, assign it to them. `
+          + `Reply as JSON: {"summary":"1 to 3 plain sentences on what the photo shows","tasks":${TASK_SHAPE.slice(9, -1)}}`,
+        user: hint ? `Context from the person: ${hint}` : 'What needs doing because of this photo?',
+        imageUrl: `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`,
+      });
+      res.json({ summary: clean(String(out.summary || ''), 800), tasks: cleanTasks(out.tasks, people, req.user.id) });
+    } catch (err) {
+      fail(res, err, next);
+    }
+  });
 });
 
 // ---- meetings ------------------------------------------------------------------------------------------

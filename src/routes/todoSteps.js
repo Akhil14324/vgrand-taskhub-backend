@@ -7,6 +7,7 @@ const { loadActor } = require('../utils/org');
 const { getTodoFor, audienceIds } = require('../services/todoQueries');
 const { isAssignable } = require('../services/todoGovernance');
 const { BLOCKER_LABELS, logEvent, setStatus, assignTodo } = require('../services/todoTimeline');
+const { releaseNext } = require('../services/workflows');
 const { readStepGo } = require('../utils/quickAction');
 const { createMeet, configured: meetConfigured } = require('../utils/googleMeet');
 
@@ -112,6 +113,7 @@ router.post('/:id(\\d+)/step-review', authenticate, async (req, res, next) => {
       });
     }
 
+    if (decision === 'continue') await releaseNext(parent.id).catch((e) => console.error('[workflows] next step:', e.message));
     const who = [...new Set([step.assignee_id, step.done_by, parent.assignee_id].filter(Boolean))];
     await notify(who, {
       type: 'step_reviewed',
@@ -209,6 +211,7 @@ async function stepGo(req, res) {
     await db.query("UPDATE todos SET step_state = 'approved' WHERE id = $1", [step.id]);
     await db.query('INSERT INTO todo_step_reviews (todo_id, reviewer_id, decision, note) VALUES ($1, $2, $3, $4)', [step.id, actor.id, 'continue', '']);
     await logEvent({ todoId: step.id, userId: actor.id, subjectId: step.assignee_id, kind: 'step_reviewed', to: LABELS.continue });
+    await releaseNext(parent.id).catch((e) => console.error('[workflows] next step:', e.message));
     await notify([...new Set([step.assignee_id, step.done_by, parent.assignee_id].filter(Boolean))], {
       type: 'step_reviewed',
       title: `${actor.name}: ${LABELS.continue} on "${step.title}"`,

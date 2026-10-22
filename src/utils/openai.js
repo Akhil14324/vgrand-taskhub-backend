@@ -35,6 +35,41 @@ async function chatJSON({ system, user, temperature = 0.2, maxTokens = 1500 }) {
   }
 }
 
+/** One chat turn that may call tools. Returns the assistant message ({ content, tool_calls }). */
+async function chatTools({ messages, tools, temperature = 0.2, maxTokens = 1200 }) {
+  if (!configured()) throw notConfigured();
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL(), temperature, max_tokens: maxTokens, messages, tools, tool_choice: 'auto' }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error?.message || 'The AI could not answer');
+  return data.choices?.[0]?.message || { content: '' };
+}
+
+/** Like chatJSON but with a picture (a data: URL) next to the text. */
+async function visionJSON({ system, user, imageUrl, maxTokens = 1500 }) {
+  if (!configured()) throw notConfigured();
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: process.env.OPENAI_VISION_MODEL || MODEL(),
+      temperature: 0.2,
+      max_tokens: maxTokens,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: [{ type: 'text', text: user }, { type: 'image_url', image_url: { url: imageUrl, detail: 'auto' } }] },
+      ],
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error?.message || 'The AI could not read that picture');
+  try { return JSON.parse(data.choices?.[0]?.message?.content || '{}'); } catch { throw new Error('The AI answered in a form the app could not read'); }
+}
+
 /** Speech to text for one audio file (webm, mp4, m4a, wav ... up to 25 MB). Returns the text. */
 async function transcribe(buffer, filename = 'audio.webm', mime = 'audio/webm') {
   if (!configured()) throw notConfigured();
@@ -51,4 +86,4 @@ async function transcribe(buffer, filename = 'audio.webm', mime = 'audio/webm') 
   return String(data.text || '').trim();
 }
 
-module.exports = { configured, chatJSON, transcribe };
+module.exports = { configured, chatJSON, chatTools, visionJSON, transcribe };

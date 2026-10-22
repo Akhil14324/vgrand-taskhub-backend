@@ -10,6 +10,54 @@ const { todayInAppZone } = require('../utils/recurrence');
 // the app already keeps. With an OpenAI key it also gets a short plain-language summary on top.
 const router = express.Router();
 
+/** Yesterday (company time zone) for the businesses in this person's scope, plus a short summary when AI is on. */
+async function dailyReport(actor) {
+  const health = await businessHealth(actor, 7);
+  const ids = health.businesses.map((b) => b.id);
+  const names = new Map(health.businesses.map((b) => [b.id, b.name]));
+  const zone = require('../utils/recurrence').APP_TIMEZONE;
+  const finished = ids.length ? (await db.query(
+    `SELECT COALESCE((e.meta->>'business_id')::int, t.business_id) AS business_id, u.name AS who, COUNT(*)::int AS n
+     FROM todo_events e LEFT JOIN todos t ON t.id = e.todo_id LEFT JOIN users u ON u.id = e.user_id
+     WHERE e.kind = 'completed' AND COALESCE((e.meta->>'is_subtask')::boolean, FALSE) = FALSE
+       AND (e.created_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date - 1
+       AND COALESCE((e.meta->>'business_id')::int, t.business_id) = ANY($1::int[])
+     GROUP BY 1, 2 ORDER BY n DESC`, [ids, zone]
+  )).rows : [];
+  const blockers = ids.length ? (await db.query(
+    `SELECT t.title, t.business_id FROM todo_blockers b JOIN todos t ON t.id = b.todo_id
+     WHERE t.business_id = ANY($1::int[]) AND (b.raised_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date - 1 LIMIT 10`, [ids, zone]
+  )).rows : [];
+  const decisions = ids.length ? (await db.query(
+    `SELECT r.decision, COUNT(*)::int AS n FROM todo_step_reviews r JOIN todos s ON s.id = r.todo_id JOIN todos p ON p.id = s.parent_id
+     WHERE p.business_id = ANY($1::int[]) AND (r.created_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date - 1 GROUP BY r.decision`, [ids, zone]
+  )).rows : [];
+  const perBusiness = health.businesses.map((b) => ({
+    id: b.id, name: b.name, overdue: b.overdue, blocked: b.blocked,
+    finished: finished.filter((f) => f.business_id === b.id).reduce((n, f) => n + f.n, 0),
+  }));
+  const report = {
+    totals: { finished: perBusiness.reduce((n, b) => n + b.finished, 0), new_blockers: blockers.length, overdue: perBusiness.reduce((n, b) => n + b.overdue, 0) },
+    businesses: perBusiness,
+    top: finished.slice(0, 5).map((f) => ({ who: f.who, business: names.get(f.business_id), n: f.n })),
+    blockers: blockers.map((b) => ({ title: b.title, business: names.get(b.business_id) })),
+    decisions,
+    narrative: null,
+  };
+  if (configured() && ids.length) {
+    try {
+      const out = await chatJSON({
+        system: 'You write the 30-second morning brief a company leader reads about yesterday. Plain sentences, no markdown, no greeting, at most 70 words. '
+          + 'Say what got done, what went wrong or got stuck, and the one thing to look at first, naming the business or person. Use only the numbers given. Reply as JSON {"narrative":"..."}.',
+        user: JSON.stringify(report),
+        maxTokens: 250,
+      });
+      report.narrative = String(out.narrative || '').slice(0, 600) || null;
+    } catch { /* the numbers are enough */ }
+  }
+  return report;
+}
+
 router.get('/weekly', authenticate, async (req, res, next) => {
   try {
     const actor = await loadActor(req.user.id);
@@ -70,4 +118,16 @@ router.get('/weekly', authenticate, async (req, res, next) => {
   }
 });
 
+// GET /api/reports/daily — what happened yesterday, for the businesses this person looks after.
+router.get('/daily', authenticate, async (req, res, next) => {
+  try {
+    const actor = await loadActor(req.user.id);
+    if (!actor || !actor.can('insights')) return res.status(403).json({ error: 'You do not have access to this' });
+    res.json(await dailyReport(actor));
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;
+module.exports.dailyReport = dailyReport;

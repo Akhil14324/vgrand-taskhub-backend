@@ -5,6 +5,7 @@ const { loadActor } = require('../utils/org');
 const { listTodos } = require('../services/todoQueries');
 const { todayInAppZone, APP_TIMEZONE } = require('../utils/recurrence');
 const { DEFAULT_TASK_MIN } = require('../utils/insights');
+const { atRisk } = require('../services/risk');
 
 // /api/plan: the morning plan, and the "usually" suggestions for quick add.
 const router = express.Router();
@@ -98,6 +99,16 @@ router.get('/defaults', authenticate, async (req, res, next) => {
       [req.user.id]
     )).rows[0] || null;
     res.json({ assignees: people, business: biz });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/plan/risk — to-dos in the next week that look likely to miss their date, with the reasons.
+router.get('/risk', authenticate, async (req, res, next) => {
+  try {
+    const actor = await loadActor(req.user.id);
+    res.json({ items: await atRisk(actor) });
   } catch (err) {
     next(err);
   }
