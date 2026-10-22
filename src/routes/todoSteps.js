@@ -7,6 +7,7 @@ const { loadActor } = require('../utils/org');
 const { getTodoFor, audienceIds } = require('../services/todoQueries');
 const { isAssignable } = require('../services/todoGovernance');
 const { BLOCKER_LABELS, logEvent, setStatus, assignTodo } = require('../services/todoTimeline');
+const { readStepGo } = require('../utils/quickAction');
 const { createMeet, configured: meetConfigured } = require('../utils/googleMeet');
 
 // Step reviews and meetings. Mounted next to the to-do router on /api/todos.
@@ -132,7 +133,7 @@ router.get('/:id(\\d+)/meetings', authenticate, async (req, res, next) => {
     const todo = await openTodoFor(req, res);
     if (!todo) return;
     const rows = (await db.query(
-      `SELECT m.id, m.title, m.meet_url, m.starts_at, m.ends_at, m.attendee_ids, m.created_by, u.name AS created_by_name,
+      `SELECT m.id, m.title, m.meet_url, length(m.transcript) AS transcript_chars, m.starts_at, m.ends_at, m.attendee_ids, m.created_by, u.name AS created_by_name,
               (SELECT COALESCE(json_agg(json_build_object('id', a.id, 'name', a.name)), '[]'::json)
                  FROM users a WHERE a.id = ANY(m.attendee_ids)) AS attendees
        FROM todo_meetings m LEFT JOIN users u ON u.id = m.created_by
@@ -193,4 +194,36 @@ router.post('/:id(\\d+)/meetings', authenticate, async (req, res, next) => {
   }
 });
 
+// Public: GET|POST /api/quick/step-go?t=<token> — "Go ahead" from a notification button. The signed link is the
+// key (one step, one person, three days); the same rules as the app apply to who may decide.
+const quick = express.Router();
+async function stepGo(req, res) {
+  try {
+    const { stepId, userId } = readStepGo(String(req.query.t || ''));
+    const actor = await loadActor(userId);
+    const step = actor ? await getTodoFor(stepId, actor.id, actor) : null;
+    const parent = step?.parent_id ? await getTodoFor(step.parent_id, actor.id, actor) : null;
+    if (!step || !parent) return res.status(404).json({ error: 'Not found' });
+    if (step.step_state !== 'awaiting_review') return res.json({ ok: true, already: true });
+    if (parent.created_by !== actor.id && !parent.permissions.can_edit) return res.status(403).json({ error: 'Not allowed' });
+    await db.query("UPDATE todos SET step_state = 'approved' WHERE id = $1", [step.id]);
+    await db.query('INSERT INTO todo_step_reviews (todo_id, reviewer_id, decision, note) VALUES ($1, $2, $3, $4)', [step.id, actor.id, 'continue', '']);
+    await logEvent({ todoId: step.id, userId: actor.id, subjectId: step.assignee_id, kind: 'step_reviewed', to: LABELS.continue });
+    await notify([...new Set([step.assignee_id, step.done_by, parent.assignee_id].filter(Boolean))], {
+      type: 'step_reviewed',
+      title: `${actor.name}: ${LABELS.continue} on "${step.title}"`,
+      body: parent.title,
+      data: { todoId: parent.id },
+    }, { exclude: [actor.id] });
+    await broadcast(parent.id);
+    await broadcast(step.id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: 'This link has expired' });
+  }
+}
+quick.get('/step-go', stepGo);
+quick.post('/step-go', stepGo);
+
 module.exports = router;
+module.exports.quick = quick;

@@ -3,6 +3,7 @@ const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
 const { notify, emitToUsers } = require('../utils/notify');
+const { stepGoUrl } = require('../utils/quickAction');
 const { resolveMentions } = require('../utils/mentions');
 const { deliverMessage } = require('../services/chatDelivery');
 const { todayInAppZone, nextOccurrence, APP_TIMEZONE } = require('../utils/recurrence');
@@ -914,14 +915,14 @@ async function requestStepReview(step, actor) {
   if (!step.parent_id) return;
   const parent = (await db.query('SELECT id, title, parent_id, created_by FROM todos WHERE id = $1', [step.parent_id])).rows[0];
   if (!parent || parent.parent_id) return;
-  await db.query("UPDATE todos SET step_state = 'awaiting_review' WHERE id = $1", [step.id]);
+  await db.query("UPDATE todos SET step_state = 'awaiting_review', step_since = NOW(), step_chased_at = NULL WHERE id = $1", [step.id]);
   await logEvent({ todoId: step.id, userId: actor.id, subjectId: step.assignee_id, kind: 'step_done', note: 'Waiting for a decision' });
   if (parent.created_by && parent.created_by !== actor.id) {
     await notify([parent.created_by], {
       type: 'step_review',
       title: `${actor.name} finished a step`,
       body: `${step.title} (${parent.title}): go on, redo or stop?`,
-      data: { todoId: parent.id },
+      data: { todoId: parent.id, stepId: step.id, quickUrl: stepGoUrl(step.id, parent.created_by) },
     });
   }
 }
