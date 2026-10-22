@@ -17,7 +17,6 @@ const clean = (v, n) => sanitizeText(v, n) || '';
 
 function fail(res, err, next) {
   if (err.status) return res.status(err.status).json({ error: err.message });
-  if (/AI|OpenAI|recording/i.test(err.message || '')) return res.status(502).json({ error: err.message });
   return next(err);
 }
 

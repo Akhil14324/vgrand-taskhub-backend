@@ -6,6 +6,12 @@ const configured = () => !!process.env.OPENAI_API_KEY;
 const MODEL = () => process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const TRANSCRIBE_MODEL = () => process.env.OPENAI_TRANSCRIBE_MODEL || 'whisper-1';
 
+function upstream(message) {
+  const err = new Error(message);
+  err.status = 502;
+  return err;
+}
+
 function notConfigured() {
   const err = new Error('AI is not switched on yet. Ask the owner to add the OpenAI key on the server.');
   err.status = 503;
@@ -27,11 +33,11 @@ async function chatJSON({ system, user, temperature = 0.2, maxTokens = 1500 }) {
     }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error?.message || 'The AI could not answer');
+  if (!res.ok) throw upstream(data.error?.message || 'The AI could not answer');
   try {
     return JSON.parse(data.choices?.[0]?.message?.content || '{}');
   } catch {
-    throw new Error('The AI answered in a form the app could not read');
+    throw upstream('The AI answered in a form the app could not read');
   }
 }
 
@@ -44,7 +50,7 @@ async function chatTools({ messages, tools, temperature = 0.2, maxTokens = 1200 
     body: JSON.stringify({ model: MODEL(), temperature, max_tokens: maxTokens, messages, tools, tool_choice: 'auto' }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error?.message || 'The AI could not answer');
+  if (!res.ok) throw upstream(data.error?.message || 'The AI could not answer');
   return data.choices?.[0]?.message || { content: '' };
 }
 
@@ -66,8 +72,8 @@ async function visionJSON({ system, user, imageUrl, maxTokens = 1500 }) {
     }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error?.message || 'The AI could not read that picture');
-  try { return JSON.parse(data.choices?.[0]?.message?.content || '{}'); } catch { throw new Error('The AI answered in a form the app could not read'); }
+  if (!res.ok) throw upstream(data.error?.message || 'The AI could not read that picture');
+  try { return JSON.parse(data.choices?.[0]?.message?.content || '{}'); } catch { throw upstream('The AI answered in a form the app could not read'); }
 }
 
 /** Speech to text for one audio file (webm, mp4, m4a, wav ... up to 25 MB). Returns the text. */
@@ -82,7 +88,7 @@ async function transcribe(buffer, filename = 'audio.webm', mime = 'audio/webm') 
     body: form,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error?.message || 'The recording could not be turned into text');
+  if (!res.ok) throw upstream(data.error?.message || 'The recording could not be turned into text');
   return String(data.text || '').trim();
 }
 

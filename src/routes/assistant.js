@@ -201,7 +201,6 @@ router.post('/chat', authenticate, async (req, res, next) => {
     res.json({ reply, proposals });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ error: err.message });
-    if (/AI/.test(err.message || '')) return res.status(502).json({ error: err.message });
     next(err);
   }
 });

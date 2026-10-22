@@ -196,7 +196,7 @@ router.post('/:id(\\d+)/meetings', authenticate, async (req, res, next) => {
   }
 });
 
-// Public: GET|POST /api/quick/step-go?t=<token> — "Go ahead" from a notification button. The signed link is the
+// Public: POST /api/quick/step-go?t=<token> — "Go ahead" from a notification button. The signed link is the
 // key (one step, one person, three days); the same rules as the app apply to who may decide.
 const quick = express.Router();
 async function stepGo(req, res) {
@@ -225,7 +225,6 @@ async function stepGo(req, res) {
     res.status(400).json({ error: 'This link has expired' });
   }
 }
-quick.get('/step-go', stepGo);
 quick.post('/step-go', stepGo);
 
 module.exports = router;
