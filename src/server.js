@@ -103,9 +103,11 @@ const globalLimiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  // Only failed attempts count: a whole office sharing one IP signing in must not lock each other out.
+  skipSuccessfulRequests: true,
   skip: (req) => (req.method === 'GET' && req.path === '/me') || isInternal(req),
   message: { error: 'Too many authentication attempts, please try again later.' },
 });
