@@ -2,6 +2,7 @@
 // mirrors FEATURES in Taskhub-mobile/src/utils/features.js; unknown keys are dropped.
 const FEATURE_KEYS = [
   'water', 'stretch', 'focus', 'buddy', 'roulette', 'roast',
+  'buddy_chase', 'buddy_rows', 'buddy_mood', 'buddy_life', 'buddy_cheer',
   'deadlines', 'labels', 'estimates', 'reminders',
   'board', 'calendar', 'timeline', 'leaderboard', 'automation', 'alarm',
 ];

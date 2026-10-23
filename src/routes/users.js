@@ -8,6 +8,7 @@ const { loadActor, actorBestLevel } = require('../utils/org');
 const { setMemberships, syncLeaderGroups } = require('../services/org');
 const { notify } = require('../utils/notify');
 const { cleanFeatures } = require('../utils/features');
+const { cleanBuddy } = require('../utils/buddyProfile');
 
 const router = express.Router();
 
@@ -315,6 +316,7 @@ const PREFERENCE_RULES = {
   reminderSound: (v) => typeof v === 'boolean',
   waterReminder: (v) => typeof v === 'boolean',
   features: (v) => cleanFeatures(v) !== null,
+  buddy: (v) => cleanBuddy(v) !== null,
 };
 
 // PUT /api/users/me/preferences — merge a few personal settings; they change the app for this account only
@@ -325,6 +327,7 @@ router.put('/me/preferences', authenticate, async (req, res, next) => {
       if (req.body[key] !== undefined && ok(req.body[key])) patch[key] = req.body[key];
     }
     if (patch.features) patch.features = cleanFeatures(patch.features);
+    if (patch.buddy) patch.buddy = cleanBuddy(patch.buddy);
     const result = await db.query(
       `UPDATE users SET preferences = preferences || $1::jsonb WHERE id = $2 RETURNING preferences`,
       [JSON.stringify(patch), req.user.id]
