@@ -4,6 +4,7 @@ const { isLeader } = require('../utils/org');
 const { shift } = require('../utils/streak');
 const { streakFor, weekStart } = require('./engagement');
 const { countCleanMonths, computeBadges } = require('../utils/badges');
+const { cleanBuddy } = require('../utils/buddyProfile');
 
 /** My milestone badges and the numbers behind them. */
 async function badgesFor(userId) {
@@ -88,6 +89,14 @@ async function weekWall(actor, offset = 0) {
     `SELECT COUNT(*)::int AS n FROM kudos WHERE created_at >= ($2::date)::timestamp AT TIME ZONE $1 AND created_at < (($2::date + 7)::timestamp AT TIME ZONE $1)`,
     [APP_TIMEZONE, start]
   );
+  const top = [...people.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)).slice(0, 5);
+  if (top.length) { // their cats, so the wall can show the winner's cat with a trophy
+    const prefs = (await db.query('SELECT id, preferences FROM users WHERE id = ANY($1::int[])', [top.map((p) => p.id)])).rows;
+    for (const p of top) {
+      const pr = prefs.find((x) => x.id === p.id)?.preferences || {};
+      p.buddy = pr.features?.buddy === false ? null : (cleanBuddy(pr.buddy) || cleanBuddy({}));
+    }
+  }
   return {
     week_start: start,
     week_end: shift(start, 6),
@@ -101,7 +110,7 @@ async function weekWall(actor, offset = 0) {
       const day = shift(start, i);
       return { day, count: perDay.get(day) || 0 };
     }),
-    top: [...people.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)).slice(0, 5),
+    top,
     businesses: [...businesses.values()].sort((a, b) => b.count - a.count),
     feed: rows.slice(0, 30).map((r) => ({
       id: r.id,
