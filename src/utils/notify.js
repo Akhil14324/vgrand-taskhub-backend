@@ -74,7 +74,7 @@ async function notify(userIds, { type, title, body, data = {} }, { store = true,
   const ids = uniqueIds(userIds, exclude);
   if (ids.length === 0) return;
   const actor = currentActorId();
-  if (actor) visit(ids, actor, type, { todoId: data.todoId || null }).catch(() => {});
+  if (actor) visit(ids, actor, type, { todoId: data.todoId || null, text: String(body || '').slice(0, 90) }).catch(() => {});
   try {
     if (store) {
       const result = await db.query(
