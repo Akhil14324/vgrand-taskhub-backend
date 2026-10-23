@@ -92,9 +92,18 @@ app.use(cors({
 app.use(express.json({ limit: '1mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
+// Signed-in people are counted per person, not per IP: a whole office shares one address, and the app
+// itself makes many calls (lists, notifications, chat), so a shared IP bucket ran out and blocked sign-in.
+const jwtLib = require('jsonwebtoken');
+const callerId = (req) => {
+  const h = req.headers.authorization;
+  if (!h || !h.startsWith('Bearer ')) return null;
+  try { return jwtLib.verify(h.split(' ')[1], process.env.JWT_SECRET).id; } catch { return null; }
+};
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 600,
+  max: (req) => (callerId(req) ? 1500 : 600),
+  keyGenerator: (req) => { const id = callerId(req); return id ? `u:${id}` : req.ip; },
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => isInternal(req),
