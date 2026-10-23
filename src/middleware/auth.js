@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const dotenv = require('dotenv');
 const db = require('../db');
+const { runAsActor } = require('../utils/actorContext');
 
 dotenv.config();
 
@@ -33,7 +34,7 @@ async function authenticate(req, res, next) {
       id: dbUser.id,
       role: dbUser.role,
     };
-    next();
+    runAsActor(dbUser.id, next);
   } catch (err) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }

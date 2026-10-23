@@ -1,5 +1,5 @@
 const db = require('../db');
-const { notify } = require('../utils/notify');
+const { notify, visit } = require('../utils/notify');
 const { sendPushToUsers } = require('../utils/push');
 const { extractMentions } = require('../utils/mentions');
 const { publish } = require('../utils/automation/bus');
@@ -144,6 +144,8 @@ async function fanOut(io, message) {
       data,
     });
   }
+
+  visit([...mentioned, ...others.filter((p) => !p.is_muted && !p.is_invisible).map((p) => p.user_id)], message.senderId, 'chat', { conversationId: message.conversationId }).catch(() => {});
 
   const pushIds = others
     .filter((p) => !p.is_muted && !p.is_invisible && !mentioned.includes(p.user_id))

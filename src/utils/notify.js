@@ -1,6 +1,8 @@
 const db = require('../db');
 const { sendPushToUsers } = require('./push');
 const { publish } = require('./automation/bus');
+const { currentActorId } = require('./actorContext');
+const { cleanBuddy } = require('./buddyProfile');
 
 let ioRef = null;
 
@@ -27,6 +29,38 @@ function emitToUsers(userIds, event, payload) {
   }
 }
 
+const profileCache = new Map(); // id -> { at, value }
+
+/** A person's name and cat (null when they switched their cat buddy off). Cached for a minute. */
+async function catOf(userId) {
+  const hit = profileCache.get(userId);
+  if (hit && Date.now() - hit.at < 60e3) return hit.value;
+  let value = null;
+  try {
+    const r = await db.query('SELECT name, preferences FROM users WHERE id = $1', [userId]);
+    const row = r.rows[0];
+    const prefs = row?.preferences || {};
+    if (row && prefs.features?.buddy !== false && prefs.features?.buddy_social !== false) {
+      value = { id: userId, name: row.name, buddy: cleanBuddy(prefs.buddy) || cleanBuddy({}) };
+    }
+  } catch { /* the visit is optional */ }
+  profileCache.set(userId, { at: Date.now(), value });
+  return value;
+}
+
+/**
+ * Tell people that someone's cat is coming to see them (the sender's cat walks onto their screen). Fire and
+ * forget: it never fails the request that caused it.
+ */
+async function visit(userIds, fromId, kind, extra = {}) {
+  if (!ioRef || !fromId) return;
+  const ids = uniqueIds(userIds, [fromId]);
+  if (!ids.length) return;
+  const from = await catOf(Number(fromId));
+  if (!from) return;
+  for (const id of ids) ioRef.to(`user:${id}`).emit('buddy:visit', { from, kind, ...extra });
+}
+
 /**
  * Notify users: store an in-app notification, push it live over the socket and
  * send a device push (FCM web push / Expo).
@@ -39,6 +73,8 @@ function emitToUsers(userIds, event, payload) {
 async function notify(userIds, { type, title, body, data = {} }, { store = true, push = true, exclude = [] } = {}) {
   const ids = uniqueIds(userIds, exclude);
   if (ids.length === 0) return;
+  const actor = currentActorId();
+  if (actor) visit(ids, actor, type, { todoId: data.todoId || null }).catch(() => {});
   try {
     if (store) {
       const result = await db.query(
@@ -62,4 +98,4 @@ async function notify(userIds, { type, title, body, data = {} }, { store = true,
   }
 }
 
-module.exports = { setIO, getIO, emitToUsers, notify, uniqueIds };
+module.exports = { setIO, getIO, emitToUsers, notify, uniqueIds, visit };
