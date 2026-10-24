@@ -7,6 +7,7 @@ const { loadActor } = require('../utils/org');
 const { getTodoFor } = require('../services/todoQueries');
 const { todayInAppZone, APP_TIMEZONE } = require('../utils/recurrence');
 const { chatJSON, visionJSON, transcribe, configured } = require('../utils/openai');
+const { createTodoCore } = require('./todos');
 
 // /api/ai: everything that uses GPT. Each call needs OPENAI_API_KEY on the server (see utils/openai.js).
 const router = express.Router();
@@ -186,6 +187,7 @@ router.post('/meetings/:id(\\d+)/transcript', authenticate, async (req, res, nex
 });
 
 // POST /api/ai/meetings/:id/extract — summary and action items from the transcript so far.
+// { create: true } also makes each task as a to-do, handed to the person it is for (no review step).
 router.post('/meetings/:id(\\d+)/extract', authenticate, async (req, res, next) => {
   try {
     const ctx = await openMeeting(req, res);
@@ -196,6 +198,8 @@ router.post('/meetings/:id(\\d+)/extract', authenticate, async (req, res, next) 
     const out = await chatJSON({
       system: `You read a meeting transcript and pull out what was decided and who has to do what. ${datePrompt()} `
         + `The meeting was about the task "${ctx.todo.title}". People who can be given work: ${people.text}. `
+        + 'The speech may be in English, in Telugu, or in both mixed together (Telugu is often written in English letters). '
+        + 'Understand all of it, and write every title, summary and decision in clear English. '
         + 'Match the names people say to the closest person. Only list real action items that someone agreed to or was asked to do, not discussion. '
         + `Reply as JSON: {"summary":"2 to 4 plain sentences","decisions":["..."],"tasks":${TASK_SHAPE.slice(9, -1)}}`,
       user: transcript,
@@ -207,6 +211,20 @@ router.post('/meetings/:id(\\d+)/extract', authenticate, async (req, res, next) 
       tasks: cleanTasks(out.tasks, people, req.user.id),
     };
     await db.query('UPDATE todo_meetings SET extracted = $2 WHERE id = $1', [ctx.meeting.id, JSON.stringify(result)]);
+    if (req.body.create) {
+      const made = [];
+      const failed = [];
+      for (const t of result.tasks) {
+        // Tasks for someone else go to them as a personal to-do; the rest stay on the speaker's own list.
+        const body = { title: t.title, due_date: t.due_date || undefined, due_time: t.due_time || undefined, priority: t.priority || undefined };
+        if (t.assignee) body.delegate_to = t.assignee.id;
+        const out2 = await createTodoCore(ctx.actor, body);
+        if (out2.todo) made.push({ title: t.title, assignee: t.assignee ? t.assignee.name : null });
+        else failed.push(t.title);
+      }
+      result.created = made;
+      result.failed = failed;
+    }
     res.json(result);
   } catch (err) {
     fail(res, err, next);
@@ -214,3 +232,5 @@ router.post('/meetings/:id(\\d+)/extract', authenticate, async (req, res, next) 
 });
 
 module.exports = router;
+// Shared with routes/meetingNotes.js so standalone meeting notes read people and dates the same way.
+module.exports.helpers = { peopleForPrompt, cleanTasks, datePrompt, TASK_SHAPE, clean };
