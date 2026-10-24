@@ -7,6 +7,7 @@ const { loadActor, actorLevelIn } = require('../utils/org');
 const { listTodos, audienceIds } = require('../services/todoQueries');
 const { clearWarnings } = require('../services/todoGovernance');
 const { logEvent } = require('../services/todoTimeline');
+const { cachedCount } = require('../services/erpApprovals');
 
 const router = express.Router();
 
@@ -49,13 +50,16 @@ router.get('/', authenticate, async (req, res, next) => {
     const requests = pending.rows.filter((a) => canDecide(a, actor));
     const reviewTodos = reviews.filter((todo) => todo.permissions.can_approve);
     const proposalTodos = proposals.filter((todo) => todo.permissions.can_review);
+    // Hospital ERP approvals (routes/erp.js) count towards the badge, from the last list read (never waits on the ERP).
+    const erpCount = cachedCount(actor.id);
 
     res.json({
       requests,
       reviews: reviewTodos,
       proposals: proposalTodos,
       mine: mine.rows,
-      count: requests.length + reviewTodos.length + proposalTodos.length,
+      erp_count: erpCount,
+      count: requests.length + reviewTodos.length + proposalTodos.length + erpCount,
     });
   } catch (err) {
     next(err);

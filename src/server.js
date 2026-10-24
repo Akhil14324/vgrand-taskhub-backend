@@ -24,6 +24,7 @@ const monitorRoutes = require('./routes/monitor');
 const orgRoutes = require('./routes/org');
 const approvalRoutes = require('./routes/approvals');
 const accessRoutes = require('./routes/access');
+const erpRoutes = require('./routes/erp');
 const db = require('./db');
 const { runMigrations } = require('./migrations/run');
 const { scheduleOverdueNotifications } = require('./jobs/overdueNotifications');
@@ -35,6 +36,7 @@ const { scheduleChasing } = require('./jobs/chasing');
 const { scheduleWorkflows } = require('./jobs/workflows');
 const { scheduleRisk } = require('./jobs/risk');
 const { scheduleDailyBrief } = require('./jobs/dailyBrief');
+const { scheduleErpApprovals } = require('./jobs/erpApprovals');
 const engageRoutes = require('./routes/engage');
 const templateRoutes = require('./routes/templates');
 const insightRoutes = require('./routes/insights');
@@ -88,7 +90,7 @@ app.use(cors({
   credentials: true,
 }));
 
-// The raw body is kept for the signed /api/claude/callback.
+// The raw body is kept for the signed /api/claude/callback and /api/erp/webhook.
 app.use(express.json({ limit: '1mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
@@ -194,6 +196,7 @@ app.use('/api/automation', automationRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/approvals', approvalRoutes);
 app.use('/api/access', accessRoutes);
+app.use('/api/erp', erpRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
@@ -241,6 +244,7 @@ if (require.main === module) {
       scheduleWorkflows();
       scheduleRisk();
       scheduleDailyBrief();
+      scheduleErpApprovals();
       automationEngine.start();
     } catch (err) {
       console.error('Failed to start server:', err);
