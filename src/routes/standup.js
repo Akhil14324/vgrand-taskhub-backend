@@ -165,4 +165,84 @@ router.post('/nudge', authenticate, async (req, res, next) => {
   }
 });
 
+/** The people on my team board: me, my colleagues in my businesses, and anyone I monitor. */
+async function teamFor(userId) {
+  const { people: watched } = await monitorablePeople(userId);
+  const colleagues = await db.query(
+    `SELECT DISTINCT ub2.user_id AS id FROM user_businesses ub
+     JOIN user_businesses ub2 ON ub2.business_id = ub.business_id
+     WHERE ub.user_id = $1`,
+    [userId]
+  );
+  const ids = [...new Set([userId, ...watched.map((p) => p.id), ...colleagues.rows.map((r) => r.id)])];
+  const rows = await db.query(
+    `SELECT u.id, u.name, u.username, u.profile_picture FROM users u
+     WHERE u.id = ANY($1::int[]) AND u.status <> 'inactive' ORDER BY u.name`,
+    [ids]
+  );
+  return rows.rows;
+}
+
+// GET /api/standup/team?day= — the team board: business work each person finished this week and still has open,
+// and whether their daily report is in for the day (attendance)
+router.get('/team', authenticate, async (req, res, next) => {
+  try {
+    const today = todayInAppZone();
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(req.query.day || '') ? req.query.day : today;
+    const people = await teamFor(req.user.id);
+    const ids = people.map((p) => p.id);
+    const [work, posts] = await Promise.all([
+      db.query(
+        `SELECT t.assignee_id AS id,
+                COUNT(*) FILTER (WHERE t.is_done AND (t.done_at AT TIME ZONE $3)::date > $2::date - 7)::int AS completed,
+                COUNT(*) FILTER (WHERE NOT t.is_done)::int AS pending,
+                COUNT(*) FILTER (WHERE NOT t.is_done AND t.due_date < $2::date)::int AS overdue
+         FROM todos t
+         WHERE t.business_id IS NOT NULL AND t.parent_id IS NULL AND t.review_state = 'accepted'
+           AND t.assignee_id = ANY($1::int[])
+         GROUP BY t.assignee_id`,
+        [ids, day, APP_TIMEZONE]
+      ),
+      db.query(
+        `SELECT s.user_id,
+                MAX(s.created_at) FILTER (WHERE s.day = $2::date) AS posted_at,
+                COUNT(*) FILTER (WHERE s.day = $2::date)::int AS posted_today,
+                COUNT(*)::int AS posted_week
+         FROM standups s
+         WHERE s.user_id = ANY($1::int[]) AND s.day > $2::date - 7 AND s.day <= $2::date
+         GROUP BY s.user_id`,
+        [ids, day]
+      ),
+    ]);
+    const byWork = new Map(work.rows.map((r) => [r.id, r]));
+    const byPost = new Map(posts.rows.map((r) => [r.user_id, r]));
+    const board = people.map((p) => {
+      const w = byWork.get(p.id) || { completed: 0, pending: 0, overdue: 0 };
+      const s = byPost.get(p.id);
+      return {
+        id: p.id,
+        name: p.name,
+        username: p.username,
+        profile_picture: p.profile_picture,
+        me: p.id === req.user.id,
+        completed: w.completed,
+        pending: w.pending,
+        overdue: w.overdue,
+        posted: !!s?.posted_today,
+        posted_at: s?.posted_at || null,
+        posted_days_week: s?.posted_week || 0,
+      };
+    });
+    res.json({
+      day,
+      weekend: isWeekend(day),
+      people: board,
+      posted: board.filter((p) => p.posted).length,
+      total: board.length,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

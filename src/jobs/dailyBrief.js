@@ -3,12 +3,17 @@ const { notify } = require('../utils/notify');
 const { loadActor } = require('../utils/org');
 const { APP_TIMEZONE, todayInAppZone } = require('../utils/recurrence');
 
-// Two small automatic messages so nobody writes status reports:
+// Automatic messages so nobody writes status reports by hand, and so the daily report counts as attendance:
 //  - 08:30, leaders: a brief of yesterday across the businesses they look after,
-//  - 18:00, anyone who finished work today and has not posted their stand-up: "your update is drafted, tap to post".
+//  - 17:00 on working days, everyone who has not posted today's report: "due, drafted, tap to post",
+//  - 18:30, the same people again: last call,
+//  - 19:00, leadership: who has still not posted today.
 const LEADER_HOUR = 8;
 const LEADER_MIN = 30;
-const UPDATE_HOUR = 18;
+const REPORT_MIN = 17 * 60;
+const LATE_MIN = 18 * 60 + 30;
+const ATTENDANCE_MIN = 19 * 60;
+const CUTOFF_MIN = 22 * 60;
 const INTERVAL_MS = 10 * 60 * 1000;
 
 const clock = async () => (await db.query(
@@ -19,6 +24,16 @@ const clock = async () => (await db.query(
 const claim = async (userId, kind) => (await db.query(
   'INSERT INTO brief_log (user_id, day, kind) VALUES ($1, $2::date, $3) ON CONFLICT DO NOTHING RETURNING user_id', [userId, todayInAppZone(), kind]
 )).rows.length > 0;
+
+/** Active people placed in a business (or in the organisation), who have not posted today's report yet. */
+const unpostedToday = async () => (await db.query(
+  `SELECT u.id, u.name FROM users u
+   WHERE u.status <> 'inactive'
+     AND (u.org_level IS NOT NULL OR EXISTS (SELECT 1 FROM user_businesses ub WHERE ub.user_id = u.id))
+     AND NOT EXISTS (SELECT 1 FROM standups s WHERE s.user_id = u.id AND s.day = $1::date)
+   ORDER BY u.name`,
+  [todayInAppZone()]
+)).rows;
 
 async function leaderBriefs() {
   const { dailyReport } = require('../routes/reports');
@@ -39,20 +54,28 @@ async function leaderBriefs() {
   }
 }
 
-async function updateNudges() {
-  const today = todayInAppZone();
-  const people = (await db.query(
-    `SELECT DISTINCT e.user_id AS id FROM todo_events e
-     WHERE e.kind = 'completed' AND e.user_id IS NOT NULL AND (e.created_at AT TIME ZONE $2)::date = $1::date
-       AND NOT EXISTS (SELECT 1 FROM standups s WHERE s.user_id = e.user_id AND s.day = $1::date)`,
-    [today, APP_TIMEZONE]
+/** Tell everyone who has not posted yet. Each person hears each reminder once a day. */
+async function remindUnposted(kind, title, body) {
+  for (const { id } of await unpostedToday()) {
+    if (!(await claim(id, kind))) continue;
+    await notify([id], { type: 'standup_nudge', title, body, data: { standup: true } });
+  }
+}
+
+/** Leadership: who is still missing their daily report today. */
+async function attendanceToLeaders() {
+  const missing = await unpostedToday();
+  if (!missing.length) return;
+  const leaders = (await db.query(
+    `SELECT id FROM users WHERE status <> 'inactive' AND org_level IS NOT NULL AND org_level <= 3`
   )).rows;
-  for (const { id } of people) {
-    if (!(await claim(id, 'update'))) continue;
+  const names = missing.slice(0, 8).map((p) => p.name).join(', ') + (missing.length > 8 ? ` and ${missing.length - 8} more` : '');
+  for (const { id } of leaders) {
+    if (!(await claim(id, 'attendance'))) continue;
     await notify([id], {
       type: 'standup_nudge',
-      title: 'Your update is ready',
-      body: 'We wrote today\'s update from what you finished. Check it and post it in one tap.',
+      title: `${missing.length} daily report${missing.length === 1 ? '' : 's'} missing today`,
+      body: names,
       data: { standup: true },
     });
   }
@@ -62,8 +85,13 @@ async function run() {
   try {
     const c = await clock();
     if (c.d > 6) return;
-    if (c.h > LEADER_HOUR || (c.h === LEADER_HOUR && c.m >= LEADER_MIN)) if (c.h < 12) await leaderBriefs();
-    if (c.h >= UPDATE_HOUR && c.h < 21) await updateNudges();
+    const minutes = c.h * 60 + c.m;
+    if (minutes >= LEADER_HOUR * 60 + LEADER_MIN && c.h < 12) await leaderBriefs();
+    // The daily report is for working days (Monday to Friday, as in utils/standup.js).
+    if (c.d >= 6 || minutes >= CUTOFF_MIN) return;
+    if (minutes >= REPORT_MIN) await remindUnposted('report', 'Your daily report is due', 'We drafted it from what you finished. Check it and post it in one tap.');
+    if (minutes >= LATE_MIN) await remindUnposted('report-late', 'Last call: daily report', 'Your daily report is still missing. Posting it counts as today\'s attendance.');
+    if (minutes >= ATTENDANCE_MIN) await attendanceToLeaders();
   } catch (err) {
     console.error('[brief] failed:', err.message);
   }

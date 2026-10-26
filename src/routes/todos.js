@@ -449,7 +449,7 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
     : await resolvePlacement(actor.id, parseInt(body.list_id, 10) || null, parseInt(body.section_id, 10) || null);
   if (place.error) return { status: 404, error: place.error };
 
-  const assignTo = parseInt(body.assign_to ?? body.assigned_user_id, 10) || null;
+  let assignTo = parseInt(body.assign_to ?? body.assigned_user_id, 10) || null;
   if (businessId && assignTo && !(await isAssignable(assignTo, businessId))) {
     return { status: 400, error: 'That person is not part of this business' };
   }
@@ -457,6 +457,15 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
   let reviewState = 'accepted';
   if (parent) reviewState = parent.review_state;
   else if (businessId && !(isLeader(actor) || managesBusiness(actor, businessId))) reviewState = 'proposed';
+
+  // "@ravi send the invoice" on a business task: the one other person named in the title is the one who does
+  // it, so it lands in their To-do. Several names means shared, with nobody accountable.
+  if (businessId && !parent && !assignTo && reviewState === 'accepted') {
+    const named = (await resolveMentions(title)).map((m) => m.id).filter((id) => id !== actor.id);
+    const eligible = [];
+    for (const id of named) if (await isAssignable(id, businessId)) eligible.push(id);
+    if (eligible.length === 1) assignTo = eligible[0];
+  }
 
   let assigneeId = delegates.length > 1 ? null : delegate ? delegate.id : actor.id;
   if (businessId) {
@@ -1009,7 +1018,7 @@ router.post('/:id(\\d+)/toggle', authenticate, async (req, res, next) => {
         todoId: existing.id, userId: actor.id, subjectId: existing.assignee_id, kind: 'reopened', to: target,
         note: 'Taken back from review',
       });
-    } else if (existing.business_id && existing.requires_approval && !existing.permissions.can_edit) {
+    } else if (existing.business_id && existing.requires_approval && !existing.permissions.can_edit && !isLeader(actor)) {
       await submitForReview(existing, actor);
     } else {
       rolledTo = await finishTodo(existing, actor);
