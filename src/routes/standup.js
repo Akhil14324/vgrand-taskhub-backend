@@ -50,6 +50,16 @@ const POST_SELECT = `
          u.name, u.username, u.profile_picture
   FROM standups s JOIN users u ON u.id = s.user_id`;
 
+/**
+ * Open work a person is accountable for, shown under their stand-up. Business tasks are visible to anyone in the
+ * business; personal to-dos only to the people who may monitor that person ($2), so a colleague never sees them.
+ */
+const OPEN_TASKS = `
+  SELECT t.id, t.title, t.status, t.priority, t.due_date::text AS due_date, t.business_id
+  FROM todos t
+  WHERE t.is_done = FALSE AND t.parent_id IS NULL AND t.review_state <> 'rejected' AND ${MINE}
+    AND ($2::boolean OR t.business_id IS NOT NULL)`;
+
 // GET /api/standup/today — the draft built from my work, and today's post if I already made one
 router.get('/today', authenticate, async (req, res, next) => {
   try {
@@ -139,7 +149,10 @@ router.get('/feed', authenticate, async (req, res, next) => {
     const missing = isWeekend(day)
       ? []
       : watched.filter((p) => !postedIds.has(p.id)).map((p) => ({ id: p.id, name: p.name, profile_picture: p.profile_picture, display_title: p.display_title }));
-    res.json({ day, weekend: isWeekend(day), posts: posts.rows, missing, can_see_missing: watched.length > 0 });
+    const watchedIds = new Set(watched.map((p) => p.id));
+    const tasks = await Promise.all(posts.rows.map((p) => db.query(`${OPEN_TASKS} ORDER BY t.due_date NULLS LAST, t.priority, t.id LIMIT 15`, [p.user_id, watchedIds.has(p.user_id)])));
+    const withTasks = posts.rows.map((p, i) => ({ ...p, tasks: tasks[i].rows }));
+    res.json({ day, weekend: isWeekend(day), posts: withTasks, missing, can_see_missing: watched.length > 0 });
   } catch (err) {
     next(err);
   }
