@@ -3,23 +3,18 @@ const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
 const { notify } = require('../utils/notify');
-const { loadActor, isLeader, managesBusiness } = require('../utils/org');
+const { loadActor } = require('../utils/org');
 const { todayInAppZone } = require('../utils/recurrence');
-const { cleanPoints, isYmd, addDaysYmd, summarize, burndown, averageVelocity } = require('../utils/sprints');
+const { cleanPoints, isYmd, addDaysYmd, summarize, burndown } = require('../utils/sprints');
+const { capacityLevel } = require('../utils/workspace');
+const { accessFor } = require('../services/bizAccess');
+const { sprintStats, velocityOf } = require('../services/sprintData');
 
 const router = express.Router();
 
 const DEFAULT_LENGTH_DAYS = 13; // a two-week sprint
 const MAX_BATCH = 100;
 const BACKLOG_LIMIT = 200;
-
-/** What the actor may do with a business's sprints: anyone in the business (or leadership) sees them, managers plan them. */
-function accessFor(actor, businessId) {
-  return {
-    view: isLeader(actor) || actor.memberships.has(businessId),
-    manage: isLeader(actor) || managesBusiness(actor, businessId),
-  };
-}
 
 /** Sprint row with its business, if the actor may see that business. */
 async function loadSprintRow(actor, sprintId) {
@@ -37,34 +32,6 @@ async function businessTasks(businessId, ids) {
   )).rows;
 }
 
-/** Sprint summary numbers for a list of sprints (one query). */
-async function sprintStats(businessId) {
-  return (await db.query(
-    `SELECT s.id, s.name, s.goal, s.starts_on, s.ends_on, s.status, s.started_at, s.completed_at,
-            COUNT(t.id)::int AS task_count,
-            COUNT(t.id) FILTER (WHERE t.is_done)::int AS done_count,
-            COALESCE(SUM(t.story_points), 0)::int AS total_points,
-            COALESCE(SUM(t.story_points) FILTER (WHERE t.is_done), 0)::int AS done_points
-     FROM sprints s
-     LEFT JOIN todos t ON t.sprint_id = s.id
-     WHERE s.business_id = $1
-     GROUP BY s.id
-     ORDER BY CASE s.status WHEN 'active' THEN 0 WHEN 'planned' THEN 1 ELSE 2 END, s.starts_on DESC, s.id DESC`,
-    [businessId]
-  )).rows;
-}
-
-/** Velocity: average points finished across recent completed sprints (oldest first). */
-function velocityOf(rows) {
-  const completed = rows
-    .filter((r) => r.status === 'completed')
-    .sort((a, b) => (a.completed_at > b.completed_at ? 1 : -1));
-  return {
-    average: averageVelocity(completed.map((r) => r.done_points)),
-    completed: completed.map((r) => ({ id: r.id, name: r.name, points: r.done_points, ends_on: r.ends_on })),
-  };
-}
-
 /** Full sprint: its tasks, the business backlog, and the burndown for a started sprint. */
 async function loadSprintDetail(actor, sprintId) {
   const found = await loadSprintRow(actor, sprintId);
@@ -74,7 +41,7 @@ async function loadSprintDetail(actor, sprintId) {
 
   const tasks = (await db.query(
     `SELECT t.id, t.title, t.status, t.is_done, t.story_points, t.priority, t.due_date, t.assignee_id,
-            u.name AS assignee_name,
+            t.item_type, t.epic_id, t.release_id, u.name AS assignee_name,
             CASE WHEN t.done_at IS NULL THEN NULL ELSE to_char(t.done_at AT TIME ZONE $2, 'YYYY-MM-DD') END AS done_on
      FROM todos t
      LEFT JOIN users u ON u.id = t.assignee_id
@@ -84,7 +51,7 @@ async function loadSprintDetail(actor, sprintId) {
   )).rows;
 
   const backlog = sprint.status === 'completed' ? [] : (await db.query(
-    `SELECT t.id, t.title, t.status, t.story_points, t.priority, t.due_date, u.name AS assignee_name
+    `SELECT t.id, t.title, t.status, t.story_points, t.priority, t.due_date, t.item_type, t.epic_id, u.name AS assignee_name
      FROM todos t
      LEFT JOIN users u ON u.id = t.assignee_id
      WHERE t.business_id = $1 AND t.sprint_id IS NULL AND NOT t.is_done AND t.review_state = 'accepted'
@@ -107,6 +74,24 @@ async function loadSprintDetail(actor, sprintId) {
 
   const all = await sprintStats(sprint.business_id);
   const row = all.find((r) => r.id === sprint.id) || {};
+
+  // Capacity: what is planned against what the team usually finishes, and who carries how much.
+  const velocity = velocityOf(all);
+  const people = new Map();
+  for (const t of tasks) {
+    const key = t.assignee_id || 0;
+    const entry = people.get(key) || { user_id: t.assignee_id, name: t.assignee_name || 'Nobody yet', tasks: 0, points: 0, done_points: 0 };
+    entry.tasks += 1;
+    entry.points += t.story_points || 0;
+    if (t.is_done) entry.done_points += t.story_points || 0;
+    people.set(key, entry);
+  }
+  const capacity = {
+    planned_points: row.total_points || 0,
+    velocity_average: velocity.average,
+    level: capacityLevel(row.total_points || 0, velocity.average),
+    people: [...people.values()].sort((a, b) => b.points - a.points),
+  };
   return {
     sprint: {
       id: sprint.id,
@@ -127,6 +112,7 @@ async function loadSprintDetail(actor, sprintId) {
     tasks: tasks.map(({ done_on: _ignored, ...t }) => t),
     backlog,
     burndown: burn,
+    capacity,
     summary: summarize(tasks.map((t) => ({ points: t.story_points || 0, is_done: t.is_done }))),
     today,
   };
