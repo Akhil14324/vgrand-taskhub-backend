@@ -204,7 +204,9 @@ router.get('/team', authenticate, async (req, res, next) => {
     const day = /^\d{4}-\d{2}-\d{2}$/.test(req.query.day || '') ? req.query.day : today;
     const people = await teamFor(req.user.id);
     const ids = people.map((p) => p.id);
-    const [work, posts] = await Promise.all([
+    const { people: watched } = await monitorablePeople(req.user.id);
+    const watchedIds = new Set(watched.map((p) => p.id));
+    const [work, posts, todays] = await Promise.all([
       db.query(
         `SELECT t.assignee_id AS id,
                 COUNT(*) FILTER (WHERE t.is_done AND (t.done_at AT TIME ZONE $3)::date > $2::date - 7)::int AS completed,
@@ -226,12 +228,20 @@ router.get('/team', authenticate, async (req, res, next) => {
          GROUP BY s.user_id`,
         [ids, day]
       ),
+      db.query(
+        `SELECT s.user_id, s.done, s.doing, s.blockers, s.note
+         FROM standups s WHERE s.day = $2::date AND s.user_id = ANY($1::int[])`,
+        [ids, day]
+      ),
     ]);
     const byWork = new Map(work.rows.map((r) => [r.id, r]));
     const byPost = new Map(posts.rows.map((r) => [r.user_id, r]));
-    const board = people.map((p) => {
+    const byToday = new Map(todays.rows.map((r) => [r.user_id, r]));
+    const tasks = await Promise.all(people.map((p) => db.query(`${OPEN_TASKS} ORDER BY t.due_date NULLS LAST, t.priority, t.id LIMIT 15`, [p.id, watchedIds.has(p.id)])));
+    const board = people.map((p, i) => {
       const w = byWork.get(p.id) || { completed: 0, pending: 0, overdue: 0 };
       const s = byPost.get(p.id);
+      const report = byToday.get(p.id);
       return {
         id: p.id,
         name: p.name,
@@ -244,6 +254,8 @@ router.get('/team', authenticate, async (req, res, next) => {
         posted: !!s?.posted_today,
         posted_at: s?.posted_at || null,
         posted_days_week: s?.posted_week || 0,
+        report: report ? { done: report.done || [], doing: report.doing || [], blockers: report.blockers || [], note: report.note || '' } : null,
+        tasks: tasks[i].rows,
       };
     });
     res.json({
