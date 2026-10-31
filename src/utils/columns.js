@@ -121,7 +121,9 @@ const DEFAULT_STATUS_LABELS = [
 
 const DEFAULT_VIEWS = [
   { kind: 'table', name: 'Main table', settings: {} },
+  { kind: 'gantt', name: 'Gantt', settings: {} },
   { kind: 'kanban', name: 'Kanban', settings: { group_by: 'status' } },
+  { kind: 'calendar', name: 'Calendar', settings: {} },
 ];
 
 const AI_ACTIONS = ['summarize', 'categorize', 'extract', 'translate', 'sentiment', 'reply', 'custom'];

@@ -44,3 +44,14 @@ FROM boards b
 WHERE b.archived_at IS NULL
   AND EXISTS (SELECT 1 FROM board_columns c WHERE c.board_id = b.id AND c.system_key = 'status')
   AND NOT EXISTS (SELECT 1 FROM board_columns c WHERE c.board_id = b.id AND c.kind = 'files' AND c.archived_at IS NULL);
+
+-- Boards open with Main table, Gantt, Kanban and Calendar tabs. A board that has none of a kind gets it
+-- (a tab someone closed stays archived, so it is only added when the kind was never there).
+INSERT INTO board_views (board_id, owner_id, kind, name, settings, sort_order)
+SELECT b.id, NULL, v.kind, v.name, v.settings::jsonb,
+       COALESCE((SELECT MAX(sort_order) FROM board_views x WHERE x.board_id = b.id), 0) + v.ord
+FROM boards b
+CROSS JOIN (VALUES ('gantt', 'Gantt', '{}', 1), ('calendar', 'Calendar', '{}', 2)) AS v(kind, name, settings, ord)
+WHERE b.archived_at IS NULL
+  AND EXISTS (SELECT 1 FROM board_views x WHERE x.board_id = b.id)
+  AND NOT EXISTS (SELECT 1 FROM board_views x WHERE x.board_id = b.id AND x.kind = v.kind);
