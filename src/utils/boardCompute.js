@@ -70,21 +70,34 @@ function computeFormulas(items, columns, values, nameOf) {
   const prepared = formulas.map((c) => ({ col: c, ...formulaSource(c.settings.expression, columns) }));
   for (const item of items) {
     const results = {};
+    let filled = false; // did any column the formula reads have a value? (all empty -> blank, not 0)
+    const has = (col) => {
+      if (col.system_key) return item[SYSTEM_FIELD[col.system_key]] !== null && item[SYSTEM_FIELD[col.system_key]] !== undefined;
+      const v = values?.[item.id]?.[col.id];
+      return v !== null && v !== undefined && v !== '';
+    };
     const lookup = (name) => {
-      if (name === 'item') return item.title;
+      if (name === 'item') { filled = true; return item.title; }
       const m = /^c(\d+)$/.exec(name);
       if (!m) return undefined;
       const id = Number(m[1]);
-      if (results[id] !== undefined) return results[id] && results[id].error ? '' : results[id];
+      if (results[id] !== undefined) {
+        if (results[id] && results[id].error) return '';
+        if (results[id] !== '') filled = true;
+        return results[id];
+      }
       const col = columns.find((c) => c.id === id);
       if (!col) return '';
       if (col.kind === 'formula') return ''; // a formula that refers to a later formula, or to itself, sees blank
+      if (has(col) || col.system_key === 'timeline') filled = true;
       return plainValue(item, col, values, nameOf);
     };
     for (const p of prepared) {
       if (p.missing.length) { results[p.col.id] = { error: `No column called ${p.missing.join(', ')}` }; continue; }
       try {
-        const v = evaluate(p.src, lookup);
+        filled = false;
+        let v = evaluate(p.src, lookup);
+        if (!filled && !/%item/.test(p.src)) v = '';
         results[p.col.id] = typeof v === 'number' && !Number.isFinite(v) ? { error: 'Not a number' } : v;
       } catch (err) {
         results[p.col.id] = { error: err instanceof ExprError ? err.message : 'This formula does not work' };

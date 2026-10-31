@@ -30,11 +30,16 @@ test('formulas compute per item, can use an earlier formula, and read status lab
   assert.strictEqual(r[100][4], 14000);
   assert.strictEqual(r[100][5], 16520);
   assert.strictEqual(r[100][6], 1);
-  assert.strictEqual(r[101][4], 0); // empty Qty counts as 0
+  assert.strictEqual(r[101][4], 0); // empty Qty counts as 0 once another input is filled
   assert.strictEqual(r[101][6], 0);
   assert.match(r[100][7].error, /No column called Nope/);
   assert.strictEqual(r[100][10], 5);
   assert.strictEqual(r[101][10], '');
+});
+
+test('a formula whose inputs are all empty stays blank', () => {
+  const r = computeFormulas([{ id: 102, title: 'Nothing yet', status: 'todo' }], columns, {});
+  assert.strictEqual(r[102][4], '');
 });
 
 test('the new date functions', () => {
