@@ -78,7 +78,7 @@ async function buildBoard(actor, place, def, { withItems = true, createTodoCore 
     [
       place.scope, place.business_id || null, place.site_id || null, place.scope === 'personal' ? actor.id : null,
       place.name, place.description || '', def.icon || 'grid-outline', color,
-      place.privacy || (place.scope === 'personal' ? 'private' : 'main'), String(def.item_word || 'Item').slice(0, 30), actor.id,
+      place.privacy || (place.scope === 'personal' ? 'private' : 'main'), String(def.item_word || 'Task').slice(0, 30), actor.id,
     ]
   )).rows[0];
 

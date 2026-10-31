@@ -20,6 +20,7 @@ const { configured: aiConfigured, chatJSON } = require('../utils/openai');
 const { BUILT_INS, checkDefinition } = require('../utils/boardTemplates');
 const { definitionFromBoard, buildBoard } = require('../services/boardBuild');
 const columnsCatalog = require('../utils/columns');
+const { setDependencies } = require('../services/dependencies');
 const { recipeList, buildRecipe, isBoardProfile } = require('../utils/boardRecipes');
 
 /**
@@ -363,7 +364,7 @@ router.post('/', authenticate, withActor, async (req, res, next) => {
         scope, businessId, siteId, scope === 'personal' ? actor.id : null, name,
         sanitizeText(req.body.description, 2000) || '', sanitizeText(req.body.icon, 40) || 'grid-outline',
         color(req.body.color, 'blue'), PRIVACY.includes(req.body.privacy) ? req.body.privacy : (scope === 'personal' ? 'private' : 'main'),
-        sanitizeText(req.body.kind, 20) || 'custom', sanitizeText(req.body.item_word, 30) || 'Item', order, actor.id,
+        sanitizeText(req.body.kind, 20) || 'custom', sanitizeText(req.body.item_word, 30) || 'Task', order, actor.id,
       ]
     )).rows[0];
     await ensureBoardDefaults(db, board.id, actor.id);
@@ -515,7 +516,7 @@ router.patch('/:id(\\d+)', authenticate, withActor, boardParam('manage'), async 
         req.body.icon !== undefined ? sanitizeText(req.body.icon, 40) || b.icon : b.icon,
         req.body.color !== undefined ? color(req.body.color, b.color) : b.color,
         PRIVACY.includes(req.body.privacy) && !(b.is_default && req.body.privacy === 'private') ? req.body.privacy : b.privacy,
-        req.body.item_word !== undefined ? sanitizeText(req.body.item_word, 30) || 'Item' : b.item_word,
+        req.body.item_word !== undefined ? sanitizeText(req.body.item_word, 30) || 'Task' : b.item_word,
         Number.isInteger(req.body.sort_order) ? req.body.sort_order : b.sort_order,
         archived,
       ]
@@ -968,6 +969,24 @@ router.get('/:id(\\d+)/activity', authenticate, withActor, boardParam('view'), a
   }
 });
 
+// PUT /:id/items/:todoId/depends-on — { ids: [todoId, ...] } what this task waits for (replaces the list).
+// The task, and everything that waits for it, moves to start after the latest of them; later, when one of
+// them changes its date, the tasks that wait for it move by the same days (services/dependencies.js).
+router.put('/:id(\\d+)/items/:todoId(\\d+)/depends-on', authenticate, withActor, boardParam('view'), async (req, res, next) => {
+  try {
+    const todo = await getTodoFor(int(req.params.todoId), req.actor.id, req.actor);
+    if (!todo || todo.board_id !== req.board.id) return res.status(404).json({ error: 'Task not found on this board' });
+    if (!todo.permissions?.can_edit) return res.status(403).json({ error: 'You cannot change this task' });
+    const result = await setDependencies(todo, req.body.ids, req.actor.id);
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    const fresh = await getTodoFor(todo.id, req.actor.id, req.actor);
+    await changed(req.board, 'items', { todoId: todo.id });
+    res.json({ todo: fresh, moved: result.moved });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /:id/dependencies — "this item waits for that one" pairs among the board's items (Gantt arrows).
 router.get('/:id(\\d+)/dependencies', authenticate, withActor, boardParam('view'), async (req, res, next) => {
   try {
@@ -979,7 +998,17 @@ router.get('/:id(\\d+)/dependencies', authenticate, withActor, boardParam('view'
        WHERE kind = 'dependency' AND todo_id = ANY($1::int[]) AND blocked_by_todo_id = ANY($1::int[])`,
       [ids]
     )).rows;
-    res.json({ links: rows.map((r) => ({ from: r.blocked_by_todo_id, to: r.todo_id, resolved: r.resolved })) });
+    const waits = (await db.query(
+      `SELECT d.todo_id, d.depends_on_id, p.is_done FROM todo_dependencies d JOIN todos p ON p.id = d.depends_on_id
+       WHERE d.todo_id = ANY($1::int[]) AND d.depends_on_id = ANY($1::int[])`,
+      [ids]
+    )).rows;
+    res.json({
+      links: [
+        ...rows.map((r) => ({ from: r.blocked_by_todo_id, to: r.todo_id, resolved: r.resolved })),
+        ...waits.map((r) => ({ from: r.depends_on_id, to: r.todo_id, resolved: r.is_done })),
+      ],
+    });
   } catch (err) {
     next(err);
   }

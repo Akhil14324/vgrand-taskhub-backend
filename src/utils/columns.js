@@ -87,8 +87,8 @@ const KINDS = {
  */
 const SYSTEM_COLUMNS = {
   status: { kind: 'status', title: 'Status', field: 'status', edit: 'status', width: 150 },
-  person: { kind: 'person', title: 'Person', field: 'assignee_id', edit: 'assign', width: 110 },
-  date: { kind: 'date', title: 'Date', field: 'due_date', edit: 'put', width: 130 },
+  person: { kind: 'person', title: 'Owner', field: 'assignee_id', edit: 'assign', width: 110 },
+  date: { kind: 'date', title: 'Due date', field: 'due_date', edit: 'put', width: 130 },
   deadline: { kind: 'date', title: 'Deadline', field: 'deadline_date', edit: 'put', width: 130 },
   timeline: { kind: 'timeline', title: 'Timeline', field: ['start_date', 'due_date'], edit: 'put', width: 180 },
   priority: { kind: 'priority', title: 'Priority', field: 'priority', edit: 'put', width: 120 },
@@ -97,7 +97,7 @@ const SYSTEM_COLUMNS = {
   points: { kind: 'numbers', title: 'Story points', field: 'story_points', edit: 'workspace', width: 110 },
   sprint: { kind: 'sprint', title: 'Sprint', field: 'sprint_id', edit: 'workspace', width: 140 },
   item_type: { kind: 'item_type', title: 'Type', field: 'item_type', edit: 'workspace', width: 110 },
-  dependency: { kind: 'dependency', title: 'Dependencies', field: 'open_blocker_count', edit: 'blockers', width: 140 },
+  dependency: { kind: 'dependency', title: 'Dependent On', field: 'depends_on', edit: 'depends', width: 170 },
   time_tracking: { kind: 'time_tracking', title: 'Time tracking', field: null, edit: 'timer', width: 140 },
   approval: { kind: 'approval', title: 'Approval', field: 'status', edit: 'approve', width: 130 },
   item_id: { kind: 'auto_number', title: 'Item ID', field: 'id', edit: null, width: 90 },
@@ -106,7 +106,9 @@ const SYSTEM_COLUMNS = {
 };
 
 // A new board shows only what most work needs (simplicity rule, F-DSN-05); the rest is one click away.
-const DEFAULT_COLUMNS = ['person', 'status', 'date'];
+const DEFAULT_COLUMNS = ['person', 'status', 'date', 'dependency'];
+// Plain columns every new board also gets (after the built-in ones above): { kind, title, width }.
+const DEFAULT_EXTRA_COLUMNS = [{ kind: 'long_text', title: 'Notes', width: 160 }, { kind: 'files', title: 'Files', width: 140 }];
 
 const DEFAULT_STATUS_LABELS = [
   { label: 'Not started', color: 'grey', maps_to: 'todo' },
@@ -327,7 +329,7 @@ module.exports = {
   STATUS_KEYS,
   KINDS,
   SYSTEM_COLUMNS,
-  DEFAULT_COLUMNS,
+  DEFAULT_COLUMNS, DEFAULT_EXTRA_COLUMNS,
   DEFAULT_STATUS_LABELS,
   DEFAULT_VIEWS,
   VIEW_KINDS,

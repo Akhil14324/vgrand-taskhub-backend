@@ -1,6 +1,6 @@
 const db = require('../db');
 const {
-  SYSTEM_COLUMNS, DEFAULT_COLUMNS, DEFAULT_STATUS_LABELS, DEFAULT_VIEWS,
+  SYSTEM_COLUMNS, DEFAULT_COLUMNS, DEFAULT_EXTRA_COLUMNS, DEFAULT_STATUS_LABELS, DEFAULT_VIEWS,
 } = require('../utils/columns');
 const { boardAccess } = require('../utils/boardAccess');
 
@@ -40,6 +40,12 @@ async function ensureBoardDefaults(q, boardId, createdBy = null) {
   const has = await q.query('SELECT 1 FROM board_columns WHERE board_id = $1 LIMIT 1', [boardId]);
   if (!has.rows.length) {
     for (const [i, key] of DEFAULT_COLUMNS.entries()) await addSystemColumn(q, boardId, key, i + 1, createdBy);
+    for (const [i, c] of DEFAULT_EXTRA_COLUMNS.entries()) {
+      await q.query(
+        'INSERT INTO board_columns (board_id, kind, title, width, sort_order, settings, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [boardId, c.kind, c.title, c.width, DEFAULT_COLUMNS.length + i + 1, {}, createdBy]
+      );
+    }
   }
   const views = await q.query('SELECT 1 FROM board_views WHERE board_id = $1 LIMIT 1', [boardId]);
   if (!views.rows.length) {
