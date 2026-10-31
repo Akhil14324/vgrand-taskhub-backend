@@ -26,11 +26,13 @@ const SCOPES = [
   { value: 'any', label: 'Any to-do I can see' },
   { value: 'mine', label: 'Only mine' },
   { value: 'business', label: 'Only in one business' },
+  { value: 'board', label: 'Only on one board' },
 ];
 
 const TODO_FILTERS = [
   { key: 'scope', type: 'select', label: 'Which to-dos', options: SCOPES, default: 'any' },
   { key: 'business_id', type: 'business', label: 'Business', showWhen: { key: 'scope', is: 'business' } },
+  { key: 'board_id', type: 'board', label: 'Board', showWhen: { key: 'scope', is: 'board' } },
   { key: 'text', type: 'text', label: 'Title contains (optional)', placeholder: 'invoice' },
   { key: 'label', type: 'label', label: 'Has label (optional)', placeholder: 'finance' },
 ];

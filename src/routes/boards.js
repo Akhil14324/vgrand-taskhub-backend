@@ -6,6 +6,7 @@ const { emitToUsers } = require('../utils/notify');
 const { loadActor } = require('../utils/org');
 const { listTodos, getTodoFor } = require('../services/todoQueries');
 const { canCreateBoard } = require('../utils/boardAccess');
+const { isLeader: isLeaderActor } = require('../utils/org');
 const {
   PALETTE, KINDS, SYSTEM_COLUMNS, VIEW_KINDS, STATUS_KEYS, COLOR_NAMES, cleanValue, cleanSettings,
 } = require('../utils/columns');
@@ -16,6 +17,10 @@ const { createTodoCore, announce } = require('./todos');
 const { logEvent } = require('../services/todoTimeline');
 const { computeFormulas, computeMirrors, plainValue } = require('../utils/boardCompute');
 const { configured: aiConfigured, chatJSON } = require('../utils/openai');
+const { BUILT_INS, checkDefinition } = require('../utils/boardTemplates');
+const { definitionFromBoard, buildBoard } = require('../services/boardBuild');
+const columnsCatalog = require('../utils/columns');
+const { recipeList, buildRecipe, isBoardProfile } = require('../utils/boardRecipes');
 
 /**
  * Boards (migration 055), mounted at /api/boards. See MONDAY_FEATURE_SPEC.md sections 2–5.
@@ -115,6 +120,208 @@ router.get('/catalog', authenticate, (req, res) => {
     view_kinds: VIEW_KINDS,
     status_keys: STATUS_KEYS,
   });
+});
+
+// ---------------------------------------------------------------------------
+// Templates, duplicate, import (M9)
+// ---------------------------------------------------------------------------
+
+/** Where a new board goes, checked: { scope, business_id, site_id } -> { place } or { error, status }. */
+async function placementFrom(actor, body) {
+  const scope = SCOPES.includes(body.scope) ? body.scope : 'personal';
+  let businessId = null;
+  let siteId = null;
+  if (scope === 'site') {
+    siteId = int(body.site_id);
+    const site = siteId ? (await db.query('SELECT id, business_id FROM sites WHERE id = $1 AND archived_at IS NULL', [siteId])).rows[0] : null;
+    if (!site) return { status: 404, error: 'Site not found' };
+    businessId = site.business_id;
+  } else if (scope === 'business') {
+    businessId = int(body.business_id);
+    if (!businessId || !(await db.query('SELECT 1 FROM businesses WHERE id = $1', [businessId])).rows.length) return { status: 404, error: 'Business not found' };
+  }
+  if (!canCreateBoard(actor, scope, businessId)) return { status: 403, error: 'You cannot add boards here' };
+  return { place: { scope, business_id: businessId, site_id: siteId, privacy: PRIVACY.includes(body.privacy) ? body.privacy : undefined } };
+}
+
+// GET /templates — ready-made ones, the person's own, and those of their businesses.
+router.get('/templates', authenticate, withActor, async (req, res, next) => {
+  try {
+    const mine = (await db.query(
+      `SELECT t.id, t.name, t.description, t.business_id, b.name AS business_name, t.owner_id, t.created_at
+       FROM board_templates t LEFT JOIN businesses b ON b.id = t.business_id
+       WHERE t.archived_at IS NULL AND (t.owner_id = $1 OR t.business_id = ANY($2::int[]) OR $3::boolean)
+       ORDER BY t.created_at DESC LIMIT 200`,
+      [req.actor.id, [...req.actor.memberships.keys()], isLeaderActor(req.actor)]
+    )).rows;
+    res.json({
+      ready_made: Object.entries(BUILT_INS).map(([key, t]) => ({ key, name: t.name, description: t.description, sector: t.sector })),
+      saved: mine,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /templates — { board_id, name, description?, with_items?: 'none' | 'all' | 'open', for_business? } save a board's shape.
+router.post('/templates', authenticate, withActor, async (req, res, next) => {
+  try {
+    const found = await boardFor(req.body.board_id, req.actor);
+    if (!found) return res.status(404).json({ error: 'Board not found' });
+    const name = sanitizeText(req.body.name, 120);
+    if (!name) return res.status(400).json({ error: 'Name the template' });
+    const def = await definitionFromBoard(found.board, req.actor, ['all', 'open'].includes(req.body.with_items) ? req.body.with_items : 'none');
+    const businessId = req.body.for_business && found.board.business_id && found.access.manage ? found.board.business_id : null;
+    const row = (await db.query(
+      'INSERT INTO board_templates (owner_id, business_id, name, description, definition) VALUES ($1, $2, $3, $4, $5) RETURNING id, name',
+      [req.actor.id, businessId, name, sanitizeText(req.body.description, 1000) || '', def]
+    )).rows[0];
+    res.status(201).json({ template: row });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /from-template — { key? (ready-made) | template_id?, name, scope, business_id?, site_id?, privacy?, with_items? }
+router.post('/from-template', authenticate, withActor, async (req, res, next) => {
+  try {
+    let def;
+    let fallbackName;
+    if (req.body.key && BUILT_INS[req.body.key]) {
+      def = BUILT_INS[req.body.key].definition;
+      fallbackName = BUILT_INS[req.body.key].name;
+    } else {
+      const t = (await db.query(
+        'SELECT * FROM board_templates WHERE id = $1 AND archived_at IS NULL AND (owner_id = $2 OR business_id = ANY($3::int[]) OR $4::boolean)',
+        [int(req.body.template_id), req.actor.id, [...req.actor.memberships.keys()], isLeaderActor(req.actor)]
+      )).rows[0];
+      if (!t) return res.status(404).json({ error: 'Template not found' });
+      def = t.definition;
+      fallbackName = t.name;
+    }
+    const problems = checkDefinition(def, columnsCatalog);
+    if (problems.length) return res.status(400).json({ error: `This template cannot be used: ${problems[0]}` });
+    const p = await placementFrom(req.actor, req.body);
+    if (p.error) return res.status(p.status).json({ error: p.error });
+    const name = sanitizeText(req.body.name, 120) || fallbackName;
+    const out = await buildBoard(req.actor, { ...p.place, name }, def, { withItems: req.body.with_items !== false, createTodoCore });
+    await changed(out.board, 'created');
+    res.status(201).json({ board: out.board, items: out.items });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /:id/duplicate — { name?, with_items?: 'none' | 'all' | 'open' } a new board in the same place; the original is untouched.
+router.post('/:id(\\d+)/duplicate', authenticate, withActor, boardParam('view'), async (req, res, next) => {
+  try {
+    const b = req.board;
+    if (!canCreateBoard(req.actor, b.scope, b.business_id)) return res.status(403).json({ error: 'You cannot add boards here' });
+    const withItems = ['all', 'open'].includes(req.body.with_items) ? req.body.with_items : 'none';
+    const def = await definitionFromBoard(b, req.actor, withItems);
+    const name = sanitizeText(req.body.name, 120) || `${b.name} (copy)`;
+    const out = await buildBoard(req.actor, { scope: b.scope, business_id: b.business_id, site_id: b.site_id, privacy: b.privacy, name, description: b.description },
+      def, { withItems: withItems !== 'none', createTodoCore });
+    await changed(out.board, 'created');
+    res.status(201).json({ board: out.board, items: out.items });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /:id/groups/:gid/duplicate — { with_items? } a copy of a group right below it (new items, the old ones stay).
+router.post('/:id(\\d+)/groups/:gid(\\d+)/duplicate', authenticate, withActor, boardParam('add'), async (req, res, next) => {
+  try {
+    const g = (await db.query('SELECT * FROM todo_sections WHERE id = $1 AND board_id = $2', [int(req.params.gid), req.board.id])).rows[0];
+    if (!g) return res.status(404).json({ error: 'Group not found' });
+    await db.query('UPDATE todo_sections SET sort_order = sort_order + 1 WHERE board_id = $1 AND sort_order > $2', [req.board.id, g.sort_order]);
+    const copy = (await db.query(
+      `INSERT INTO todo_sections (list_id, owner_id, business_id, board_id, name, description, sort_order, color)
+       VALUES (NULL, $1, $2, $3, $4, $5, $6, $7) RETURNING id, name, color, sort_order`,
+      [req.actor.id, req.board.business_id, req.board.id, `${g.name} (copy)`.slice(0, 120), g.description || '', g.sort_order + 1, g.color]
+    )).rows[0];
+    let made = 0;
+    if (req.body.with_items) {
+      const items = await listTodos(req.actor.id, { actor: req.actor, where: 't.board_id = $5 AND t.business_section_id = $6 AND t.parent_id IS NULL AND NOT t.is_done', params: [req.board.id, g.id], tail: 'LIMIT 200' });
+      for (const t of items) {
+        const out = await createTodoCore(req.actor, {
+          title: t.title, notes: t.notes || '', priority: t.priority, due_date: t.due_date || undefined, start_date: t.start_date || undefined,
+          board_id: req.board.business_id ? req.board.id : undefined, business_id: req.board.business_id || undefined,
+          business_section_id: req.board.business_id ? copy.id : undefined, assign_to: t.assignee_id || undefined,
+        }, { quiet: true });
+        const id = out.todo?.id || out.id;
+        if (!id) continue;
+        made += 1;
+        if (!req.board.business_id) await db.query('UPDATE todos SET board_id = $1, business_section_id = $2 WHERE id = $3', [req.board.id, copy.id, id]);
+        await db.query(`INSERT INTO item_values (todo_id, column_id, value, updated_by) SELECT $1, column_id, value, $3 FROM item_values WHERE todo_id = $2 ON CONFLICT DO NOTHING`, [id, t.id, req.actor.id]);
+      }
+    }
+    await changed(req.board, 'groups');
+    res.status(201).json({ group: copy, items: made });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /:id/import — { rows: [{ title, group?, due_date?, priority?, values?: { [column title]: raw } }], dry_run? }
+// Creates new items only (it never updates an existing one). A dry run answers what would happen.
+router.post('/:id(\\d+)/import', authenticate, withActor, boardParam('add'), async (req, res, next) => {
+  try {
+    const rows = (Array.isArray(req.body.rows) ? req.body.rows : []).slice(0, 5000);
+    if (!rows.length) return res.status(400).json({ error: 'Nothing to import' });
+    const cols = (await db.query('SELECT * FROM board_columns WHERE board_id = $1 AND archived_at IS NULL AND system_key IS NULL', [req.board.id])).rows;
+    const groups = (await db.query('SELECT id, name FROM todo_sections WHERE board_id = $1 AND NOT archived ORDER BY sort_order', [req.board.id])).rows;
+    const existing = new Set((await db.query('SELECT lower(title) AS t FROM todos WHERE board_id = $1', [req.board.id])).rows.map((r) => r.t));
+    const byTitle = new Map(cols.map((c) => [c.title.toLowerCase(), c]));
+    const labelMaps = new Map();
+    for (const c of cols.filter((x) => x.kind === 'status')) {
+      labelMaps.set(c.id, new Map((await db.query('SELECT id, lower(label) AS l FROM status_labels WHERE column_id = $1 AND archived_at IS NULL', [c.id])).rows.map((r) => [r.l, r.id])));
+    }
+    const plan = rows.map((r, i) => {
+      const title = sanitizeText(r.title, 500);
+      const problems = [];
+      if (!title) problems.push('no name');
+      const values = {};
+      for (const [k, raw] of Object.entries(r.values || {})) {
+        const col = byTitle.get(String(k).toLowerCase());
+        if (!col || raw === '' || raw === null || raw === undefined) continue;
+        let v = raw;
+        if (col.kind === 'status') v = { label_id: labelMaps.get(col.id)?.get(String(raw).toLowerCase()) };
+        if (col.kind === 'dropdown') {
+          const opt = (col.settings?.options || []).find((o) => o.label.toLowerCase() === String(raw).toLowerCase());
+          v = opt ? [opt.id] : '__none__';
+        }
+        const cleaned = cleanValue(col.kind, v, col.settings || {}, col.kind === 'status' ? { labelIds: [...(labelMaps.get(col.id)?.values() || [])] } : {});
+        if (cleaned.error) problems.push(`${col.title}: ${cleaned.error}`); else values[col.id] = cleaned.value;
+      }
+      const group = r.group ? groups.find((g) => g.name.toLowerCase() === String(r.group).toLowerCase()) : null;
+      return { row: i + 1, title, values, group_id: group?.id || groups[0]?.id || null, due_date: r.due_date, priority: r.priority, duplicate: existing.has((title || '').toLowerCase()), problems };
+    });
+    const summary = { rows: plan.length, ok: plan.filter((p) => !p.problems.length).length, with_problems: plan.filter((p) => p.problems.length).length, duplicates: plan.filter((p) => p.duplicate).length };
+    if (req.body.dry_run) return res.json({ summary, problems: plan.filter((p) => p.problems.length).slice(0, 50).map((p) => ({ row: p.row, problems: p.problems })), duplicates: plan.filter((p) => p.duplicate).slice(0, 50).map((p) => ({ row: p.row, title: p.title })) });
+    let made = 0;
+    const skipDuplicates = req.body.skip_duplicates !== false;
+    for (const p of plan) {
+      if (p.problems.length || (skipDuplicates && p.duplicate)) continue;
+      const out = await createTodoCore(req.actor, {
+        title: p.title, due_date: p.due_date || undefined, priority: p.priority || undefined,
+        board_id: req.board.business_id ? req.board.id : undefined, business_id: req.board.business_id || undefined,
+        business_section_id: req.board.business_id ? p.group_id : undefined,
+      }, { quiet: true });
+      const id = out.todo?.id || out.id;
+      if (!id) continue;
+      made += 1;
+      if (!req.board.business_id) await db.query('UPDATE todos SET board_id = $1, business_section_id = $2 WHERE id = $3', [req.board.id, p.group_id, id]);
+      for (const [cid, v] of Object.entries(p.values)) {
+        if (v === null) continue;
+        await db.query('INSERT INTO item_values (todo_id, column_id, value, updated_by) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING', [id, Number(cid), JSON.stringify(v), req.actor.id]);
+      }
+    }
+    await changed(req.board, 'groups');
+    res.status(201).json({ summary, created: made });
+  } catch (err) {
+    next(err);
+  }
 });
 
 router.get('/', authenticate, withActor, async (req, res, next) => {
@@ -702,6 +909,35 @@ router.put('/:id(\\d+)/items/:todoId(\\d+)/values/:cid(\\d+)', authenticate, wit
     await logEvent({ todoId: todo.id, userId: req.actor.id, subjectId: todo.assignee_id, kind: 'value_changed', note: col.title, meta: { column_id: col.id } });
     await announce(todo.id, 'updated');
     res.json({ value: r.value });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /:id/automations — the board's recipe gallery and the viewer's own automations on this board (F-AUT-01).
+router.get('/:id(\\d+)/automations', authenticate, withActor, boardParam('view'), async (req, res, next) => {
+  try {
+    const rows = (await db.query(
+      `SELECT p.id, p.name, p.enabled, p.contexts, p.created_at,
+              (SELECT COUNT(*)::int FROM automation_runs r WHERE r.profile_id = p.id AND r.started_at > NOW() - INTERVAL '30 days') AS runs_30d
+       FROM automation_profiles p WHERE p.owner_id = $1 ORDER BY p.created_at DESC`,
+      [req.actor.id]
+    )).rows;
+    res.json({ recipes: recipeList(), mine: rows.filter((p) => isBoardProfile(p.contexts, req.board.id)).map(({ contexts, ...p }) => p) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /:id/automations — { recipe, params } add a recipe for this board, owned (and run) by the person adding it.
+router.post('/:id(\\d+)/automations', authenticate, withActor, boardParam('view'), async (req, res, next) => {
+  try {
+    const built = buildRecipe(String(req.body.recipe || ''), req.board, req.body.params || {});
+    if (built.error) return res.status(400).json({ error: built.error });
+    const { createFromDoc } = require('./automation');
+    const made = await createFromDoc(req.actor, built, { enabled: true });
+    if (made.error) return res.status(400).json({ error: made.error });
+    res.status(201).json({ profile_id: made.profileId });
   } catch (err) {
     next(err);
   }

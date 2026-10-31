@@ -567,3 +567,4 @@ router.post('/hook/:token', hookLimiter, express.text({ type: 'text/*', limit: '
 router.get('/hook/:token', hookLimiter, hook);
 
 module.exports = router;
+module.exports.createFromDoc = createFromDoc;

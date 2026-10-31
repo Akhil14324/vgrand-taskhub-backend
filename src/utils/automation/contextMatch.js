@@ -111,6 +111,7 @@ function todoFits(ctx, todo, ownerId) {
     if (!mine) return false;
   }
   if (ctx.scope === 'business' && Number(todo.business_id) !== Number(ctx.business_id)) return false;
+  if (ctx.scope === 'board' && Number(todo.board_id) !== Number(ctx.board_id)) return false;
   if (ctx.text && !String(todo.title || '').toLowerCase().includes(String(ctx.text).toLowerCase())) return false;
   if (ctx.label && !(todo.labels || []).map((l) => String(l).toLowerCase()).includes(String(ctx.label).toLowerCase().replace(/^@/, ''))) return false;
   return true;
