@@ -7,6 +7,7 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "migrate": "node src/migrations/run.js",
+    "manifest": "node src/scripts/manifest.js",
     "seed:review": "node src/scripts/seed-review-account.js",
     "test": "node --test"
   },

@@ -27,7 +27,7 @@ const approvalRoutes = require('./routes/approvals');
 const accessRoutes = require('./routes/access');
 const erpRoutes = require('./routes/erp');
 const db = require('./db');
-const { runMigrations } = require('./migrations/run');
+const { runMigrations, pendingMigrations } = require('./migrations/run');
 const { scheduleOverdueNotifications } = require('./jobs/overdueNotifications');
 const { scheduleTodoReminders } = require('./jobs/todoReminders');
 const { scheduleNudges } = require('./jobs/nudges');
@@ -239,7 +239,15 @@ if (require.main === module) {
   (async () => {
     try {
       await waitForConnection();
-      await runMigrations({ autoClose: false });
+      // MIGRATIONS_AUTO=false: never change the schema on boot; run `npm run migrate` by hand
+      // after rehearsing on a copy. Default (unset) keeps the old behaviour.
+      if (process.env.MIGRATIONS_AUTO === 'false') {
+        const pending = await pendingMigrations();
+        if (pending.length) console.warn(`MIGRATIONS_AUTO=false: ${pending.length} migration(s) not applied: ${pending.join(', ')}`);
+        else console.log('MIGRATIONS_AUTO=false: schema is up to date.');
+      } else {
+        await runMigrations({ autoClose: false });
+      }
       server.listen(PORT, () => {
         console.log(`TaskHub backend running on port ${PORT}`);
       });
