@@ -15,6 +15,7 @@ const {
  *
  * Business to-dos follow the chain of command (lower level number = more senior):
  *   - everyone in the business sees them, leadership sees all of them
+ *   - anyone in the business assigns them to anyone else in it (open assignment, no decline)
  *   - the creator, or anyone senior to the creator, edits and deletes
  *   - the assignee (or anyone, when unassigned) does the work; seniors may too
  *   - a senior person reviews finished work and proposals, and may warn the assignee
@@ -107,7 +108,8 @@ function businessPermissions(row, actor) {
     can_request_delete: !canDelete && (isAssignee || inBusiness) && !row.pending_delete_request_id,
     can_change_status: canWork,
     can_hold: canEdit || (manages && !rejected),
-    can_assign: canEdit || (manages && !rejected),
+    // Open assignment: anyone in the business (or leadership) gives its tasks to anyone else in it.
+    can_assign: canEdit || (!rejected && (manages || inBusiness || isLeader(actor))),
     can_approve: canApprove,
     can_review: row.review_state !== 'accepted' && !isCreator && manages && outranksCreator,
     can_warn: canWarn,

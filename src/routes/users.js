@@ -5,7 +5,7 @@ const { authenticate, requireAdmin, requireSuperAdmin } = require('../middleware
 const { sanitizeText, validatePassword } = require('../middleware/sanitize');
 const { USERNAME_PATTERN, USERNAME_RULE, cleanUsername } = require('../utils/mentions');
 const { loadActor, actorBestLevel } = require('../utils/org');
-const { setMemberships, syncLeaderGroups } = require('../services/org');
+const { setMemberships, syncLeaderGroups, deactivateUser } = require('../services/org');
 const { notify } = require('../utils/notify');
 const { cleanFeatures } = require('../utils/features');
 const { cleanBuddy } = require('../utils/buddyProfile');
@@ -207,8 +207,8 @@ router.delete('/:id', authenticate, requireAdmin, async (req, res, next) => {
       return res.status(403).json({ error: 'You can only delete people below you in the hierarchy' });
     }
 
-    await db.query('DELETE FROM users WHERE id = $1', [id]);
-    res.json({ message: 'User deleted successfully' });
+    await deactivateUser(db, parseInt(id, 10));
+    res.json({ message: 'User removed. Their work and history are kept.' });
   } catch (err) {
     next(err);
   }

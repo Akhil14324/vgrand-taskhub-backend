@@ -9,7 +9,7 @@ const { deliverMessage } = require('../services/chatDelivery');
 const { todayInAppZone, nextOccurrence, APP_TIMEZONE } = require('../utils/recurrence');
 const { completionSnapshot } = require('../utils/timeline');
 const {
-  loadActor, actorLevelIn, isLeader, managesBusiness, nextApprovers,
+  loadActor, actorLevelIn, isLeader, managesBusiness, nextApprovers, worksIn,
 } = require('../utils/org');
 const {
   listTodos, getTodoFor, memberIds, audienceIds, descendantIds, depthOf, heightOf,
@@ -456,7 +456,7 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
 
   let reviewState = 'accepted';
   if (parent) reviewState = parent.review_state;
-  else if (businessId && !(isLeader(actor) || managesBusiness(actor, businessId))) reviewState = 'proposed';
+  else if (businessId && !worksIn(actor, businessId)) reviewState = 'proposed';
 
   // "@ravi send the invoice" on a business task: the one other person named in the title is the one who does
   // it, so it lands in their To-do. Several names means shared, with nobody accountable.
@@ -1303,8 +1303,7 @@ router.post('/:id(\\d+)/move-to-business', authenticate, async (req, res, next) 
     if (assignTo && !(await isAssignable(assignTo, businessId))) {
       return res.status(400).json({ error: 'That person is not part of this business' });
     }
-    const manages = isLeader(actor) || managesBusiness(actor, businessId);
-    const reviewState = manages ? 'accepted' : 'proposed';
+    const reviewState = worksIn(actor, businessId) ? 'accepted' : 'proposed';
     const assigneeId = reviewState === 'proposed' ? actor.id : (assignTo || actor.id);
     const sourceBusinessId = !actor.memberships.has(businessId) && !isLeader(actor)
       ? ([...actor.memberships.keys()][0] || null)

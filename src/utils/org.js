@@ -141,6 +141,14 @@ function managesBusiness(actor, businessId) {
   return actorLevelIn(actor, businessId) <= BUSINESS_MANAGER_LEVEL;
 }
 
+/**
+ * Open assignment inside a business: anyone who belongs to it (or leadership) adds tasks there that count
+ * straight away and hands them to anyone else in it. Only someone from outside the business proposes.
+ */
+function worksIn(actor, businessId) {
+  return isLeader(actor) || !!actor?.memberships?.has(Number(businessId)) || managesBusiness(actor, businessId);
+}
+
 /** Level of any user inside a business (single query). */
 async function userLevelIn(userId, businessId) {
   const result = await db.query(
@@ -203,6 +211,7 @@ module.exports = {
   isLeader,
   isPortalAdmin,
   managesBusiness,
+  worksIn,
   userLevelIn,
   userBestLevel,
   nextApprovers,

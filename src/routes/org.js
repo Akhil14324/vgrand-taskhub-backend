@@ -20,7 +20,7 @@ const {
   isPortalAdmin,
   managesBusiness,
 } = require('../utils/org');
-const { generateTempPassword, setMemberships, syncLeaderGroups } = require('../services/org');
+const { generateTempPassword, setMemberships, syncLeaderGroups, deactivateUser } = require('../services/org');
 
 const router = express.Router();
 
@@ -367,8 +367,8 @@ router.delete('/people/:id', authenticate, requirePortal, async (req, res, next)
     if (!(await canManage(req.actor, targetId))) {
       return res.status(403).json({ error: 'You can only remove people below you in the hierarchy' });
     }
-    await db.query('DELETE FROM users WHERE id = $1', [targetId]);
-    res.json({ message: 'Person removed' });
+    if (!(await deactivateUser(db, targetId))) return res.status(404).json({ error: 'Person not found' });
+    res.json({ message: 'Person removed. Their work and history are kept.' });
   } catch (err) {
     next(err);
   }
