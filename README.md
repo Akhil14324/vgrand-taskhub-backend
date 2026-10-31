@@ -95,6 +95,7 @@ Each socket joins `user:<id>` (personal room) on connect and `conv:<id>` rooms v
 - `notification:new` — the stored notification row (personal room)
 - `automation:effect` — `{ kind: 'toast'|'alert'|'sound'|'vibrate'|'speak'|'open'|'open_todo'|'focus', ... }` (personal room; something an automation wants the open app to do) and `automation:run` — `{ id, profileId, status, error }` (a run finished; the Automations screen refreshes)
 - `todo:changed` — `{ todoId, action }` (personal rooms of everyone who can see the to-do: its members and, for a business to-do, the whole business and leadership)
+- `board:changed` — `{ boardId, what }` with `what` one of `created`, `board`, `columns`, `groups`, `views`, `members` (personal rooms of everyone who can see the board). Items on a board still announce themselves with `todo:changed`.
 
 ## REST Endpoints
 

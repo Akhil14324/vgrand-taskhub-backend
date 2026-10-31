@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const { seedOrganization, seedOwner } = require('../seed/organization');
 const { seedStructure } = require('../seed/structure');
+const { backfillBoards } = require('../services/boards');
 
 async function ensureMigrationsTable(directQuery) {
   await directQuery(`
@@ -72,6 +73,8 @@ async function runMigrations({ autoClose = true } = {}) {
   await seedOrganization({ query: directQuery });
   await seedOwner({ query: directQuery });
   await seedStructure({ query: directQuery });
+  // Every business has its default board and every board its default columns (migration 055).
+  await backfillBoards({ query: directQuery });
 
   if (autoClose) {
     await db.directPool.end();

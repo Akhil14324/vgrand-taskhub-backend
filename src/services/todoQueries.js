@@ -15,7 +15,7 @@ const TODO_SELECT = `
          t.priority, t.recurrence, t.is_done, t.done_at, t.done_by, t.created_by, t.created_at, t.updated_at,
          t.parent_id, t.labels, t.deadline_date, t.duration_minutes, t.reminder_offsets,
          t.remind_date, to_char(t.remind_time, 'HH24:MI') AS remind_time, t.remind_repeat, t.business_section_id,
-         t.sprint_id, t.story_points, t.item_type, t.epic_id, t.release_id,
+         t.sprint_id, t.story_points, t.item_type, t.epic_id, t.release_id, t.board_id, t.start_date,
          (SELECT sp.name FROM sprints sp WHERE sp.id = t.sprint_id) AS sprint_name,
          (SELECT ep.name FROM epics ep WHERE ep.id = t.epic_id) AS epic_name,
          (SELECT re.name FROM releases re WHERE re.id = t.release_id) AS release_name,
