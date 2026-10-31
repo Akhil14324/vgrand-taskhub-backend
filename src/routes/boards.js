@@ -707,6 +707,48 @@ router.put('/:id(\\d+)/items/:todoId(\\d+)/values/:cid(\\d+)', authenticate, wit
   }
 });
 
+// GET /:id/activity — { before? } the board's history (F-VIW-13): todo_events of the items the viewer can see,
+// newest first, 100 at a time. Survives deleted items (their title stays in the event).
+router.get('/:id(\\d+)/activity', authenticate, withActor, boardParam('view'), async (req, res, next) => {
+  try {
+    const visible = await listTodos(req.actor.id, { actor: req.actor, where: 't.board_id = $5', params: [req.board.id] });
+    const ids = visible.map((t) => t.id);
+    if (!ids.length) return res.json({ events: [] });
+    const before = parseInt(req.query.before, 10) || null;
+    const rows = (await db.query(
+      `SELECT e.id, e.todo_id, e.kind, e.from_value, e.to_value, e.note, e.created_at,
+              u.name AS user_name, s.name AS subject_name, t.title AS todo_title
+       FROM todo_events e
+       LEFT JOIN users u ON u.id = e.user_id
+       LEFT JOIN users s ON s.id = e.subject_id
+       LEFT JOIN todos t ON t.id = e.todo_id
+       WHERE e.todo_id = ANY($1::int[]) AND ($2::int IS NULL OR e.id < $2)
+       ORDER BY e.id DESC LIMIT 100`,
+      [ids, before]
+    )).rows;
+    res.json({ events: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /:id/dependencies — "this item waits for that one" pairs among the board's items (Gantt arrows).
+router.get('/:id(\\d+)/dependencies', authenticate, withActor, boardParam('view'), async (req, res, next) => {
+  try {
+    const visible = await listTodos(req.actor.id, { actor: req.actor, where: 't.board_id = $5', params: [req.board.id] });
+    const ids = visible.map((t) => t.id);
+    if (!ids.length) return res.json({ links: [] });
+    const rows = (await db.query(
+      `SELECT todo_id, blocked_by_todo_id, resolved_at IS NOT NULL AS resolved FROM todo_blockers
+       WHERE kind = 'dependency' AND todo_id = ANY($1::int[]) AND blocked_by_todo_id = ANY($1::int[])`,
+      [ids]
+    )).rows;
+    res.json({ links: rows.map((r) => ({ from: r.blocked_by_todo_id, to: r.todo_id, resolved: r.resolved })) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /:id/columns/:cid/ai-fill — { item_ids } fill an AI column from its source columns (OpenAI only, F-MORE-01).
 const AI_PROMPTS = {
   summarize: 'Summarise the item in one short plain sentence.',
