@@ -180,16 +180,50 @@ const EMPTY_COMPLETION = {
   on_time_rate: null, estimate_ratio: null,
 };
 
+/**
+ * Steps (events): the lowest-level sub-tasks under each person's open tasks (processes). A task is only "done"
+ * when all its steps are, so the overview counts the steps as well: how many exist, how many are finished, and
+ * how many were finished in the period. A sub-task that has its own sub-tasks is not a step, its sub-tasks are.
+ */
+async function stepStats(userIds, days) {
+  const live = await db.query(
+    `WITH RECURSIVE tree AS (
+       SELECT t.id, t.id AS root, t.assignee_id, t.is_done FROM todos t
+       WHERE t.parent_id IS NULL AND NOT t.is_done AND t.assignee_id = ANY($1::int[])
+       UNION ALL
+       SELECT c.id, tree.root, tree.assignee_id, c.is_done FROM todos c JOIN tree ON c.parent_id = tree.id
+     ), leaves AS (
+       SELECT * FROM tree WHERE id <> root AND NOT EXISTS (SELECT 1 FROM todos k WHERE k.parent_id = tree.id)
+     )
+     SELECT assignee_id AS user_id, COUNT(*)::int AS total, COUNT(*) FILTER (WHERE is_done)::int AS done,
+            COUNT(DISTINCT root)::int AS processes
+     FROM leaves GROUP BY assignee_id`,
+    [userIds]
+  );
+  const finished = await db.query(
+    `SELECT subject_id AS user_id, COUNT(*)::int AS n FROM todo_events
+     WHERE kind = 'completed' AND subject_id = ANY($1::int[]) AND created_at > NOW() - make_interval(days => $2)
+       AND COALESCE((meta->>'is_subtask')::boolean, FALSE) = TRUE
+     GROUP BY subject_id`,
+    [userIds, days]
+  );
+  const out = new Map(userIds.map((id) => [id, { total: 0, done: 0, processes: 0, finished: 0 }]));
+  for (const r of live.rows) Object.assign(out.get(r.user_id) || {}, { total: r.total, done: r.done, processes: r.processes });
+  for (const r of finished.rows) if (out.has(r.user_id)) out.get(r.user_id).finished = r.n;
+  return out;
+}
+
 /** Per-person numbers for the overview list. */
 async function statsForPeople(userIds, days) {
   if (!userIds.length) return new Map();
-  const [open, done] = await Promise.all([openStats(userIds), completionStats(userIds, days)]);
+  const [open, done, steps] = await Promise.all([openStats(userIds), completionStats(userIds, days), stepStats(userIds, days)]);
   const out = new Map();
   for (const id of userIds) {
     out.set(id, {
       ...open.get(id),
       ...(done.map.get(id) || EMPTY_COMPLETION),
       reschedules: done.resched.get(id) || 0,
+      steps: steps.get(id),
     });
   }
   return out;
@@ -213,6 +247,12 @@ function teamTotals(statsByPerson) {
     blocked: sum('blocked'),
     completed: sum('completed'),
     reschedules: sum('reschedules'),
+    steps: {
+      total: all.reduce((s, x) => s + (x.steps?.total || 0), 0),
+      done: all.reduce((s, x) => s + (x.steps?.done || 0), 0),
+      finished: all.reduce((s, x) => s + (x.steps?.finished || 0), 0),
+      processes: all.reduce((s, x) => s + (x.steps?.processes || 0), 0),
+    },
     health: {
       green: all.reduce((s, x) => s + x.health.green, 0),
       orange: all.reduce((s, x) => s + x.health.orange, 0),

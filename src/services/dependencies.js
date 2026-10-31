@@ -64,14 +64,19 @@ async function followDueChange(todo, from, to, actorId) {
  * before what it waits for ends is moved to the day after (keeping its length).
  * Returns { ok, error?, moved }.
  */
-async function setDependencies(todo, ids, actorId) {
+async function setDependencies(todo, ids, actorId, allowedIds = null) {
   const wanted = [...new Set((ids || []).map((x) => parseInt(x, 10)).filter(Boolean))];
   if (wanted.includes(todo.id)) return { ok: false, error: 'A task cannot wait for itself' };
   if (wanted.length) {
-    const found = (await db.query(
-      'SELECT id, due_date FROM todos WHERE id = ANY($1::int[]) AND board_id IS NOT DISTINCT FROM $2', [wanted, todo.board_id]
-    )).rows;
-    if (found.length !== wanted.length) return { ok: false, error: 'Pick tasks from this board' };
+    // The caller says which tasks the person may pick (the ones they see on this board); without it, same board only.
+    if (allowedIds) {
+      if (wanted.some((w) => !allowedIds.has(w))) return { ok: false, error: 'Pick tasks from this board' };
+    } else {
+      const found = (await db.query(
+        'SELECT id FROM todos WHERE id = ANY($1::int[]) AND board_id IS NOT DISTINCT FROM $2', [wanted, todo.board_id]
+      )).rows;
+      if (found.length !== wanted.length) return { ok: false, error: 'Pick tasks from this board' };
+    }
     // A loop: one of the picks (or anything it waits for) already waits for this task.
     const below = new Set(await dependentsOf(todo.id));
     if (wanted.some((w) => below.has(w))) return { ok: false, error: 'That would make a loop: it already waits for this task' };

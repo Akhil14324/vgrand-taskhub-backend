@@ -150,6 +150,12 @@ A private notepad (migration 060): only the person who wrote a note sees it.
 - `GET /` (`?q=` searches title and text; pinned first), `POST /` `{ title?, body? }`, `GET|PATCH|DELETE /:id` (`PATCH` takes `title`, `body`, `pinned`; delete hides the note)
 - `POST /:id/images` (multipart `file`, pictures only, stored like to-do files) and `DELETE /:id/images/:imageId`
 
+### My to-dos board (`/api/boards`, migration 061)
+Each person has one board of `kind: 'my_todos'`, created when their boards are first listed. `GET /:id` returns the personal to-dos the person is on (no `board_id` needed), grouped by their lists (`groups` are `todo_lists`; an item's `business_section_id` is its `list_id`). `POST /:id/groups` makes a list, `PATCH /:id/groups/:gid` renames or recolours one, and `POST /:id/items` with `group_id` adds to that list.
+
+### Steps in the team monitor (`/api/monitor`)
+`GET /overview` and `GET /people/:id` add `stats.steps = { total, done, processes, finished }`: the lowest-level sub-tasks under the person's open tasks (total and done), the number of open tasks that have steps, and the steps finished in the period. `team.steps` is the sum.
+
 ### Task dependencies (`/api/boards`)
 - `PUT /:id/items/:todoId/depends-on` `{ ids }` replaces what a task waits for (same board, no loops). A task that would start on or before the day what it waits for ends is moved to the day after, together with everything that waits for it.
 - When a task's `due_date` changes through `PUT /api/todos/:id`, every task that waits for it (any depth) moves by the same number of days and gets a timeline entry. `todo.depends_on` lists `{ id, title, due_date, is_done }`. `GET /:id/dependencies` returns the arrows for the Gantt.

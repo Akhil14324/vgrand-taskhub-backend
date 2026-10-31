@@ -90,6 +90,16 @@ async function changed(board, what, extra = {}) {
   emitToUsers(await boardAudience(board), 'board:changed', { boardId: board.id, what, ...extra });
 }
 
+// "My to-dos" (kind 'my_todos', migration 061): a board over the personal to-dos the viewer is on, whose groups
+// are the viewer's own lists. Nothing is stored on the to-dos; every other board lists the items with its board_id.
+const isMine = (board) => board.kind === 'my_todos';
+/** WHERE / params (from $5) for "the items of this board", plus an optional extra condition using $6... */
+function boardItems(board, extra = '', extraParams = []) {
+  if (isMine(board)) return { where: `t.business_id IS NULL AND tm.user_id IS NOT NULL AND $5::int > 0${extra ? ` AND ${extra}` : ''}`, params: [board.id, ...extraParams] };
+  return { where: `t.board_id = $5${extra ? ` AND ${extra}` : ''}`, params: [board.id, ...extraParams] };
+}
+const onBoard = (todo, board) => todo.board_id === board.id || (isMine(board) && !todo.business_id);
+
 const color = (c, fallback = null) => (COLOR_NAMES.includes(c) ? c : fallback);
 const int = (v) => (Number.isInteger(v) ? v : parseInt(v, 10) || null);
 
@@ -439,10 +449,13 @@ router.get('/:id(\\d+)', authenticate, withActor, boardParam('view'), async (req
          WHERE c.board_id = $1 AND l.archived_at IS NULL ORDER BY l.sort_order, l.id`,
         [board.id]
       ),
-      db.query(
-        'SELECT id, name, description, color, sort_order, archived FROM todo_sections WHERE board_id = $1 AND NOT archived ORDER BY sort_order, id',
-        [board.id]
-      ),
+      isMine(board)
+        ? db.query(`SELECT id, name, '' AS description, color, sort_order, FALSE AS archived FROM todo_lists WHERE owner_id = $1 ORDER BY sort_order, id`, [actor.id])
+          .then((r) => ({ rows: r.rows.map((g) => ({ ...g, color: COLOR_NAMES.includes(g.color) ? g.color : 'blue' })) }))
+        : db.query(
+          'SELECT id, name, description, color, sort_order, archived FROM todo_sections WHERE board_id = $1 AND NOT archived ORDER BY sort_order, id',
+          [board.id]
+        ),
       db.query(
         `SELECT * FROM board_views WHERE board_id = $1 AND archived_at IS NULL AND (owner_id IS NULL OR owner_id = $2)
          ORDER BY sort_order, id`,
@@ -450,12 +463,18 @@ router.get('/:id(\\d+)', authenticate, withActor, boardParam('view'), async (req
       ),
     ]);
     // Items: open ones, and finished ones from the last 60 days (older finished work stays in Completed / search).
-    const items = await listTodos(actor.id, {
+    const mine = isMine(board);
+    const scope = boardItems(board, `(NOT t.is_done OR t.done_at > NOW() - INTERVAL '60 days')`);
+    let items = await listTodos(actor.id, {
       actor,
-      where: `t.board_id = $5 AND (NOT t.is_done OR t.done_at > NOW() - INTERVAL '60 days')`,
-      params: [board.id],
-      tail: 'ORDER BY t.business_section_id NULLS FIRST, COALESCE(bo.position, tm.sort_order, 0), t.created_at',
+      where: scope.where,
+      params: scope.params,
+      tail: mine
+        ? 'ORDER BY tm.list_id NULLS FIRST, COALESCE(bo.position, tm.sort_order, 0), t.created_at'
+        : 'ORDER BY t.business_section_id NULLS FIRST, COALESCE(bo.position, tm.sort_order, 0), t.created_at',
     });
+    // On "My to-dos" a group is one of the person's lists.
+    if (mine) items = items.map((t) => (t.parent_id ? t : { ...t, business_section_id: t.list_id || null }));
     const ids = items.map((t) => t.id);
     const values = {};
     if (ids.length) {
@@ -738,6 +757,16 @@ router.post('/:id(\\d+)/groups', authenticate, withActor, boardParam('add'), asy
     const board = req.board;
     const name = sanitizeText(req.body.name, 120);
     if (!name) return res.status(400).json({ error: 'Name the group' });
+    if (isMine(board)) {
+      // On "My to-dos" a group is a list of the person's own.
+      const order = (await db.query('SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM todo_lists WHERE owner_id = $1', [req.actor.id])).rows[0].n;
+      const list = (await db.query(
+        `INSERT INTO todo_lists (owner_id, name, color, sort_order) VALUES ($1, $2, $3, $4) RETURNING id, name, '' AS description, color, sort_order, FALSE AS archived`,
+        [req.actor.id, name, color(req.body.color, 'blue'), order]
+      )).rows[0];
+      await changed(board, 'groups');
+      return res.status(201).json({ group: list });
+    }
     const position = int(req.body.position);
     let order;
     if (position) {
@@ -760,6 +789,19 @@ router.post('/:id(\\d+)/groups', authenticate, withActor, boardParam('add'), asy
 
 router.patch('/:id(\\d+)/groups/:gid(\\d+)', authenticate, withActor, boardParam('add'), async (req, res, next) => {
   try {
+    if (isMine(req.board)) {
+      if (req.body.archived) return res.status(400).json({ error: 'Lists are archived or deleted from To-do' });
+      const list = (await db.query('SELECT * FROM todo_lists WHERE id = $1 AND owner_id = $2', [int(req.params.gid), req.actor.id])).rows[0];
+      if (!list) return res.status(404).json({ error: 'Group not found' });
+      const name = req.body.name !== undefined ? sanitizeText(req.body.name, 120) : list.name;
+      if (!name) return res.status(400).json({ error: 'Name the group' });
+      const updated = (await db.query(
+        `UPDATE todo_lists SET name = $2, color = $3 WHERE id = $1 RETURNING id, name, '' AS description, color, sort_order, FALSE AS archived`,
+        [list.id, name, req.body.color !== undefined ? color(req.body.color, list.color) : list.color]
+      )).rows[0];
+      await changed(req.board, 'groups');
+      return res.json({ group: updated });
+    }
     const group = (await db.query('SELECT * FROM todo_sections WHERE id = $1 AND board_id = $2', [int(req.params.gid), req.board.id])).rows[0];
     if (!group) return res.status(404).json({ error: 'Group not found' });
     // Renaming and recolouring is for anyone who fills the board; archiving a group is for those who run it.
@@ -784,7 +826,8 @@ router.patch('/:id(\\d+)/groups/:gid(\\d+)', authenticate, withActor, boardParam
 
 router.put('/:id(\\d+)/groups/order', authenticate, withActor, boardParam('add'), async (req, res, next) => {
   try {
-    await reorder('todo_sections', req.body.ids, 'board_id = $3', [req.board.id]);
+    if (isMine(req.board)) await reorder('todo_lists', req.body.ids, 'owner_id = $3', [req.actor.id]);
+    else await reorder('todo_sections', req.body.ids, 'board_id = $3', [req.board.id]);
     await changed(req.board, 'groups');
     res.json({ ok: true });
   } catch (err) {
@@ -833,11 +876,14 @@ router.post('/:id(\\d+)/items', authenticate, withActor, boardParam('add'), asyn
     const board = req.board;
     const groupId = int(req.body.group_id);
     if (groupId) {
-      const ok = await db.query('SELECT 1 FROM todo_sections WHERE id = $1 AND board_id = $2 AND NOT archived', [groupId, board.id]);
+      const ok = isMine(board)
+        ? await db.query('SELECT 1 FROM todo_lists WHERE id = $1 AND owner_id = $2', [groupId, req.actor.id])
+        : await db.query('SELECT 1 FROM todo_sections WHERE id = $1 AND board_id = $2 AND NOT archived', [groupId, board.id]);
       if (!ok.rows.length) return res.status(404).json({ error: 'Group not found' });
     }
     const body = {
       ...req.body,
+      list_id: isMine(board) && groupId ? groupId : req.body.list_id,
       board_id: req.body.parent_id ? undefined : board.id,
       business_id: board.business_id || undefined,
       business_section_id: board.business_id ? groupId : undefined,
@@ -847,7 +893,7 @@ router.post('/:id(\\d+)/items', authenticate, withActor, boardParam('add'), asyn
     const result = await createTodoCore(req.actor, body);
     if (result.error) return res.status(result.status || 400).json({ error: result.error });
     const todoId = result.todo?.id || result.id;
-    if (!board.business_id && groupId && todoId) {
+    if (!board.business_id && !isMine(board) && groupId && todoId) {
       await db.query('UPDATE todos SET business_section_id = $1 WHERE id = $2', [groupId, todoId]);
     }
     // Custom values given with the new item ({ columnId: value }); built-in fields go in the body above.
@@ -880,7 +926,7 @@ router.put('/:id(\\d+)/items/:todoId(\\d+)/values/:cid(\\d+)', authenticate, wit
       return res.status(403).json({ error: 'Only the people who run this board can change this column' });
     }
     const todo = await getTodoFor(req.params.todoId, req.actor.id, req.actor);
-    if (!todo || todo.board_id !== req.board.id) return res.status(404).json({ error: 'Item not found' });
+    if (!todo || !onBoard(todo, req.board)) return res.status(404).json({ error: 'Item not found' });
     // A vote is everyone's own: { vote: true | false } adds or takes back the voter's vote only.
     if (col.kind === 'vote') {
       if (!req.boardAccess.view) return res.status(403).json({ error: 'You cannot vote here' });
@@ -948,7 +994,8 @@ router.post('/:id(\\d+)/automations', authenticate, withActor, boardParam('view'
 // newest first, 100 at a time. Survives deleted items (their title stays in the event).
 router.get('/:id(\\d+)/activity', authenticate, withActor, boardParam('view'), async (req, res, next) => {
   try {
-    const visible = await listTodos(req.actor.id, { actor: req.actor, where: 't.board_id = $5', params: [req.board.id] });
+    const scope = boardItems(req.board);
+    const visible = await listTodos(req.actor.id, { actor: req.actor, where: scope.where, params: scope.params });
     const ids = visible.map((t) => t.id);
     if (!ids.length) return res.json({ events: [] });
     const before = parseInt(req.query.before, 10) || null;
@@ -975,9 +1022,11 @@ router.get('/:id(\\d+)/activity', authenticate, withActor, boardParam('view'), a
 router.put('/:id(\\d+)/items/:todoId(\\d+)/depends-on', authenticate, withActor, boardParam('view'), async (req, res, next) => {
   try {
     const todo = await getTodoFor(int(req.params.todoId), req.actor.id, req.actor);
-    if (!todo || todo.board_id !== req.board.id) return res.status(404).json({ error: 'Task not found on this board' });
+    if (!todo || !onBoard(todo, req.board)) return res.status(404).json({ error: 'Task not found on this board' });
     if (!todo.permissions?.can_edit) return res.status(403).json({ error: 'You cannot change this task' });
-    const result = await setDependencies(todo, req.body.ids, req.actor.id);
+    const scope = boardItems(req.board);
+    const visible = await listTodos(req.actor.id, { actor: req.actor, where: scope.where, params: scope.params });
+    const result = await setDependencies(todo, req.body.ids, req.actor.id, new Set(visible.map((t) => t.id)));
     if (!result.ok) return res.status(400).json({ error: result.error });
     const fresh = await getTodoFor(todo.id, req.actor.id, req.actor);
     await changed(req.board, 'items', { todoId: todo.id });
@@ -990,7 +1039,8 @@ router.put('/:id(\\d+)/items/:todoId(\\d+)/depends-on', authenticate, withActor,
 // GET /:id/dependencies — "this item waits for that one" pairs among the board's items (Gantt arrows).
 router.get('/:id(\\d+)/dependencies', authenticate, withActor, boardParam('view'), async (req, res, next) => {
   try {
-    const visible = await listTodos(req.actor.id, { actor: req.actor, where: 't.board_id = $5', params: [req.board.id] });
+    const scope = boardItems(req.board);
+    const visible = await listTodos(req.actor.id, { actor: req.actor, where: scope.where, params: scope.params });
     const ids = visible.map((t) => t.id);
     if (!ids.length) return res.json({ links: [] });
     const rows = (await db.query(
