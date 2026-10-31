@@ -15,7 +15,7 @@ test('every recipe is valid as shipped', () => {
 });
 
 test('every context and action has a label and a group, and fields that the editor knows', () => {
-  const types = new Set(['text', 'textarea', 'number', 'select', 'bool', 'time', 'days', 'date', 'person', 'business', 'task', 'priority', 'status', 'label', 'cond', 'expr']);
+  const types = new Set(['text', 'textarea', 'number', 'select', 'bool', 'time', 'days', 'date', 'person', 'business', 'board', 'task', 'priority', 'status', 'label', 'cond', 'expr']);
   for (const [name, spec] of [...Object.entries(CONTEXTS), ...Object.entries(ACTIONS)]) {
     assert.ok(spec.label && spec.group, name);
     for (const f of spec.fields) assert.ok(types.has(f.type), `${name}.${f.key} has type ${f.type}`);

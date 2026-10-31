@@ -17,6 +17,7 @@ const {
 const {
   MAX_DEPTH, isAssignable, businessMemberIds, clearWarnings, reviewersFor,
 } = require('../services/todoGovernance');
+const { boardFor, defaultBoardFor } = require('../services/boards');
 const {
   logEvent, setStatus, resolveOpenBlockers, assignTodo, releaseDependents,
 } = require('../services/todoTimeline');
@@ -485,6 +486,21 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
     sourceBusinessId = [...actor.memberships.keys()][0] || null;
   }
 
+  // Board (migration 055): a sub-task sits on its parent's board; a named board must be one the person can
+  // add to and of the same business (or a personal / group board for a personal to-do); a business task
+  // with no board named lands on its business's default board.
+  let boardId = parent ? (parent.board_id || null) : null;
+  const wantedBoard = parent ? null : (parseInt(body.board_id, 10) || null);
+  if (wantedBoard) {
+    const found = await boardFor(wantedBoard, actor);
+    if (!found || !found.access.add || found.board.archived_at) return { status: 403, error: 'You cannot add to that board' };
+    if ((found.board.business_id || null) !== (businessId || null)) return { status: 400, error: 'That board belongs somewhere else' };
+    boardId = found.board.id;
+  } else if (!parent && businessId) {
+    boardId = await defaultBoardFor(db, businessId);
+  }
+  const startDate = parseDate(body.start_date);
+
   const recurrence = RECURRENCES.includes(body.recurrence) ? body.recurrence : null;
   const dueDate = parseDate(body.due_date) || (recurrence ? todayInAppZone() : null);
   const dueTime = parseTime(body.due_time);
@@ -507,6 +523,9 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
     ]
   );
   const todo = inserted.rows[0];
+  if (boardId || startDate) {
+    await db.query('UPDATE todos SET board_id = $1, start_date = $2 WHERE id = $3', [boardId, startDate, todo.id]);
+  }
   const wantedSection = businessId && !parent ? (parseInt(body.business_section_id, 10) || null) : null;
   if (wantedSection) {
     await db.query(
@@ -543,7 +562,8 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
 
   if (delegate) {
     const urgent = parsePriority(body.priority) === 1 ? 'Urgent: ' : '';
-    for (const person of delegates) {
+    // `quiet`: the caller tells each person once for a whole batch (meeting drafts).
+    for (const person of quiet ? [] : delegates) {
       const others = delegates.filter((p) => p.id !== person.id).map((p) => p.name.split(' ')[0]);
       await notify([person.id], {
         type: 'todo_assigned',
@@ -736,6 +756,7 @@ router.put('/:id(\\d+)', authenticate, async (req, res, next) => {
       : existing.recurrence;
     const labels = req.body.labels !== undefined ? parseLabels(req.body.labels) : existing.labels;
     const deadline = req.body.deadline_date !== undefined ? parseDate(req.body.deadline_date) : existing.deadline_date;
+    const startDate = req.body.start_date !== undefined ? parseDate(req.body.start_date) : (existing.start_date || null);
     const duration = req.body.duration_minutes !== undefined ? parseDuration(req.body.duration_minutes) : existing.duration_minutes;
     const offsets = dueTime
       ? (req.body.reminder_offsets !== undefined ? parseOffsets(req.body.reminder_offsets) : existing.reminder_offsets)
@@ -813,12 +834,15 @@ router.put('/:id(\\d+)', authenticate, async (req, res, next) => {
          reminders_sent = CASE WHEN $11::boolean OR $12::boolean THEN '{}'::int[] ELSE reminders_sent END,
          remind_date = $15, remind_time = $16, remind_repeat = $17,
          remind_sent_at = CASE WHEN $18::boolean THEN NULL ELSE remind_sent_at END,
-         business_section_id = $19
+         business_section_id = $19, start_date = $20
        WHERE id = $13`,
       [title, notes || '', dueDate, dueTime, priority, recurrence, labels, deadline, duration, offsets,
         scheduleChanged, offsetsChanged, existing.id, requiresApproval,
-        remind.date, remind.time, remind.repeat, remindChanged, businessSectionId]
+        remind.date, remind.time, remind.repeat, remindChanged, businessSectionId, startDate]
     );
+    if (startDate !== (existing.start_date || null)) {
+      await logEvent({ todoId: existing.id, userId: actor.id, subjectId: existing.assignee_id, kind: 'start_changed', from: existing.start_date || null, to: startDate });
+    }
     if (newParent !== undefined) {
       await db.query('UPDATE todos SET parent_id = $1 WHERE id = $2', [newParent, existing.id]);
     }
@@ -1001,6 +1025,17 @@ router.post('/:id(\\d+)/toggle', authenticate, async (req, res, next) => {
     }
     if (existing.review_state !== 'accepted') {
       return res.status(400).json({ error: 'This is still waiting for review' });
+    }
+    // Required board columns (F-MORE-04): an item is not finished while one of them is still empty.
+    if (!existing.is_done && existing.status !== 'in_review' && existing.board_id) {
+      const empty = (await db.query(
+        `SELECT c.title FROM board_columns c
+         WHERE c.board_id = $1 AND c.archived_at IS NULL AND c.system_key IS NULL AND (c.settings->>'required')::boolean
+           AND NOT EXISTS (SELECT 1 FROM item_values v WHERE v.column_id = c.id AND v.todo_id = $2)
+         ORDER BY c.sort_order`,
+        [existing.board_id, existing.id]
+      )).rows.map((r) => r.title);
+      if (empty.length) return res.status(400).json({ error: `Fill ${empty.join(', ')} before marking it done` });
     }
 
     let rolledTo = null;
@@ -1320,6 +1355,8 @@ router.post('/:id(\\d+)/move-to-business', authenticate, async (req, res, next) 
       `UPDATE todos SET assignee_id = $1::int, assigned_at = COALESCE(assigned_at, NOW()) WHERE id = $2`,
       [assigneeId, existing.id]
     );
+    // Onto the business's default board, sub-tasks included (migration 055).
+    await db.query('UPDATE todos SET board_id = $1 WHERE id = ANY($2::int[])', [await defaultBoardFor(db, businessId), all]);
     // A business task is seen through the business, not through anybody's own lists.
     await db.query('UPDATE todo_members SET list_id = NULL, section_id = NULL WHERE todo_id = ANY($1::int[])', [all]);
     await ensureMember(existing.id, assigneeId, actor.id, { withDescendants: true });

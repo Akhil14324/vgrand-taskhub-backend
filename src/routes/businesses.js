@@ -3,6 +3,7 @@ const { loadActor } = require('../utils/org');
 const db = require('../db');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
+const { defaultBoardFor } = require('../services/boards');
 
 const router = express.Router();
 
@@ -161,6 +162,9 @@ router.post('/', authenticate, requireManageBusinesses, async (req, res, next) =
     );
 
     const business = result.rows[0];
+    // Part of the group, with its main board ready (migrations 053, 055).
+    await db.query('UPDATE businesses SET group_id = (SELECT MIN(id) FROM org_groups) WHERE id = $1 AND group_id IS NULL', [business.id]);
+    await defaultBoardFor(db, business.id);
 
     try {
       await createBusinessGroup(business.id, business.name, req.user.id);
@@ -220,7 +224,8 @@ router.delete('/:id', authenticate, requireManageBusinesses, async (req, res, ne
             + (SELECT COUNT(*) FROM sprints WHERE business_id = $1)
             + (SELECT COUNT(*) FROM goals WHERE business_id = $1)
             + (SELECT COUNT(*) FROM approvals WHERE business_id = $1)
-            + (SELECT COUNT(*) FROM tasks WHERE business_id = $1) AS n`,
+            + (SELECT COUNT(*) FROM tasks WHERE business_id = $1)
+            + (SELECT COUNT(*) FROM boards WHERE business_id = $1 AND NOT is_default) AS n`,
       [id]
     )).rows[0];
     if (Number(used?.n) > 0) {

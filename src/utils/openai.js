@@ -77,11 +77,13 @@ async function visionJSON({ system, user, imageUrl, maxTokens = 1500 }) {
 }
 
 /** Speech to text for one audio file (webm, mp4, m4a, wav ... up to 25 MB). Returns the text. */
-async function transcribe(buffer, filename = 'audio.webm', mime = 'audio/webm') {
+// `prompt` is a spelling hint for the transcriber: the names of people, companies and places it will hear.
+async function transcribe(buffer, filename = 'audio.webm', mime = 'audio/webm', { prompt } = {}) {
   if (!configured()) throw notConfigured();
   const form = new FormData();
   form.append('file', new Blob([buffer], { type: mime }), filename);
   form.append('model', TRANSCRIBE_MODEL());
+  if (prompt) form.append('prompt', String(prompt).slice(0, 800));
   const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
