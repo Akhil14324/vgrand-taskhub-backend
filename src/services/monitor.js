@@ -10,6 +10,7 @@ const {
   actorLevelIn,
 } = require('../utils/org');
 const { APP_TIMEZONE } = require('../utils/recurrence');
+const { openProcesses } = require('./processes');
 const { todoHealth } = require('../utils/timeline');
 
 /**
@@ -186,30 +187,33 @@ const EMPTY_COMPLETION = {
  * how many were finished in the period. A sub-task that has its own sub-tasks is not a step, its sub-tasks are.
  */
 async function stepStats(userIds, days) {
-  const live = await db.query(
-    `WITH RECURSIVE tree AS (
-       SELECT t.id, t.id AS root, t.assignee_id, t.is_done FROM todos t
-       WHERE t.parent_id IS NULL AND NOT t.is_done AND t.assignee_id = ANY($1::int[])
-       UNION ALL
-       SELECT c.id, tree.root, tree.assignee_id, c.is_done FROM todos c JOIN tree ON c.parent_id = tree.id
-     ), leaves AS (
-       SELECT * FROM tree WHERE id <> root AND NOT EXISTS (SELECT 1 FROM todos k WHERE k.parent_id = tree.id)
-     )
-     SELECT assignee_id AS user_id, COUNT(*)::int AS total, COUNT(*) FILTER (WHERE is_done)::int AS done,
-            COUNT(DISTINCT root)::int AS processes
-     FROM leaves GROUP BY assignee_id`,
-    [userIds]
-  );
-  const finished = await db.query(
-    `SELECT subject_id AS user_id, COUNT(*)::int AS n FROM todo_events
-     WHERE kind = 'completed' AND subject_id = ANY($1::int[]) AND created_at > NOW() - make_interval(days => $2)
-       AND COALESCE((meta->>'is_subtask')::boolean, FALSE) = TRUE
-     GROUP BY subject_id`,
-    [userIds, days]
-  );
-  const out = new Map(userIds.map((id) => [id, { total: 0, done: 0, processes: 0, finished: 0 }]));
-  for (const r of live.rows) Object.assign(out.get(r.user_id) || {}, { total: r.total, done: r.done, processes: r.processes });
+  const [processes, finished] = await Promise.all([
+    openProcesses({ userIds }),
+    db.query(
+      `SELECT subject_id AS user_id, COUNT(*)::int AS n FROM todo_events
+       WHERE kind = 'completed' AND subject_id = ANY($1::int[]) AND created_at > NOW() - make_interval(days => $2)
+         AND COALESCE((meta->>'is_subtask')::boolean, FALSE) = TRUE
+       GROUP BY subject_id`,
+      [userIds, days]
+    ),
+  ]);
+  const out = new Map(userIds.map((id) => [id, { total: 0, done: 0, processes: 0, finished: 0, pct: null, stalled: 0, _w: 0, _g: 0 }]));
+  for (const p of processes) {
+    const o = out.get(p.assignee_id);
+    if (!o) continue;
+    o.total += p.total;
+    o.done += p.done;
+    o.processes += 1;
+    if (p.stalled) o.stalled += 1;
+    o._w += p.total; // weight each process by its number of steps when averaging their time-weighted progress
+    o._g += p.pct * p.total;
+  }
   for (const r of finished.rows) if (out.has(r.user_id)) out.get(r.user_id).finished = r.n;
+  for (const o of out.values()) {
+    o.pct = o._w ? Math.round(o._g / o._w) : null;
+    delete o._w;
+    delete o._g;
+  }
   return out;
 }
 
@@ -252,6 +256,11 @@ function teamTotals(statsByPerson) {
       done: all.reduce((s, x) => s + (x.steps?.done || 0), 0),
       finished: all.reduce((s, x) => s + (x.steps?.finished || 0), 0),
       processes: all.reduce((s, x) => s + (x.steps?.processes || 0), 0),
+      stalled: all.reduce((s, x) => s + (x.steps?.stalled || 0), 0),
+      pct: (() => {
+        const w = all.reduce((s, x) => s + (x.steps?.total || 0), 0);
+        return w ? Math.round(all.reduce((s, x) => s + (x.steps?.pct || 0) * (x.steps?.total || 0), 0) / w) : null;
+      })(),
     },
     health: {
       green: all.reduce((s, x) => s + x.health.green, 0),

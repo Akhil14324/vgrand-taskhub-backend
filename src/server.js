@@ -45,6 +45,7 @@ const { scheduleChatRetention } = require('./jobs/chatRetention');
 const { scheduleChasing } = require('./jobs/chasing');
 const { scheduleWorkflows } = require('./jobs/workflows');
 const { scheduleRisk } = require('./jobs/risk');
+const { scheduleProcessAlerts } = require('./jobs/processAlerts');
 const { scheduleDailyBrief } = require('./jobs/dailyBrief');
 const { scheduleErpApprovals } = require('./jobs/erpApprovals');
 const engageRoutes = require('./routes/engage');
@@ -277,6 +278,7 @@ if (require.main === module) {
       scheduleChasing();
       scheduleWorkflows();
       scheduleRisk();
+      scheduleProcessAlerts();
       scheduleDailyBrief();
       scheduleErpApprovals();
       automationEngine.start();
