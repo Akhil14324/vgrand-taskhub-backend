@@ -60,6 +60,8 @@ async function main() {
   await client.connect();
   try {
     await client.query('SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY');
+    // Row hashes depend on how timestamps print, so fix the zone and style on every server.
+    await client.query("SET TIME ZONE 'UTC'; SET DateStyle = 'ISO, MDY'; SET extra_float_digits = 1");
     const now = await snapshot(client);
     const i = process.argv.indexOf('--compare');
     if (i === -1) {

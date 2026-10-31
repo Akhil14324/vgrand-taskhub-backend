@@ -7,6 +7,7 @@ const { authenticate } = require('../middleware/auth');
 const { sanitizeText, validatePassword } = require('../middleware/sanitize');
 const { USERNAME_PATTERN, USERNAME_RULE, cleanUsername, suggestUsername } = require('../utils/mentions');
 const { notify } = require('../utils/notify');
+const { deactivateUser } = require('../services/org');
 const {
   DESIGNATIONS,
   LEADERSHIP,
@@ -176,19 +177,9 @@ router.delete('/me', authenticate, async (req, res, next) => {
       return res.status(401).json({ error: 'Password is incorrect' });
     }
 
-    const client = await db.pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query('DELETE FROM users WHERE id = $1', [req.user.id]);
-      await client.query('COMMIT');
-    } catch (txErr) {
-      await client.query('ROLLBACK');
-      client.release();
-      throw txErr;
-    }
-    client.release();
-
-    res.json({ message: 'Account deleted successfully' });
+    // The account is closed, not erased: the work it did belongs to the business.
+    await deactivateUser(db, req.user.id);
+    res.json({ message: 'Account closed. You have been signed out.' });
   } catch (err) {
     next(err);
   }

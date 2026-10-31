@@ -144,8 +144,26 @@ async function syncLeaderGroups(q, userId, role) {
   );
 }
 
+/**
+ * "Remove" a person without losing anything: deleting a users row cascades into every to-do they created,
+ * every message they sent and every chat they started. Instead the account is switched off (login and the
+ * API refuse inactive accounts), its password replaced by an unusable one and its devices forgotten, so
+ * nothing more is pushed to them. All their work and history stays.
+ */
+async function deactivateUser(q, userId) {
+  const unusable = `!deactivated:${crypto.randomBytes(24).toString('hex')}`;
+  const result = await q.query(
+    `UPDATE users SET status = 'inactive', password_hash = $2, updated_at = NOW() WHERE id = $1 RETURNING id`,
+    [userId, unusable]
+  );
+  if (!result.rows.length) return false;
+  await q.query('DELETE FROM push_tokens WHERE user_id = $1', [userId]);
+  return true;
+}
+
 module.exports = {
   generateTempPassword,
+  deactivateUser,
   ensureBusinessGroup,
   setMemberships,
   syncLeaderGroups,

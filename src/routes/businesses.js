@@ -213,6 +213,20 @@ router.delete('/:id', authenticate, requireManageBusinesses, async (req, res, ne
   try {
     const { id } = req.params;
 
+    // Deleting a business cascades into its tasks, sections, sprints and goals. Only an empty one can go.
+    const used = (await db.query(
+      `SELECT (SELECT COUNT(*) FROM todos WHERE business_id = $1)
+            + (SELECT COUNT(*) FROM todo_sections WHERE business_id = $1)
+            + (SELECT COUNT(*) FROM sprints WHERE business_id = $1)
+            + (SELECT COUNT(*) FROM goals WHERE business_id = $1)
+            + (SELECT COUNT(*) FROM approvals WHERE business_id = $1)
+            + (SELECT COUNT(*) FROM tasks WHERE business_id = $1) AS n`,
+      [id]
+    )).rows[0];
+    if (Number(used?.n) > 0) {
+      return res.status(409).json({ error: 'This business has work in it, so it cannot be deleted. Move or finish its tasks first.' });
+    }
+
     const result = await db.query(
       'DELETE FROM businesses WHERE id = $1 RETURNING id',
       [id]
