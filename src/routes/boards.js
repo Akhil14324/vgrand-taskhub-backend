@@ -326,7 +326,7 @@ router.post('/:id(\\d+)/import', authenticate, withActor, boardParam('add'), asy
 
 router.get('/', authenticate, withActor, async (req, res, next) => {
   try {
-    res.json({ boards: await boardsFor(req.actor) });
+    res.json({ boards: await boardsFor(req.actor, { archived: req.query.archived === '1' }) });
   } catch (err) {
     next(err);
   }

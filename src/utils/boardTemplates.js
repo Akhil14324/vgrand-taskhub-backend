@@ -54,7 +54,7 @@ const BUILT_INS = {
     description: 'A building project by phase, with dates for the Gantt, site issues, material requests and approvals.',
     sector: 'real_estate',
     definition: {
-      icon: 'business-outline', color: 'blue', item_word: 'Work',
+      icon: 'business-outline', color: 'blue', item_word: 'Task',
       columns: [{ system_key: 'person' }, { system_key: 'status' }, { system_key: 'timeline' }, { kind: 'numbers', title: 'Cost', settings: { unit: '₹', decimals: 0 } }, { kind: 'files', title: 'Drawings' }, { system_key: 'dependency' }],
       groups: [
         { name: 'Approvals and permits', color: 'purple', items: [{ title: 'Building plan approval' }, { title: 'Environmental clearance' }] },

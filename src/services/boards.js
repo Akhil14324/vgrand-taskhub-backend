@@ -146,8 +146,8 @@ async function boardAudience(board) {
   return r.rows.map((x) => x.user_id);
 }
 
-/** Every board the actor may see, not archived, with their access. */
-async function boardsFor(actor) {
+/** Every board the actor may see, not archived, with their access (or, with { archived }, the archived ones they run). */
+async function boardsFor(actor, { archived = false } = {}) {
   const rows = (await db.query(
     `SELECT b.*, s.name AS site_name, bz.name AS business_name,
             COALESCE((SELECT json_agg(json_build_object('user_id', bm.user_id, 'role', bm.role))
@@ -155,13 +155,13 @@ async function boardsFor(actor) {
      FROM boards b
      LEFT JOIN sites s ON s.id = b.site_id
      LEFT JOIN businesses bz ON bz.id = b.business_id
-     WHERE b.archived_at IS NULL
+     WHERE ${archived ? 'b.archived_at IS NOT NULL' : 'b.archived_at IS NULL'}
      ORDER BY b.scope, bz.sort_order NULLS FIRST, b.is_default DESC, b.sort_order, b.id`
   )).rows;
   const out = [];
   for (const r of rows) {
     const access = boardAccess(actor, r, r.member_rows);
-    if (!access.view) continue;
+    if (!access.view || (archived && !access.manage)) continue;
     const { member_rows: _omit, ...board } = r;
     out.push({ ...board, access });
   }
