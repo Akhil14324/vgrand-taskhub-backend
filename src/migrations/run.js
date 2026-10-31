@@ -79,7 +79,16 @@ async function runMigrations({ autoClose = true } = {}) {
   }
 }
 
-module.exports = { runMigrations };
+// Files in this folder that the database has not applied yet (read-only check).
+async function pendingMigrations() {
+  const files = fs.readdirSync(__dirname).filter((f) => f.endsWith('.sql')).sort();
+  const directQuery = (text, params) => db.directPool.query(text, params);
+  await ensureMigrationsTable(directQuery);
+  const applied = new Set((await directQuery('SELECT filename FROM migrations')).rows.map((r) => r.filename));
+  return files.filter((f) => !applied.has(f));
+}
+
+module.exports = { runMigrations, pendingMigrations };
 
 if (require.main === module) {
   runMigrations()
