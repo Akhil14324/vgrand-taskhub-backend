@@ -121,6 +121,14 @@ router.post('/:id(\\d+)/audio', authenticate, (req, res, next) => {
       if (Number.isInteger(pieceNo) && pieceNo >= 0) {
         const had = await db.query('SELECT 1 FROM meeting_pieces WHERE meeting_id = $1 AND piece_no = $2', [req.params.id, pieceNo]);
         if (had.rows.length) return res.json({ ok: true, duplicate: true });
+        // A meeting recorded before pieces were numbered: keep its text as piece -1, so rebuilding the transcript
+        // from numbered pieces never drops what was said earlier.
+        await db.query(
+          `INSERT INTO meeting_pieces (meeting_id, piece_no, text)
+           SELECT id, -1, transcript FROM meeting_notes
+           WHERE id = $1 AND transcript <> '' AND NOT EXISTS (SELECT 1 FROM meeting_pieces WHERE meeting_id = $1)`,
+          [req.params.id]
+        );
         const said = await transcribe(req.file.buffer, req.file.originalname || 'part.webm', req.file.mimetype || 'audio/webm', hint);
         await db.query(
           'INSERT INTO meeting_pieces (meeting_id, piece_no, text, duration_ms) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
