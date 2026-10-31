@@ -14,6 +14,8 @@ const {
 } = require('../services/boards');
 const { createTodoCore, announce } = require('./todos');
 const { logEvent } = require('../services/todoTimeline');
+const { computeFormulas, computeMirrors, plainValue } = require('../utils/boardCompute');
+const { configured: aiConfigured, chatJSON } = require('../utils/openai');
 
 /**
  * Boards (migration 055), mounted at /api/boards. See MONDAY_FEATURE_SPEC.md sections 2–5.
@@ -171,6 +173,53 @@ router.post('/', authenticate, withActor, async (req, res, next) => {
   }
 });
 
+/**
+ * What fills itself on a board: formulas, mirrors (through Connect-boards links), the names and links of the
+ * files in Files columns, and the titles of linked items so a Connect-boards cell can show them.
+ */
+async function computedValues({ items, columns, values, actor, ids }) {
+  const names = new Map((await db.query('SELECT id, name FROM users')).rows.map((u) => [u.id, u.name]));
+  const nameOf = (id) => names.get(Number(id)) || '';
+  const cells = {};
+  const merge = (out) => {
+    for (const [todoId, row] of Object.entries(out)) cells[todoId] = { ...(cells[todoId] || {}), ...row };
+  };
+  merge(computeFormulas(items, columns, values, nameOf));
+
+  // Linked items: only those the viewer can see come back.
+  const relationCols = columns.filter((c) => c.kind === 'board_relation');
+  const linkedIds = [...new Set(items.flatMap((t) => relationCols.flatMap((c) => values[t.id]?.[c.id] || [])))].slice(0, 500);
+  let linked = { items: [], columns: [], values: {} };
+  if (linkedIds.length) {
+    const linkedItems = await listTodos(actor.id, { actor, where: 't.id = ANY($5::int[])', params: [linkedIds] });
+    const boardIds = [...new Set(linkedItems.map((t) => t.board_id).filter(Boolean))];
+    const [lcols, lvals] = await Promise.all([
+      boardIds.length ? db.query('SELECT * FROM board_columns WHERE board_id = ANY($1::int[]) AND archived_at IS NULL', [boardIds]) : { rows: [] },
+      db.query('SELECT todo_id, column_id, value FROM item_values WHERE todo_id = ANY($1::int[])', [linkedItems.map((t) => t.id)]),
+    ]);
+    const lv = {};
+    for (const r of lvals.rows) { if (!lv[r.todo_id]) lv[r.todo_id] = {}; lv[r.todo_id][r.column_id] = r.value; }
+    const lcolsVisible = lcols.rows.filter((c) => c.settings?.view !== 'managers');
+    linked = { items: linkedItems, columns: lcolsVisible, values: lv };
+    merge(computeMirrors(items, columns, values, linked, nameOf));
+  }
+
+  const fileIds = [...new Set(items.flatMap((t) => columns.filter((c) => c.kind === 'files').flatMap((c) => values[t.id]?.[c.id] || [])))];
+  const attachments = {};
+  if (fileIds.length) {
+    const rows = (await db.query(
+      'SELECT id, todo_id, url, filename, mime, size_bytes FROM todo_attachments WHERE id = ANY($1::int[]) AND todo_id = ANY($2::int[])',
+      [fileIds, ids]
+    )).rows;
+    for (const r of rows) attachments[r.id] = r;
+  }
+  return {
+    cells,
+    attachments,
+    linked: Object.fromEntries(linked.items.map((t) => [t.id, { id: t.id, title: t.title, board_id: t.board_id, is_done: t.is_done }])),
+  };
+}
+
 router.get('/:id(\\d+)', authenticate, withActor, boardParam('view'), async (req, res, next) => {
   try {
     const board = req.board;
@@ -213,15 +262,28 @@ router.get('/:id(\\d+)', authenticate, withActor, boardParam('view'), async (req
       if (!labelsByColumn[l.column_id]) labelsByColumn[l.column_id] = [];
       labelsByColumn[l.column_id].push(l);
     }
+    // A column only the people who run the board may see is left out for everyone else, values included.
+    const shown = columns.rows
+      .filter((c) => c.settings?.view !== 'managers' || req.boardAccess.manage)
+      .map((c) => ({ ...c, labels: labelsByColumn[c.id] || undefined }));
+    const shownIds = new Set(shown.map((c) => c.id));
+    for (const row of Object.values(values)) for (const cid of Object.keys(row)) if (!shownIds.has(Number(cid))) delete row[cid];
+
+    const extra = await computedValues({ items, columns: shown, values, actor, ids });
+    for (const [todoId, cells] of Object.entries(extra.cells)) values[todoId] = { ...(values[todoId] || {}), ...cells };
+
     res.json({
       board,
       access: req.boardAccess,
       members: req.boardMembers,
-      columns: columns.rows.map((c) => ({ ...c, labels: labelsByColumn[c.id] || undefined })),
+      columns: shown,
       groups: groups.rows,
       views: views.rows,
       items,
       values,
+      attachments: extra.attachments,
+      linked: extra.linked,
+      ai_enabled: aiConfigured(),
     });
   } catch (err) {
     next(err);
@@ -605,18 +667,91 @@ router.put('/:id(\\d+)/items/:todoId(\\d+)/values/:cid(\\d+)', authenticate, wit
     if (!col) return;
     if (col.archived_at) return res.status(404).json({ error: 'Column not found' });
     if (col.system_key) return res.status(400).json({ error: 'Change this column through the item itself' });
+    if (col.settings?.view === 'managers' && !req.boardAccess.manage) return res.status(404).json({ error: 'Column not found' });
+    if (col.settings?.edit === 'managers' && !req.boardAccess.manage) {
+      return res.status(403).json({ error: 'Only the people who run this board can change this column' });
+    }
     const todo = await getTodoFor(req.params.todoId, req.actor.id, req.actor);
     if (!todo || todo.board_id !== req.board.id) return res.status(404).json({ error: 'Item not found' });
+    // A vote is everyone's own: { vote: true | false } adds or takes back the voter's vote only.
+    if (col.kind === 'vote') {
+      if (!req.boardAccess.view) return res.status(403).json({ error: 'You cannot vote here' });
+      const had = (await db.query('SELECT value FROM item_values WHERE todo_id = $1 AND column_id = $2', [todo.id, col.id])).rows[0]?.value || [];
+      const voters = req.body.vote === false ? had.filter((id) => id !== req.actor.id) : [...new Set([...had, req.actor.id])];
+      const r = await writeValue(req.board, col, todo.id, voters, req.actor.id);
+      await announce(todo.id, 'updated');
+      return res.json({ value: r.value });
+    }
     if (!(todo.permissions.can_change_status || todo.permissions.can_edit)) {
       return res.status(403).json({ error: 'You cannot change this item' });
     }
-    const r = await writeValue(req.board, col, todo.id, req.body.value, req.actor.id);
+    let raw = req.body.value;
+    if (col.kind === 'files' && Array.isArray(raw) && raw.length) {
+      // Only files attached to this item (POST /api/collab/todos/:id/attachments) can sit in its Files cell.
+      raw = (await db.query('SELECT id FROM todo_attachments WHERE todo_id = $1 AND id = ANY($2::int[]) AND NOT draft', [todo.id, raw.map(Number).filter(Boolean)])).rows.map((r) => r.id);
+    }
+    if (col.kind === 'board_relation' && Array.isArray(raw) && raw.length) {
+      // Only items the person can see, and on the column's board when it names one.
+      const wanted = raw.map(Number).filter(Boolean).slice(0, 50);
+      const seen = await listTodos(req.actor.id, { actor: req.actor, where: 't.id = ANY($5::int[])', params: [wanted] });
+      raw = seen.filter((t) => t.id !== todo.id && (!col.settings?.board_id || t.board_id === col.settings.board_id)).map((t) => t.id);
+    }
+    const r = await writeValue(req.board, col, todo.id, raw, req.actor.id);
     if (r.error) return res.status(400).json({ error: r.error });
     await db.query('UPDATE todos SET updated_at = NOW() WHERE id = $1', [todo.id]);
     await logEvent({ todoId: todo.id, userId: req.actor.id, subjectId: todo.assignee_id, kind: 'value_changed', note: col.title, meta: { column_id: col.id } });
     await announce(todo.id, 'updated');
     res.json({ value: r.value });
   } catch (err) {
+    next(err);
+  }
+});
+
+// POST /:id/columns/:cid/ai-fill — { item_ids } fill an AI column from its source columns (OpenAI only, F-MORE-01).
+const AI_PROMPTS = {
+  summarize: 'Summarise the item in one short plain sentence.',
+  categorize: 'Pick the single best category for the item. Answer with the category only.',
+  extract: 'Extract the requested detail from the item. Answer with the detail only, or "-" if it is not there.',
+  translate: 'Translate the item into English if it is in Telugu, or into Telugu if it is in English. Answer with the translation only.',
+  sentiment: 'Say whether the item sounds positive, neutral or negative, in one word.',
+  reply: 'Write a short, polite reply to the item, in two sentences at most.',
+  custom: 'Do what the instruction asks with the item.',
+};
+router.post('/:id(\\d+)/columns/:cid(\\d+)/ai-fill', authenticate, withActor, boardParam('add'), async (req, res, next) => {
+  try {
+    if (!aiConfigured()) return res.status(503).json({ error: 'AI is not set up on the server' });
+    const col = await columnOf(req, res);
+    if (!col) return;
+    if (col.kind !== 'ai') return res.status(400).json({ error: 'This is not an AI column' });
+    const wanted = (Array.isArray(req.body.item_ids) ? req.body.item_ids : []).map(Number).filter(Boolean).slice(0, 50);
+    const items = await listTodos(req.actor.id, { actor: req.actor, where: 't.board_id = $5 AND t.id = ANY($6::int[])', params: [req.board.id, wanted] });
+    const cols = (await db.query('SELECT * FROM board_columns WHERE board_id = $1 AND archived_at IS NULL', [req.board.id])).rows;
+    const sources = cols.filter((c) => (col.settings?.source_column_ids || []).includes(c.id));
+    const vals = {};
+    for (const r of (await db.query('SELECT todo_id, column_id, value FROM item_values WHERE todo_id = ANY($1::int[])', [items.map((t) => t.id)])).rows) {
+      if (!vals[r.todo_id]) vals[r.todo_id] = {};
+      vals[r.todo_id][r.column_id] = r.value;
+    }
+    const action = col.settings?.action || 'summarize';
+    const out = {};
+    for (const t of items) {
+      if (!(t.permissions.can_change_status || t.permissions.can_edit)) continue;
+      const lines = [`Item: ${t.title}`, t.notes ? `Notes: ${String(t.notes).slice(0, 2000)}` : null,
+        ...sources.map((c) => `${c.title}: ${String(plainValue(t, c, vals)).slice(0, 2000)}`)].filter(Boolean);
+      const reply = await chatJSON({
+        system: `${AI_PROMPTS[action] || AI_PROMPTS.summarize} ${col.settings?.instruction ? `Instruction: ${col.settings.instruction}. ` : ''}`
+          + 'Reply as JSON: {"text":"..."}',
+        user: lines.join('\n'),
+        maxTokens: 400,
+      });
+      const text = String(reply.text || '').trim().slice(0, 5000);
+      const r = await writeValue(req.board, col, t.id, text || null, req.actor.id);
+      if (!r.error) out[t.id] = r.value;
+    }
+    await changed(req.board, 'values');
+    res.json({ values: out });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
 });

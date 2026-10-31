@@ -162,8 +162,25 @@ const FUNCTIONS = Object.assign(Object.create(null), {
   now: () => Math.floor(Date.now() / 1000),
   pad: (v, width, ch = '0') => asText(v).padStart(toNum(width) || 0, asText(ch)[0] || '0'),
   not: (v) => !truthy(v),
+  // Dates as 'YYYY-MM-DD' (board formulas): today in the app's time zone, whole days from a to b, a plus n days.
+  today: () => dayInZone(new Date()),
+  days: (a, b) => { const x = ymdToUtc(a); const y = ymdToUtc(b); return x === null || y === null ? '' : Math.round((y - x) / 86400000); },
+  addDays: (d, n) => { const x = ymdToUtc(d); return x === null ? '' : new Date(x + (toNum(n) || 0) * 86400000).toISOString().slice(0, 10); },
 });
-const FUNCTION_ARITY = Object.assign(Object.create(null), { rand: [0, 2], now: [0, 0], substr: [2, 3], if: [2, 3] });
+const FUNCTION_ARITY = Object.assign(Object.create(null), { rand: [0, 2], now: [0, 0], substr: [2, 3], if: [2, 3], today: [0, 0], days: [2, 2], addDays: [2, 2] });
+
+function ymdToUtc(v) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(asText(v));
+  return m ? Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null;
+}
+function dayInZone(date) {
+  const zone = process.env.APP_TIMEZONE || 'Asia/Kolkata';
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+  } catch {
+    return date.toISOString().slice(0, 10);
+  }
+}
 
 // ---- parser / evaluator (evaluates while parsing) -------------------------------------------------
 

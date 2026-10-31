@@ -1026,6 +1026,17 @@ router.post('/:id(\\d+)/toggle', authenticate, async (req, res, next) => {
     if (existing.review_state !== 'accepted') {
       return res.status(400).json({ error: 'This is still waiting for review' });
     }
+    // Required board columns (F-MORE-04): an item is not finished while one of them is still empty.
+    if (!existing.is_done && existing.status !== 'in_review' && existing.board_id) {
+      const empty = (await db.query(
+        `SELECT c.title FROM board_columns c
+         WHERE c.board_id = $1 AND c.archived_at IS NULL AND c.system_key IS NULL AND (c.settings->>'required')::boolean
+           AND NOT EXISTS (SELECT 1 FROM item_values v WHERE v.column_id = c.id AND v.todo_id = $2)
+         ORDER BY c.sort_order`,
+        [existing.board_id, existing.id]
+      )).rows.map((r) => r.title);
+      if (empty.length) return res.status(400).json({ error: `Fill ${empty.join(', ')} before marking it done` });
+    }
 
     let rolledTo = null;
     if (existing.is_done) {

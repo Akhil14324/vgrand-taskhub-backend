@@ -64,6 +64,8 @@ const KINDS = {
   files: { label: 'Files', icon: 'attach-outline', value: 'files' },
   board_relation: { label: 'Connect boards', icon: 'swap-horizontal-outline', value: 'items' },
   vote: { label: 'Vote', icon: 'thumbs-up-outline', value: 'voters' },
+  // Filled by OpenAI from other columns (F-MORE-01); a person may also overwrite the text by hand.
+  ai: { label: 'AI', icon: 'sparkles-outline', value: 'long_text' },
   button: { label: 'Button', icon: 'radio-button-on-outline', computed: true },
   formula: { label: 'Formula', icon: 'flask-outline', computed: true },
   mirror: { label: 'Mirror', icon: 'copy-outline', computed: true },
@@ -119,6 +121,8 @@ const DEFAULT_VIEWS = [
   { kind: 'table', name: 'Main table', settings: {} },
   { kind: 'kanban', name: 'Kanban', settings: { group_by: 'status' } },
 ];
+
+const AI_ACTIONS = ['summarize', 'categorize', 'extract', 'translate', 'sentiment', 'reply', 'custom'];
 
 const VIEW_KINDS = ['table', 'kanban', 'calendar', 'timeline', 'gantt', 'chart', 'workload', 'map', 'form', 'gallery', 'summary', 'activity'];
 
@@ -305,6 +309,15 @@ function cleanSettings(kind, raw = {}) {
     if (Number.isInteger(raw.automation_task_id)) s.automation_task_id = raw.automation_task_id;
   }
   if (raw.show_on_mobile !== undefined) s.show_on_mobile = !!raw.show_on_mobile;
+  // Who may see / change this column (F-MORE-03), and whether an item needs it before it is Done (F-MORE-04).
+  if (['everyone', 'managers'].includes(raw.view)) s.view = raw.view;
+  if (['everyone', 'managers'].includes(raw.edit)) s.edit = raw.edit;
+  if (raw.required !== undefined) s.required = !!raw.required;
+  if (kind === 'ai') {
+    if (AI_ACTIONS.includes(raw.action)) s.action = raw.action;
+    if (Array.isArray(raw.source_column_ids)) s.source_column_ids = raw.source_column_ids.filter(Number.isInteger).slice(0, 10);
+    if (raw.instruction !== undefined) s.instruction = trimText(raw.instruction, 500);
+  }
   return s;
 }
 
@@ -318,6 +331,7 @@ module.exports = {
   DEFAULT_STATUS_LABELS,
   DEFAULT_VIEWS,
   VIEW_KINDS,
+  AI_ACTIONS,
   cleanValue,
   cleanSettings,
   validDate,
