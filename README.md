@@ -145,6 +145,15 @@ Statuses: `todo` · `in_progress` · `blocked` · `in_review` · `on_hold` · `d
 
 The Team Monitor (`/api/monitor`) follows the hierarchy: leadership sees people strictly below them, business heads those below them in their business; nobody sees upward.
 
+### Notes (`/api/notes`)
+A private notepad (migration 060): only the person who wrote a note sees it.
+- `GET /` (`?q=` searches title and text; pinned first), `POST /` `{ title?, body? }`, `GET|PATCH|DELETE /:id` (`PATCH` takes `title`, `body`, `pinned`; delete hides the note)
+- `POST /:id/images` (multipart `file`, pictures only, stored like to-do files) and `DELETE /:id/images/:imageId`
+
+### Task dependencies (`/api/boards`)
+- `PUT /:id/items/:todoId/depends-on` `{ ids }` replaces what a task waits for (same board, no loops). A task that would start on or before the day what it waits for ends is moved to the day after, together with everything that waits for it.
+- When a task's `due_date` changes through `PUT /api/todos/:id`, every task that waits for it (any depth) moves by the same number of days and gets a timeline entry. `todo.depends_on` lists `{ id, title, due_date, is_done }`. `GET /:id/dependencies` returns the arrows for the Gantt.
+
 ### Approvals (`/api/approvals`)
 
 `GET /` → `{ requests, reviews, proposals, mine, count }`: deletion requests, finished work and proposed tasks waiting on you, and your own requests · `POST /:id/decide` `{ decision: approve|reject, note }` · `DELETE /:id` (withdraw).
