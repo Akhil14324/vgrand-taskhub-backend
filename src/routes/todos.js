@@ -1,4 +1,5 @@
 const express = require('express');
+const { followDueChange } = require('../services/dependencies');
 const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
@@ -840,6 +841,8 @@ router.put('/:id(\\d+)', authenticate, async (req, res, next) => {
         scheduleChanged, offsetsChanged, existing.id, requiresApproval,
         remind.date, remind.time, remind.repeat, remindChanged, businessSectionId, startDate]
     );
+    // The tasks that wait for this one move with it.
+    if (dueDate !== existing.due_date) await followDueChange(existing, existing.due_date, dueDate, actor.id);
     if (startDate !== (existing.start_date || null)) {
       await logEvent({ todoId: existing.id, userId: actor.id, subjectId: existing.assignee_id, kind: 'start_changed', from: existing.start_date || null, to: startDate });
     }

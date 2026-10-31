@@ -7,6 +7,7 @@ const { loadActor } = require('../utils/org');
 const { todayInAppZone } = require('../utils/recurrence');
 const { listTodos, getTodoFor, memberIds } = require('../services/todoQueries');
 const { buildTimeline } = require('../services/todoTimeline');
+const { openProcesses } = require('../services/processes');
 const {
   actorCanMonitor,
   monitorablePeople,
@@ -47,12 +48,20 @@ router.get('/overview', authenticate, requireMonitor, async (req, res, next) => 
   try {
     const days = parseDays(req.query.days);
     const { people } = req.monitor;
-    const stats = await statsForPeople(people.map((p) => p.id), days);
+    const ids = people.map((p) => p.id);
+    const [stats, processes] = await Promise.all([statsForPeople(ids, days), openProcesses({ userIds: ids })]);
+    const nameOf = new Map(people.map((p) => [p.id, p.name]));
     res.json({
       days,
       today: todayInAppZone(),
       team: teamTotals(stats),
       people: people.map((p) => ({ ...p, stats: stats.get(p.id) })),
+      // Tasks made of steps where nothing has been finished for a while and the date is close, worst first.
+      stalled: processes
+        .filter((p) => p.stalled)
+        .sort((a, b) => (a.daysToDue ?? 99) - (b.daysToDue ?? 99) || b.idleDays - a.idleDays)
+        .slice(0, 20)
+        .map((p) => ({ id: p.id, title: p.title, assignee_id: p.assignee_id, assignee_name: nameOf.get(p.assignee_id) || '', done: p.done, total: p.total, pct: p.pct, idle_days: p.idleDays, days_to_due: p.daysToDue })),
     });
   } catch (err) {
     next(err);

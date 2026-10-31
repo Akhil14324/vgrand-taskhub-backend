@@ -40,6 +40,8 @@ const TODO_SELECT = `
            WHERE apr.todo_id = t.id AND apr.kind IN ('todo_deletion', 'task_deletion') AND apr.status = 'pending'
            LIMIT 1) AS pending_delete_request_id,
          (SELECT COUNT(*)::int FROM todo_blockers bl WHERE bl.todo_id = t.id AND bl.resolved_at IS NULL) AS open_blocker_count,
+         (SELECT json_agg(json_build_object('id', dp.id, 'title', dp.title, 'due_date', dp.due_date, 'is_done', dp.is_done) ORDER BY dp.id)
+          FROM todo_dependencies td JOIN todos dp ON dp.id = td.depends_on_id WHERE td.todo_id = t.id) AS depends_on,
          (SELECT COUNT(*)::int FROM todos c WHERE c.parent_id = t.id) AS subtask_count,
          (SELECT COUNT(*)::int FROM todos c WHERE c.parent_id = t.id AND c.is_done) AS subtask_done_count,
          (SELECT COUNT(*)::int FROM todo_comments tc WHERE tc.todo_id = t.id) AS comment_count,

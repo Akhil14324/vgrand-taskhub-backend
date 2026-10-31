@@ -1,6 +1,6 @@
 const db = require('../db');
 const {
-  SYSTEM_COLUMNS, DEFAULT_COLUMNS, DEFAULT_STATUS_LABELS, DEFAULT_VIEWS,
+  SYSTEM_COLUMNS, DEFAULT_COLUMNS, DEFAULT_EXTRA_COLUMNS, DEFAULT_STATUS_LABELS, DEFAULT_VIEWS,
 } = require('../utils/columns');
 const { boardAccess } = require('../utils/boardAccess');
 
@@ -40,6 +40,12 @@ async function ensureBoardDefaults(q, boardId, createdBy = null) {
   const has = await q.query('SELECT 1 FROM board_columns WHERE board_id = $1 LIMIT 1', [boardId]);
   if (!has.rows.length) {
     for (const [i, key] of DEFAULT_COLUMNS.entries()) await addSystemColumn(q, boardId, key, i + 1, createdBy);
+    for (const [i, c] of DEFAULT_EXTRA_COLUMNS.entries()) {
+      await q.query(
+        'INSERT INTO board_columns (board_id, kind, title, width, sort_order, settings, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [boardId, c.kind, c.title, c.width, DEFAULT_COLUMNS.length + i + 1, {}, createdBy]
+      );
+    }
   }
   const views = await q.query('SELECT 1 FROM board_views WHERE board_id = $1 LIMIT 1', [boardId]);
   if (!views.rows.length) {
@@ -146,8 +152,25 @@ async function boardAudience(board) {
   return r.rows.map((x) => x.user_id);
 }
 
+/** The person's "My to-dos" board (created on first use). Returns its id. */
+async function ensureMyTodosBoard(q, userId) {
+  const found = await q.query(`SELECT id FROM boards WHERE kind = 'my_todos' AND owner_id = $1`, [userId]);
+  if (found.rows.length) return found.rows[0].id;
+  const created = await q.query(
+    `INSERT INTO boards (scope, owner_id, name, kind, icon, color, privacy, item_word, created_by)
+     VALUES ('personal', $1, 'My to-dos', 'my_todos', 'person-outline', 'blue', 'private', 'Task', $1)
+     ON CONFLICT (owner_id) WHERE kind = 'my_todos' DO NOTHING RETURNING id`,
+    [userId]
+  );
+  const id = created.rows[0]?.id
+    || (await q.query(`SELECT id FROM boards WHERE kind = 'my_todos' AND owner_id = $1`, [userId])).rows[0].id;
+  await ensureBoardDefaults(q, id, userId);
+  return id;
+}
+
 /** Every board the actor may see, not archived, with their access (or, with { archived }, the archived ones they run). */
 async function boardsFor(actor, { archived = false } = {}) {
+  if (!archived) await ensureMyTodosBoard(db, actor.id);
   const rows = (await db.query(
     `SELECT b.*, s.name AS site_name, bz.name AS business_name,
             COALESCE((SELECT json_agg(json_build_object('user_id', bm.user_id, 'role', bm.role))
@@ -169,6 +192,7 @@ async function boardsFor(actor, { archived = false } = {}) {
 }
 
 module.exports = {
+  ensureMyTodosBoard,
   addSystemColumn,
   addStatusLabels,
   ensureBoardDefaults,

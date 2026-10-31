@@ -145,6 +145,24 @@ Statuses: `todo` · `in_progress` · `blocked` · `in_review` · `on_hold` · `d
 
 The Team Monitor (`/api/monitor`) follows the hierarchy: leadership sees people strictly below them, business heads those below them in their business; nobody sees upward.
 
+### Notes (`/api/notes`)
+A private notepad (migration 060): only the person who wrote a note sees it.
+- `GET /` (`?q=` searches title and text; pinned first), `POST /` `{ title?, body? }`, `GET|PATCH|DELETE /:id` (`PATCH` takes `title`, `body`, `pinned`; delete hides the note)
+- `POST /:id/images` (multipart `file`, pictures only, stored like to-do files) and `DELETE /:id/images/:imageId`
+
+### My to-dos board (`/api/boards`, migration 061)
+Each person has one board of `kind: 'my_todos'`, created when their boards are first listed. `GET /:id` returns the personal to-dos the person is on (no `board_id` needed), grouped by their lists (`groups` are `todo_lists`; an item's `business_section_id` is its `list_id`). `POST /:id/groups` makes a list, `PATCH /:id/groups/:gid` renames or recolours one, and `POST /:id/items` with `group_id` adds to that list.
+
+### Stalled tasks (`services/processes.js`, job `processAlerts`, migration 062)
+Progress is weighted by time (a step's `duration_minutes`, or the average of its siblings' estimates). A task is **stalled** when it is open, has two or more steps, is not finished, no step has been finished (and the task not made) for 3 days, and its date is within a week or past (no date: 6 days). `GET /api/monitor/overview` returns `stalled` (up to 20, worst first). Once a day between 09:00 and 11:00 the job `processAlerts` sends a `process_stalled` notification to the task's owner and to everyone who may monitor them, once per task per 3 days (table `process_alerts`).
+
+### Steps in the team monitor (`/api/monitor`)
+`GET /overview` and `GET /people/:id` add `stats.steps = { total, done, processes, finished, pct, stalled }`: the lowest-level sub-tasks under the person's open tasks (total and done), the number of open tasks that have steps, and the steps finished in the period. `team.steps` is the sum.
+
+### Task dependencies (`/api/boards`)
+- `PUT /:id/items/:todoId/depends-on` `{ ids }` replaces what a task waits for (same board, no loops). A task that would start on or before the day what it waits for ends is moved to the day after, together with everything that waits for it.
+- When a task's `due_date` changes through `PUT /api/todos/:id`, every task that waits for it (any depth) moves by the same number of days and gets a timeline entry. `todo.depends_on` lists `{ id, title, due_date, is_done }`. `GET /:id/dependencies` returns the arrows for the Gantt.
+
 ### Approvals (`/api/approvals`)
 
 `GET /` → `{ requests, reviews, proposals, mine, count }`: deletion requests, finished work and proposed tasks waiting on you, and your own requests · `POST /:id/decide` `{ decision: approve|reject, note }` · `DELETE /:id` (withdraw).

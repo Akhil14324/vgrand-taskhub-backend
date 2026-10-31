@@ -10,6 +10,7 @@ const {
   actorLevelIn,
 } = require('../utils/org');
 const { APP_TIMEZONE } = require('../utils/recurrence');
+const { openProcesses } = require('./processes');
 const { todoHealth } = require('../utils/timeline');
 
 /**
@@ -180,16 +181,53 @@ const EMPTY_COMPLETION = {
   on_time_rate: null, estimate_ratio: null,
 };
 
+/**
+ * Steps (events): the lowest-level sub-tasks under each person's open tasks (processes). A task is only "done"
+ * when all its steps are, so the overview counts the steps as well: how many exist, how many are finished, and
+ * how many were finished in the period. A sub-task that has its own sub-tasks is not a step, its sub-tasks are.
+ */
+async function stepStats(userIds, days) {
+  const [processes, finished] = await Promise.all([
+    openProcesses({ userIds }),
+    db.query(
+      `SELECT subject_id AS user_id, COUNT(*)::int AS n FROM todo_events
+       WHERE kind = 'completed' AND subject_id = ANY($1::int[]) AND created_at > NOW() - make_interval(days => $2)
+         AND COALESCE((meta->>'is_subtask')::boolean, FALSE) = TRUE
+       GROUP BY subject_id`,
+      [userIds, days]
+    ),
+  ]);
+  const out = new Map(userIds.map((id) => [id, { total: 0, done: 0, processes: 0, finished: 0, pct: null, stalled: 0, _w: 0, _g: 0 }]));
+  for (const p of processes) {
+    const o = out.get(p.assignee_id);
+    if (!o) continue;
+    o.total += p.total;
+    o.done += p.done;
+    o.processes += 1;
+    if (p.stalled) o.stalled += 1;
+    o._w += p.total; // weight each process by its number of steps when averaging their time-weighted progress
+    o._g += p.pct * p.total;
+  }
+  for (const r of finished.rows) if (out.has(r.user_id)) out.get(r.user_id).finished = r.n;
+  for (const o of out.values()) {
+    o.pct = o._w ? Math.round(o._g / o._w) : null;
+    delete o._w;
+    delete o._g;
+  }
+  return out;
+}
+
 /** Per-person numbers for the overview list. */
 async function statsForPeople(userIds, days) {
   if (!userIds.length) return new Map();
-  const [open, done] = await Promise.all([openStats(userIds), completionStats(userIds, days)]);
+  const [open, done, steps] = await Promise.all([openStats(userIds), completionStats(userIds, days), stepStats(userIds, days)]);
   const out = new Map();
   for (const id of userIds) {
     out.set(id, {
       ...open.get(id),
       ...(done.map.get(id) || EMPTY_COMPLETION),
       reschedules: done.resched.get(id) || 0,
+      steps: steps.get(id),
     });
   }
   return out;
@@ -213,6 +251,17 @@ function teamTotals(statsByPerson) {
     blocked: sum('blocked'),
     completed: sum('completed'),
     reschedules: sum('reschedules'),
+    steps: {
+      total: all.reduce((s, x) => s + (x.steps?.total || 0), 0),
+      done: all.reduce((s, x) => s + (x.steps?.done || 0), 0),
+      finished: all.reduce((s, x) => s + (x.steps?.finished || 0), 0),
+      processes: all.reduce((s, x) => s + (x.steps?.processes || 0), 0),
+      stalled: all.reduce((s, x) => s + (x.steps?.stalled || 0), 0),
+      pct: (() => {
+        const w = all.reduce((s, x) => s + (x.steps?.total || 0), 0);
+        return w ? Math.round(all.reduce((s, x) => s + (x.steps?.pct || 0) * (x.steps?.total || 0), 0) / w) : null;
+      })(),
+    },
     health: {
       green: all.reduce((s, x) => s + x.health.green, 0),
       orange: all.reduce((s, x) => s + x.health.orange, 0),
