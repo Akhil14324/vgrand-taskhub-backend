@@ -562,7 +562,8 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
 
   if (delegate) {
     const urgent = parsePriority(body.priority) === 1 ? 'Urgent: ' : '';
-    for (const person of delegates) {
+    // `quiet`: the caller tells each person once for a whole batch (meeting drafts).
+    for (const person of quiet ? [] : delegates) {
       const others = delegates.filter((p) => p.id !== person.id).map((p) => p.name.split(' ')[0]);
       await notify([person.id], {
         type: 'todo_assigned',

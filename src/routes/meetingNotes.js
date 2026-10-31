@@ -8,15 +8,21 @@ const { chatJSON, transcribe } = require('../utils/openai');
 const { createTodoCore } = require('./todos');
 const { helpers } = require('./ai');
 const { splitText } = require('../utils/transcript');
+const { MEETING_TASK_SHAPE, cleanMeetingTasks, mergeTasks } = require('../utils/drafts');
+const { vocabulary, saveMeetingDrafts, draftsFor } = require('../services/drafts');
+const { isLeader } = require('../utils/org');
 
 // /api/meeting-notes: meetings recorded or pasted on their own, not attached to a to-do. Only the person who
-// recorded one can see it. A recording arrives in 5 minute pieces, so an hour-long meeting is 12 uploads.
+// recorded one can see it. A recording arrives in numbered pieces (1 minute each from the current client), kept in
+// meeting_pieces so a retried upload is never transcribed twice and the transcript is always in order.
 const router = express.Router();
 const audio = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } }).single('file');
 const { peopleForPrompt, cleanTasks, datePrompt, TASK_SHAPE, clean } = helpers;
 
 // One AI call handles about this much speech; a longer meeting is read part by part and the parts are merged.
 const CHUNK_CHARS = 12000;
+// Drafts list every task, so each AI call reads less speech and can answer with many tasks.
+const DRAFT_CHUNK_CHARS = 6000;
 const MAX_TRANSCRIPT = 400000;
 
 function fail(res, err, next) {
@@ -46,13 +52,19 @@ router.get('/', authenticate, async (req, res, next) => {
   }
 });
 
-// POST /api/meeting-notes — { title? } starts an empty one.
+// POST /api/meeting-notes — { title?, business_id? } starts an empty one. The company it is about is where its
+// tasks go by default.
 router.post('/', authenticate, async (req, res, next) => {
   try {
     const title = clean(req.body.title, 200) || 'Meeting';
+    let businessId = parseInt(req.body.business_id, 10) || null;
+    if (businessId) {
+      const actor = await loadActor(req.user.id);
+      if (!(isLeader(actor) || actor.memberships.has(businessId))) businessId = null;
+    }
     const row = (await db.query(
-      'INSERT INTO meeting_notes (owner_id, title) VALUES ($1, $2) RETURNING *',
-      [req.user.id, title]
+      'INSERT INTO meeting_notes (owner_id, title, business_id) VALUES ($1, $2, $3) RETURNING *',
+      [req.user.id, title, businessId]
     )).rows[0];
     res.status(201).json({ meeting: row });
   } catch (err) {
@@ -94,14 +106,36 @@ router.delete('/:id(\\d+)', authenticate, async (req, res, next) => {
   }
 });
 
-// POST /api/meeting-notes/:id/audio — one recorded piece (field "file"). Its text is added after the earlier pieces.
+// POST /api/meeting-notes/:id/audio — one recorded piece (field "file", optional fields piece_no and duration_ms).
+// With piece_no the piece is stored once in meeting_pieces (a retry of a piece already stored answers
+// duplicate: true without transcribing again) and the transcript is rebuilt in piece order. Without it (older
+// clients) the text is added after the earlier pieces.
 router.post('/:id(\\d+)/audio', authenticate, (req, res, next) => {
   audio(req, res, async (uploadErr) => {
     try {
       if (uploadErr) return res.status(400).json({ error: uploadErr.message });
       if (!(await mine(req))) return res.status(404).json({ error: 'Meeting not found' });
       if (!req.file) return res.status(400).json({ error: 'No recording was sent' });
-      const text = await transcribe(req.file.buffer, req.file.originalname || 'part.webm', req.file.mimetype || 'audio/webm');
+      const hint = { prompt: await vocabulary() };
+      const pieceNo = parseInt(req.body.piece_no, 10);
+      if (Number.isInteger(pieceNo) && pieceNo >= 0) {
+        const had = await db.query('SELECT 1 FROM meeting_pieces WHERE meeting_id = $1 AND piece_no = $2', [req.params.id, pieceNo]);
+        if (had.rows.length) return res.json({ ok: true, duplicate: true });
+        const said = await transcribe(req.file.buffer, req.file.originalname || 'part.webm', req.file.mimetype || 'audio/webm', hint);
+        await db.query(
+          'INSERT INTO meeting_pieces (meeting_id, piece_no, text, duration_ms) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+          [req.params.id, pieceNo, said, parseInt(req.body.duration_ms, 10) || null]
+        );
+        const row = (await db.query(
+          `UPDATE meeting_notes SET
+             transcript = (SELECT COALESCE(string_agg(NULLIF(text, ''), E'\\n' ORDER BY piece_no), '') FROM meeting_pieces WHERE meeting_id = $1),
+             pieces = (SELECT COUNT(*) FROM meeting_pieces WHERE meeting_id = $1), updated_at = NOW()
+           WHERE id = $1 RETURNING length(transcript) AS chars, pieces`,
+          [req.params.id]
+        )).rows[0];
+        return res.json({ ok: true, added: said.length, text: said, chars: row.chars, pieces: row.pieces });
+      }
+      const text = await transcribe(req.file.buffer, req.file.originalname || 'part.webm', req.file.mimetype || 'audio/webm', hint);
       const row = (await db.query(
         `UPDATE meeting_notes
          SET transcript = CASE WHEN transcript = '' THEN $2 ELSE transcript || E'\\n' || $2 END,
@@ -152,6 +186,43 @@ function readPart(part, { index, total, people, ownerId, title }) {
     tasks: cleanTasks(out.tasks, people, ownerId),
   }));
 }
+
+/** Every task from one part of a meeting, each with the name as said and the words it came from (drafts). */
+function readPartForDrafts(part, { index, total, people, ownerId, title }) {
+  const where = total > 1 ? `This is part ${index} of ${total} of one longer meeting. ` : '';
+  return chatJSON({
+    system: `You read part of a meeting transcript and list every task someone was given or agreed to do. ${datePrompt()} `
+      + `${where}The meeting was called "${title}". People who can be given work: ${people.text}. `
+      + 'The speech may be in English, in Telugu, or in both mixed together (Telugu is often written in English letters). '
+      + 'Understand all of it, and write every title in clear English, starting with a verb. '
+      + 'Match the names people say to the closest person and give their username as assignee; also copy the name exactly as it was said into assignee_said. '
+      + 'If a name was said but you cannot tell who it is, set assignee to null and still fill assignee_said. '
+      + 'A busy meeting can set more than a hundred tasks: list every one, do not merge different tasks. Leave out discussion that set no task. '
+      + `Reply as JSON: ${MEETING_TASK_SHAPE}`,
+    user: part,
+    maxTokens: 8000,
+  }).then((out) => cleanMeetingTasks(out.tasks, people, ownerId));
+}
+
+// POST /api/meeting-notes/:id/drafts — read the whole meeting into drafts for the recorder to review. Replaces the
+// drafts still waiting from an earlier reading; drafts already confirmed stay.
+router.post('/:id(\\d+)/drafts', authenticate, async (req, res, next) => {
+  try {
+    const row = await mine(req);
+    if (!row) return res.status(404).json({ error: 'Meeting not found' });
+    const transcript = String(row.transcript || '').trim();
+    if (transcript.length < 40) return res.status(400).json({ error: 'There is not enough said yet to work from' });
+    const people = await peopleForPrompt();
+    const parts = splitText(transcript, DRAFT_CHUNK_CHARS);
+    const results = await Promise.all(parts.map((part, i) => readPartForDrafts(part, {
+      index: i + 1, total: parts.length, people, ownerId: req.user.id, title: row.title,
+    })));
+    await saveMeetingDrafts(row, req.user.id, mergeTasks(results).slice(0, 400));
+    res.json(await draftsFor(req.user.id, { meetingId: row.id }));
+  } catch (err) {
+    fail(res, err, next);
+  }
+});
 
 // POST /api/meeting-notes/:id/extract — { create? } summary, decisions and action items for the whole meeting.
 // The transcript is read in parts (all at once), then merged. With create, each task becomes a to-do for the
