@@ -48,7 +48,7 @@ function cleanBox(raw = {}) {
     if (!label && !todoId(b.todo_id)) continue; // an empty slot is simply not stored
     const prev = blocks[blocks.length - 1];
     if (prev && toMin(prev.end) > b.s) { errors.push(`${b.start} overlaps ${prev.start}`); continue; }
-    const p = Number(b.priority);
+    const p = b.priority === null || b.priority === undefined || b.priority === '' ? NaN : Number(b.priority); // Number(null) is 0
     blocks.push({
       start: toHM(b.s), end: toHM(b.e), text: label, todo_id: todoId(b.todo_id),
       priority: Number.isInteger(p) && p >= 0 && p < MAX_PRIORITIES ? p : null, done: doneOf(b.done),

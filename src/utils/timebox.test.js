@@ -24,6 +24,8 @@ test('cleanBox keeps three priorities, sorts blocks and leaves out broken or ove
   assert.strictEqual(box.blocks[0].done, true);
   assert.strictEqual(box.blocks[1].done, null);
   assert.strictEqual(box.blocks[2].priority, null);
+  assert.strictEqual(cleanBox({ blocks: [{ start: '09:00', end: '09:30', text: 'x', priority: null }] }).box.blocks[0].priority, null);
+  assert.strictEqual(cleanBox({ blocks: [{ start: '09:00', end: '09:30', text: 'x', priority: 0 }] }).box.blocks[0].priority, 0);
   assert.strictEqual(errors.length, 4); // too many priorities, overlap, quarter hour, backwards
 });
 
