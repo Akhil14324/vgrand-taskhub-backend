@@ -40,3 +40,19 @@ test('workload, upcoming and overdue', () => {
   assert.deepStrictEqual(computeWidget('upcoming', {}, items, ctx).items.map((t) => t.id), [3]);
   assert.deepStrictEqual(computeWidget('overdue', {}, items, ctx).items.map((t) => t.id), [2]);
 });
+
+test('chart matrix splits by a second dimension and keeps time in order', () => {
+  const { chartMatrix } = require('./dashboard');
+  const items = [
+    { id: 1, status: 'todo', due_date: '2026-11-03', assignee_id: 1, assignee_name: 'A' },
+    { id: 2, status: 'done', due_date: '2026-11-04', assignee_id: 2, assignee_name: 'B' },
+    { id: 3, status: 'done', due_date: '2026-11-12', assignee_id: 1, assignee_name: 'A' },
+    { id: 4, status: 'todo', assignee_id: 1, assignee_name: 'A' },
+  ];
+  const m = chartMatrix(items, 'due_week', 'status', { boards: new Map() });
+  assert.deepStrictEqual(m.categories.map((c) => c.key), ['2026-11-02', '2026-11-09', 'none']);
+  const done = m.series.find((s) => s.key === 'done');
+  assert.deepStrictEqual(done.values, [1, 1, 0]);
+  const todo = m.series.find((s) => s.key === 'todo');
+  assert.deepStrictEqual(todo.values, [1, 0, 1]);
+});

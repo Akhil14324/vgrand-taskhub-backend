@@ -45,7 +45,13 @@ function cleanConfig(raw = {}) {
   const c = {};
   if (!raw || typeof raw !== 'object') return c;
   if (['all', 'open', 'done', 'overdue', 'mine', 'this_week'].includes(raw.filter)) c.filter = raw.filter;
-  if (['status', 'person', 'board', 'priority'].includes(raw.by)) c.by = raw.by;
+  const DIMS = ['status', 'person', 'board', 'priority', 'due_day', 'due_week', 'due_month', 'created_week', 'done_week'];
+  if (DIMS.includes(raw.by)) c.by = raw.by;
+  if (DIMS.includes(raw.series)) c.series = raw.series;
+  if (['bar', 'column', 'line', 'smooth_line', 'stacked_bar', 'stacked_column', 'stacked_line', 'pct_stacked_bar', 'pct_stacked_column', 'pct_stacked_line'].includes(raw.chart)) c.chart = raw.chart;
+  if (Number.isInteger(raw.h)) c.h = Math.min(Math.max(raw.h, 120), 900);
+  if (raw.legend !== undefined) c.legend = !!raw.legend;
+  if (raw.labels !== undefined) c.labels = !!raw.labels;
   if (raw.column) c.column = sanitizeText(raw.column, 120);
   if (raw.unit) c.unit = sanitizeText(raw.unit, 12);
   if (raw.text !== undefined) c.text = String(raw.text).slice(0, 2000);

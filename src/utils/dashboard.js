@@ -12,6 +12,74 @@ const STAGES = [
 ];
 const PRIORITY = { 1: ['Urgent', 'red'], 2: ['High', 'orange'], 3: ['Normal', 'blue'], 4: ['Low', 'grey'] };
 
+const DAY = 86400000;
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const CHART_COLORS = ['blue', 'green', 'orange', 'purple', 'red', 'aquamarine', 'pink', 'yellow', 'indigo', 'grass'];
+const ymd = (v) => (v ? String(v).slice(0, 10) : null);
+/** Monday of the week of a 'YYYY-MM-DD'. */
+function weekStart(d) {
+  const t = Date.parse(`${d}T00:00:00Z`);
+  return new Date(t - ((new Date(t).getUTCDay() + 6) % 7) * DAY).toISOString().slice(0, 10);
+}
+const shortDay = (d) => `${MONTHS[Number(d.slice(5, 7)) - 1]} ${Number(d.slice(8, 10))}`;
+
+/**
+ * What a chart can split by. Each returns [key, label, color, sortKey]; time ones sort in time order and leave
+ * items without that date in "No date" at the end.
+ */
+const TIME_DIMS = {
+  due_day: [(t) => ymd(dueOf(t)), (d) => d, shortDay],
+  due_week: [(t) => (dueOf(t) ? weekStart(dueOf(t)) : null), (d) => d, (d) => `Week of ${shortDay(d)}`],
+  due_month: [(t) => (dueOf(t) ? dueOf(t).slice(0, 7) : null), (d) => d, (d) => `${MONTHS[Number(d.slice(5, 7)) - 1]} ${d.slice(0, 4)}`],
+  created_week: [(t) => (ymd(t.created_at) ? weekStart(ymd(t.created_at)) : null), (d) => d, (d) => `Week of ${shortDay(d)}`],
+  done_week: [(t) => (ymd(t.done_at) ? weekStart(ymd(t.done_at)) : null), (d) => d, (d) => `Week of ${shortDay(d)}`],
+};
+function dimOf(dim, t, ctx) {
+  if (TIME_DIMS[dim]) {
+    const [get, sort, label] = TIME_DIMS[dim];
+    const d = get(t);
+    return d ? [d, label(d), 'blue', sort(d)] : ['none', 'No date', 'grey', '\uffff'];
+  }
+  switch (dim) {
+    case 'person': return [t.assignee_id || 0, t.assignee_name || 'Nobody', null, null];
+    case 'board': return [t.board_id || 0, ctx.boards.get(t.board_id) || 'No board', null, null];
+    case 'priority': { const p = PRIORITY[t.priority] || PRIORITY[4]; return [t.priority || 4, p[0], p[1], t.priority || 4]; }
+    default: { const i = Math.max(0, STAGES.findIndex((x) => x[0] === t.status)); return [STAGES[i][0], STAGES[i][1], STAGES[i][2], i]; }
+  }
+}
+
+/**
+ * The numbers behind every chart type: categories along the axis and one series per value of `series` (or one
+ * series named "Items" when there is no split). values[i] belongs to categories[i].
+ */
+function chartMatrix(items, by, seriesBy, ctx) {
+  const timeAxis = !!TIME_DIMS[by];
+  const cats = new Map();
+  const sers = new Map();
+  const cell = new Map();
+  for (const t of items) {
+    const [ck, cl, cc, cs] = dimOf(by, t, ctx);
+    const [sk, sl, sc] = seriesBy ? dimOf(seriesBy, t, ctx) : ['all', 'Items', 'blue'];
+    const c = cats.get(ck) || { key: ck, label: cl, color: cc, sort: cs, total: 0 };
+    c.total += 1; cats.set(ck, c);
+    const se = sers.get(sk) || { key: sk, label: sl, color: sc, total: 0 };
+    se.total += 1; sers.set(sk, se);
+    cell.set(`${ck}|${sk}`, (cell.get(`${ck}|${sk}`) || 0) + 1);
+  }
+  let categories = [...cats.values()];
+  categories.sort(timeAxis || by === 'status' || by === 'priority'
+    ? (a, b) => (a.sort < b.sort ? -1 : a.sort > b.sort ? 1 : 0)
+    : (a, b) => b.total - a.total);
+  categories = categories.slice(0, timeAxis ? 24 : 14);
+  let series = [...sers.values()].sort((a, b) => b.total - a.total);
+  const keep = series.slice(0, 8);
+  const rest = series.slice(8);
+  series = keep.map((x, i) => ({ ...x, color: x.color || CHART_COLORS[i % CHART_COLORS.length] }));
+  const out = series.map((x) => ({ key: x.key, label: x.label, color: x.color, values: categories.map((c) => cell.get(`${c.key}|${x.key}`) || 0) }));
+  if (rest.length) out.push({ key: 'others', label: 'Others', color: 'grey', values: categories.map((c) => rest.reduce((n, r) => n + (cell.get(`${c.key}|${r.key}`) || 0), 0)) });
+  return { categories: categories.map(({ key, label, color }) => ({ key, label, color })), series: out };
+}
+
 const dueOf = (t) => [t.due_date, t.deadline_date].filter(Boolean).sort()[0] || null;
 
 /** Items a widget's filter keeps: all | open | done | overdue | mine | this_week. */
@@ -63,6 +131,7 @@ function computeWidget(kind, config = {}, items, ctx) {
       return { bars: STAGES.map(([key, label, color]) => ({ key, label, color, count: scoped.filter((t) => t.status === key).length })).filter((b) => b.count) };
     case 'chart': {
       const by = config.by || 'status';
+      const matrix = chartMatrix(scoped, by, config.series && config.series !== by ? config.series : null, ctx);
       const bars = by === 'person'
         ? countBy(scoped, (t) => [t.assignee_id || 0, t.assignee_name || 'Nobody', 'blue'])
         : by === 'board'
@@ -70,7 +139,7 @@ function computeWidget(kind, config = {}, items, ctx) {
           : by === 'priority'
             ? countBy(scoped, (t) => [t.priority || 4, ...(PRIORITY[t.priority] || PRIORITY[4])])
             : countBy(scoped, (t) => { const s = STAGES.find((x) => x[0] === t.status) || STAGES[0]; return [s[0], s[1], s[2]]; });
-      return { by, bars };
+      return { by, series_by: config.series || null, bars, ...matrix };
     }
     case 'workload': {
       const open = items.filter((t) => !t.parent_id && !t.is_done && t.assignee_id);
@@ -101,4 +170,4 @@ function computeWidget(kind, config = {}, items, ctx) {
   }
 }
 
-module.exports = { computeWidget, filterItems, STAGES };
+module.exports = { computeWidget, filterItems, STAGES, chartMatrix };
