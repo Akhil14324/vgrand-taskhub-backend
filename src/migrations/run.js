@@ -93,7 +93,43 @@ async function pendingMigrations() {
   return files.filter((f) => !applied.has(f));
 }
 
-module.exports = { runMigrations, pendingMigrations };
+const LOCK_KEY = 727001; // pg advisory lock: two instances starting together must not apply the same file twice
+
+/**
+ * Applies the SQL files the database has not seen yet, in order, and nothing else (no seeds, no backfill).
+ * Safe on every boot: applied files are skipped, a lock keeps two starting instances from racing, and each file
+ * runs as one statement batch, so a failing file changes nothing. Used when MIGRATIONS_AUTO=false so a deploy
+ * brings its own schema; `dir` is injectable for tests. Returns the file names it applied.
+ */
+async function applyPendingMigrations({ dir = __dirname, log = console.log } = {}) {
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith('.sql')).sort();
+  const client = await db.directPool.connect();
+  const applied = [];
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [LOCK_KEY]);
+    await ensureMigrationsTable((text, params) => client.query(text, params));
+    const done = new Set((await client.query('SELECT filename FROM migrations')).rows.map((r) => r.filename));
+    for (const file of files) {
+      if (done.has(file)) continue;
+      log(`Applying migration: ${file}`);
+      try {
+        await client.query(fs.readFileSync(path.join(dir, file), 'utf8'));
+        await client.query('INSERT INTO migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [file]);
+        applied.push(file);
+        log(`  ✓ ${file}`);
+      } catch (err) {
+        log(`  ✗ ${file} failed: ${err.message}`);
+        throw err;
+      }
+    }
+    return applied;
+  } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [LOCK_KEY]).catch(() => {});
+    client.release();
+  }
+}
+
+module.exports = { runMigrations, pendingMigrations, applyPendingMigrations };
 
 if (require.main === module) {
   runMigrations()

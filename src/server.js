@@ -35,7 +35,7 @@ const approvalRoutes = require('./routes/approvals');
 const accessRoutes = require('./routes/access');
 const erpRoutes = require('./routes/erp');
 const db = require('./db');
-const { runMigrations, pendingMigrations } = require('./migrations/run');
+const { runMigrations, applyPendingMigrations } = require('./migrations/run');
 const { scheduleOverdueNotifications } = require('./jobs/overdueNotifications');
 const { scheduleTodoReminders } = require('./jobs/todoReminders');
 const { scheduleNudges } = require('./jobs/nudges');
@@ -257,11 +257,12 @@ if (require.main === module) {
   (async () => {
     try {
       await waitForConnection();
-      // MIGRATIONS_AUTO=false: never change the schema on boot; run `npm run migrate` by hand
-      // after rehearsing on a copy. Default (unset) keeps the old behaviour.
+      // MIGRATIONS_AUTO=false: the boot does not run the seeds or the backfill, but it still applies the SQL files the
+      // database has not seen (all additive), so a deploy always brings the tables its code needs. Default (unset)
+      // runs everything, as before.
       if (process.env.MIGRATIONS_AUTO === 'false') {
-        const pending = await pendingMigrations();
-        if (pending.length) console.warn(`MIGRATIONS_AUTO=false: ${pending.length} migration(s) not applied: ${pending.join(', ')}`);
+        const applied = await applyPendingMigrations();
+        if (applied.length) console.log(`Applied ${applied.length} migration(s): ${applied.join(', ')}`);
         else console.log('MIGRATIONS_AUTO=false: schema is up to date.');
       } else {
         await runMigrations({ autoClose: false });
