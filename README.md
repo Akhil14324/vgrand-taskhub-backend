@@ -150,6 +150,13 @@ A private notepad (migration 060): only the person who wrote a note sees it.
 - `GET /` (`?q=` searches title and text; pinned first), `POST /` `{ title?, body? }`, `GET|PATCH|DELETE /:id` (`PATCH` takes `title`, `body`, `pinned`; delete hides the note)
 - `POST /:id/images` (multipart `file`, pictures only, stored like to-do files) and `DELETE /:id/images/:imageId`
 
+### Dump (`/api/dump`, migration 063)
+A holding area for a person's own open personal to-dos. It is a flag on their own membership (`todo_members.dumped_at`): nothing is moved or changed, so the list, section and order come back on restore, and other people on a shared to-do still see it. `listTodos` hides what the viewer dumped by default (`dumped: 'hide'`; `'only'` / `'any'` for the Dump itself, `getTodoFor` and the Team monitor), reminders and the My day counts skip it, and business tasks are never dumped.
+- `GET /` my dumped to-dos (with sub-tasks), newest first
+- `POST /all` dump every open personal to-do (and its sub-tasks) -> `{ count, ids }`; `POST /send` `{ ids }` dump these
+- `POST /restore` `{ ids }` or `{ all: true }` bring back (and what is below them)
+Each change emits `todo:changed` with `todoId: 0` so the app reloads its lists.
+
 ### My to-dos board (`/api/boards`, migration 061)
 Each person has one board of `kind: 'my_todos'`, created when their boards are first listed. `GET /:id` returns the personal to-dos the person is on (no `board_id` needed), grouped by their lists (`groups` are `todo_lists`; an item's `business_section_id` is its `list_id`). `POST /:id/groups` makes a list, `PATCH /:id/groups/:gid` renames or recolours one, and `POST /:id/items` with `group_id` adds to that list.
 

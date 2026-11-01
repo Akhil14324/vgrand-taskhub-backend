@@ -8,7 +8,7 @@ async function dueSummary(userId, today) {
     `SELECT COUNT(*)::int AS remaining FROM todos t
      WHERE t.is_done = FALSE AND t.parent_id IS NULL AND t.review_state <> 'rejected'
        AND t.due_date IS NOT NULL AND t.due_date <= $2::date
-       AND ((t.business_id IS NULL AND EXISTS (SELECT 1 FROM todo_members m WHERE m.todo_id = t.id AND m.user_id = $1))
+       AND ((t.business_id IS NULL AND EXISTS (SELECT 1 FROM todo_members m WHERE m.todo_id = t.id AND m.user_id = $1 AND m.dumped_at IS NULL))
             OR (t.business_id IS NOT NULL AND t.assignee_id = $1 AND t.review_state = 'accepted'))`,
     [userId, today]
   );
@@ -74,7 +74,7 @@ async function waitingOnUser(userId) {
      JOIN todos t ON t.id = b.todo_id AND t.is_done = FALSE
      LEFT JOIN users u ON u.id = COALESCE(t.assignee_id, b.raised_by)
      WHERE b.resolved_at IS NULL AND b.blocked_by_user_id = $1
-       AND (t.business_id IS NOT NULL OR EXISTS (SELECT 1 FROM todo_members m WHERE m.todo_id = t.id AND m.user_id = $1))
+       AND (t.business_id IS NOT NULL OR EXISTS (SELECT 1 FROM todo_members m WHERE m.todo_id = t.id AND m.user_id = $1 AND m.dumped_at IS NULL))
      ORDER BY b.raised_at`,
     [userId]
   );

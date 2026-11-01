@@ -42,7 +42,7 @@ async function sendMorningDigests() {
       db.query(
         `SELECT COUNT(*)::int AS n FROM todos t
          WHERE t.is_done = FALSE AND t.parent_id IS NULL AND t.due_date < $2::date AND t.review_state <> 'rejected'
-           AND ((t.business_id IS NULL AND EXISTS (SELECT 1 FROM todo_members m WHERE m.todo_id = t.id AND m.user_id = $1))
+           AND ((t.business_id IS NULL AND EXISTS (SELECT 1 FROM todo_members m WHERE m.todo_id = t.id AND m.user_id = $1 AND m.dumped_at IS NULL))
                 OR (t.business_id IS NOT NULL AND t.assignee_id = $1 AND t.review_state = 'accepted'))`,
         [id, today]
       ),

@@ -26,7 +26,7 @@ const TODO_SELECT = `
          ((t.due_date + COALESCE(t.due_time, TIME '23:59')) AT TIME ZONE '${TZ}') AS due_at,
          ((t.deadline_date + TIME '23:59') AT TIME ZONE '${TZ}') AS deadline_at,
          (tm.user_id IS NOT NULL) AS is_member,
-         tm.list_id, tm.section_id, tm.sort_order, bo.position AS board_pos,
+         tm.list_id, tm.section_id, tm.sort_order, tm.dumped_at, bo.position AS board_pos,
          cu.name AS created_by_name, cu.username AS created_by_username,
          du.name AS done_by_name,
          au.name AS assignee_name, au.username AS assignee_username, au.profile_picture AS assignee_picture,
@@ -82,12 +82,14 @@ const VISIBLE = `(tm.user_id IS NOT NULL OR 0 = ANY($3::int[]) OR (t.business_id
 /**
  * Decorated rows for a viewer. `where` may use $5 and up; `tail` is appended (ORDER BY / LIMIT).
  * Pass `listOnly: true` to see only what is on the viewer's own list.
+ * `dumped`: 'hide' (default) leaves out what the viewer sent to their Dump, 'only' returns just that, 'any' both.
  */
-async function listTodos(userId, { where = 'TRUE', params = [], tail = '', actor = null, listOnly = false, seeAll = false } = {}) {
+const DUMPED = { hide: 'tm.dumped_at IS NULL', only: 'tm.dumped_at IS NOT NULL', any: 'TRUE' };
+async function listTodos(userId, { where = 'TRUE', params = [], tail = '', actor = null, listOnly = false, seeAll = false, dumped = 'hide' } = {}) {
   const a = actor || await loadActor(userId);
   const viewer = listOnly ? listOnlyParams(userId) : await viewerParams(userId, a, seeAll);
   const result = await db.query(
-    `${TODO_SELECT} WHERE ${VISIBLE} AND (${where}) ${tail}`,
+    `${TODO_SELECT} WHERE ${VISIBLE} AND ${DUMPED[dumped] || DUMPED.hide} AND (${where}) ${tail}`,
     [...viewer, ...params]
   );
   return result.rows.map((row) => decorateTodo(row, a));
@@ -97,7 +99,7 @@ async function listTodos(userId, { where = 'TRUE', params = [], tail = '', actor
 async function getTodoFor(todoId, userId, actor = null) {
   const id = parseInt(todoId, 10);
   if (!id) return null;
-  const rows = await listTodos(userId, { where: 't.id = $5', params: [id], actor, seeAll: true });
+  const rows = await listTodos(userId, { where: 't.id = $5', params: [id], actor, seeAll: true, dumped: 'any' });
   return rows[0] || null;
 }
 

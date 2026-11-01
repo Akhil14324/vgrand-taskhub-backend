@@ -178,8 +178,8 @@ async function addMentionedMembers(todo, text, explicitIds, actor, { quietFor = 
 /** Everyone on the parent also sits on its new sub-task; my own copy keeps the parent's placement. */
 async function attachSubtaskMembers(subtaskId, parent, userId) {
   await db.query(
-    `INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by)
-     SELECT $1::int, m.user_id, CASE WHEN m.user_id = $3::int THEN $4::int END, CASE WHEN m.user_id = $3::int THEN $5::int END, $3::int
+    `INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by, dumped_at)
+     SELECT $1::int, m.user_id, CASE WHEN m.user_id = $3::int THEN $4::int END, CASE WHEN m.user_id = $3::int THEN $5::int END, $3::int, m.dumped_at
      FROM todo_members m WHERE m.todo_id = $2
      ON CONFLICT DO NOTHING`,
     [subtaskId, parent.id, userId, parent.list_id, parent.section_id]

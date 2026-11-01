@@ -82,6 +82,7 @@ router.get('/people/:id', authenticate, requireMonitor, async (req, res, next) =
       // Everything on the person's own list: personal to-dos and the business tasks they are on.
       listTodos(personId, {
         listOnly: true,
+        dumped: 'any',
         where: `(t.is_done = FALSE OR t.done_at > NOW() - INTERVAL '30 days' OR t.due_date >= CURRENT_DATE - 30)`,
         tail: 'ORDER BY t.is_done, t.due_date ASC NULLS LAST, t.priority ASC, t.created_at DESC LIMIT 400',
       }),

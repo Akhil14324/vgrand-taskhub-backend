@@ -25,7 +25,7 @@ async function sendTodoReminders() {
       [APP_TIMEZONE]
     );
     for (const todo of due.rows) {
-      const members = await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1', [todo.id]);
+      const members = await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1 AND dumped_at IS NULL', [todo.id]);
       await notify(members.rows.map((m) => m.user_id), {
         type: 'todo_reminder',
         title: `Reminder · ${todo.at.replace(/^0/, '')}`,
@@ -63,7 +63,7 @@ async function sendDeadlineDayNotices() {
   for (const todo of due.rows) {
     let recipients;
     if (todo.business_id && todo.assignee_id) recipients = [...new Set([todo.assignee_id, todo.created_by])];
-    else recipients = (await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1', [todo.id])).rows.map((m) => m.user_id);
+    else recipients = (await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1 AND dumped_at IS NULL', [todo.id])).rows.map((m) => m.user_id);
     await notify(recipients, {
       type: 'todo_deadline',
       title: 'Today is your deadline',
@@ -97,7 +97,7 @@ async function sendCustomReminders() {
       [row.id, row.remind_date, next]
     );
     if (!claimed.rows.length || row.is_done) continue;
-    const members = await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1', [row.id]);
+    const members = await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1 AND dumped_at IS NULL', [row.id]);
     await notify(members.rows.map((m) => m.user_id), {
       type: 'todo_reminder',
       title: `Reminder · ${row.at.replace(/^0/, '')}`,
@@ -146,7 +146,7 @@ async function sendEarlyReminders() {
       [row.id, row.minutes]
     );
     if (!claimed.rows.length) continue;
-    const members = await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1', [row.id]);
+    const members = await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1 AND dumped_at IS NULL', [row.id]);
     await notify(members.rows.map((m) => m.user_id), {
       type: 'todo_reminder',
       title: `In ${describeOffset(row.minutes)} · ${row.at.replace(/^0/, '')}`,
