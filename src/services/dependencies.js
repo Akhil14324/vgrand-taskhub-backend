@@ -9,6 +9,23 @@ const { audienceIds } = require('./todoQueries');
  * Dates are 'YYYY-MM-DD' strings (the DATE type parser is off), so day arithmetic is done in SQL.
  */
 
+/**
+ * How a board treats its dependencies, from the settings of its "Dependent On" column:
+ *   strict   - what waits for a task moves with it (same number of days) and never starts before it ends;
+ *   flexible - what waits for a task moves only when it would otherwise start on or before the day it ends;
+ *   none     - no action: the link is only shown (a conflict shows on the Gantt, nothing moves).
+ */
+const MODES = ['strict', 'flexible', 'none'];
+async function modeOfBoard(boardId) {
+  if (!boardId) return 'strict';
+  const row = (await db.query(
+    `SELECT settings FROM board_columns WHERE board_id = $1 AND (system_key = 'dependency' OR kind = 'dependency') AND archived_at IS NULL
+     ORDER BY (system_key IS NULL) LIMIT 1`, [boardId]
+  )).rows[0];
+  const m = row?.settings?.mode;
+  return MODES.includes(m) ? m : 'strict';
+}
+
 /** Every task (any depth) that waits for `id`, nearest first. Cycles cannot form (setDependencies refuses them). */
 async function dependentsOf(id) {
   const rows = (await db.query(
@@ -50,11 +67,35 @@ async function shiftTasks(ids, days, actorId, reason) {
   return moved.map((t) => t.id);
 }
 
-/** A task's due date moved from `from` to `to`: the tasks that wait for it move with it. */
+/**
+ * Push every waiting task that would start on or before the day its latest predecessor ends to the day after
+ * (keeping its length), nearest first so the push travels down the chain. Returns the ids moved.
+ */
+async function enforceOrder(ids, actorId, reason) {
+  const moved = [];
+  for (const id of ids) {
+    const cur = (await db.query('SELECT due_date, start_date, is_done FROM todos WHERE id = $1', [id])).rows[0];
+    if (!cur || cur.is_done) continue;
+    const begins = cur.start_date || cur.due_date;
+    if (!begins) continue;
+    const latest = (await db.query(
+      `SELECT MAX(p.due_date) AS d FROM todo_dependencies d JOIN todos p ON p.id = d.depends_on_id WHERE d.todo_id = $1`, [id]
+    )).rows[0].d;
+    if (!latest) continue;
+    const gap = await daysBetween(begins, latest);
+    if (gap >= 0) moved.push(...await shiftTasks([id], gap + 1, actorId, reason));
+  }
+  return moved;
+}
+
+/** A task's due date moved from `from` to `to`: what waits for it follows, as the board's dependency mode says. */
 async function followDueChange(todo, from, to, actorId) {
   if (!from || !to || from === to) return [];
+  const mode = await modeOfBoard(todo.board_id);
+  if (mode === 'none') return [];
   const ids = await dependentsOf(todo.id);
   if (!ids.length) return [];
+  if (mode === 'flexible') return enforceOrder(ids, actorId, `Moved after "${todo.title}"`);
   const days = await daysBetween(from, to);
   return shiftTasks(ids, days, actorId, `Moved with "${todo.title}"`);
 }
@@ -86,7 +127,7 @@ async function setDependencies(todo, ids, actorId, allowedIds = null) {
     await db.query('INSERT INTO todo_dependencies (todo_id, depends_on_id, created_by) VALUES ($1, $2, $3)', [todo.id, w, actorId]);
   }
   let moved = [];
-  if (wanted.length) {
+  if (wanted.length && (await modeOfBoard(todo.board_id)) !== 'none') {
     const latest = (await db.query('SELECT MAX(due_date) AS d FROM todos WHERE id = ANY($1::int[])', [wanted])).rows[0].d;
     const current = (await db.query('SELECT due_date, start_date FROM todos WHERE id = $1', [todo.id])).rows[0];
     const begins = current.start_date || current.due_date;
@@ -105,4 +146,4 @@ async function setDependencies(todo, ids, actorId, allowedIds = null) {
   return { ok: true, moved };
 }
 
-module.exports = { dependentsOf, followDueChange, setDependencies };
+module.exports = { dependentsOf, followDueChange, setDependencies, modeOfBoard, enforceOrder, MODES };

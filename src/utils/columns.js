@@ -308,6 +308,10 @@ function cleanSettings(kind, raw = {}) {
     if (Number.isInteger(raw.target_column_id)) s.target_column_id = raw.target_column_id;
   }
   if (kind === 'board_relation' && Number.isInteger(raw.board_id)) s.board_id = raw.board_id;
+  if (kind === 'dependency') {
+    if (['strict', 'flexible', 'none'].includes(raw.mode)) s.mode = raw.mode;
+    if (['due', 'timeline'].includes(raw.date_field)) s.date_field = raw.date_field;
+  }
   if (kind === 'button') {
     if (raw.label) s.label = trimText(raw.label, 40);
     if (Number.isInteger(raw.automation_task_id)) s.automation_task_id = raw.automation_task_id;
