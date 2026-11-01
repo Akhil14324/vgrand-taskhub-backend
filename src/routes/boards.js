@@ -1121,12 +1121,13 @@ function cleanViewSettings(raw = {}) {
   const s = {};
   if (!raw || typeof raw !== 'object') return s;
   if (raw.filters !== undefined) s.filters = JSON.parse(JSON.stringify(raw.filters ?? null)) ?? undefined;
-  for (const k of ['sort', 'hidden_columns', 'column_order', 'column_widths', 'card_columns', 'color_rules']) {
+  for (const k of ['sort', 'hidden_columns', 'column_order', 'column_widths', 'card_columns', 'color_rules', 'defaults', 'search_columns']) {
     if (raw[k] !== undefined) s[k] = JSON.parse(JSON.stringify(raw[k] ?? null)) ?? undefined;
   }
-  for (const k of ['group_by', 'date_column', 'timeline_column', 'zoom', 'density', 'chart', 'search']) {
+  for (const k of ['group_by', 'group_dir', 'header_height', 'item_height', 'date_column', 'timeline_column', 'zoom', 'density', 'chart', 'search']) {
     if (raw[k] !== undefined && raw[k] !== null) s[k] = String(raw[k]).slice(0, 200);
   }
+  if (raw.pinned !== undefined) s.pinned = Math.min(Math.max(int(raw.pinned) || 0, 0), 5);
   if (raw.show_done !== undefined) s.show_done = !!raw.show_done;
   if (raw.collapsed_groups !== undefined && Array.isArray(raw.collapsed_groups)) s.collapsed_groups = raw.collapsed_groups.map(int).filter(Boolean).slice(0, 500);
   const size = JSON.stringify(s).length;
