@@ -2,6 +2,7 @@ const db = require('../db');
 const { listTodos } = require('./todoQueries');
 const { addSystemColumn, addStatusLabels } = require('./boards');
 const { cleanSettings, cleanValue, COLOR_NAMES } = require('../utils/columns');
+const { sanitizeText } = require('../middleware/sanitize');
 
 /**
  * Boards from definitions and definitions from boards (templates, duplicate, M9). A definition is the shape in
@@ -113,47 +114,88 @@ async function buildBoard(actor, place, def, { withItems = true, createTodoCore 
   }
 
   const views = def.views?.length ? def.views : [{ kind: 'table', name: 'Main table' }, { kind: 'kanban', name: 'Kanban' }];
-  for (const [i, v] of views.entries()) {
-    await db.query('INSERT INTO board_views (board_id, owner_id, kind, name, settings, sort_order) VALUES ($1, NULL, $2, $3, $4, $5)',
-      [board.id, v.kind, String(v.name || v.kind).slice(0, 80), v.settings || {}, i + 1]);
-  }
+  await db.query(
+    `INSERT INTO board_views (board_id, owner_id, kind, name, settings, sort_order)
+     SELECT $1, NULL, v.kind, v.name, v.settings::jsonb, v.ord
+       FROM unnest($2::text[], $3::text[], $4::text[]) WITH ORDINALITY AS v(kind, name, settings, ord)`,
+    [board.id, views.map((v) => v.kind), views.map((v) => String(v.name || v.kind).slice(0, 80)), views.map((v) => JSON.stringify(v.settings || {}))]
+  );
 
   // Custom status columns keep labels by name in a definition; values are re-pointed at the new labels.
   const labelIds = new Map();
-  for (const col of cols.filter((c) => c.kind === 'status' && !c.system_key)) {
-    const ls = (await db.query('SELECT id, label FROM status_labels WHERE column_id = $1', [col.id])).rows;
-    labelIds.set(col.id, new Map(ls.map((l) => [l.label.toLowerCase(), l.id])));
+  const statusCols = cols.filter((c) => c.kind === 'status' && !c.system_key);
+  if (statusCols.length) {
+    const ls = (await db.query('SELECT id, column_id, label FROM status_labels WHERE column_id = ANY($1::int[])', [statusCols.map((c) => c.id)])).rows;
+    for (const c of statusCols) labelIds.set(c.id, new Map(ls.filter((l) => l.column_id === c.id).map((l) => [l.label.toLowerCase(), l.id])));
   }
 
-  let made = 0;
+  // Groups in one statement (sort_order = their place), then every item of every group in one more. A template
+  // can carry hundreds of starter items and a remote database costs a round trip per query, so nothing here
+  // may loop over queries (it used to, through createTodoCore, and the request timed out).
   const groups = def.groups?.length ? def.groups : [{ name: 'Group 1', color: 'blue' }];
-  for (const [i, g] of groups.entries()) {
-    const group = (await db.query(
-      `INSERT INTO todo_sections (list_id, owner_id, business_id, board_id, name, description, sort_order, color)
-       VALUES (NULL, $1, $2, $3, $4, '', $5, $6) RETURNING id`,
-      [actor.id, board.business_id, board.id, String(g.name).slice(0, 120), i + 1, COLOR_NAMES.includes(g.color) ? g.color : 'blue']
-    )).rows[0];
-    if (!withItems || !createTodoCore) continue;
-    for (const it of (g.items || []).slice(0, ITEM_LIMIT)) {
-      const body = {
-        title: it.title, notes: it.notes || '', priority: it.priority || undefined, due_date: it.due_date || undefined,
-        start_date: it.start_date || undefined, board_id: board.business_id ? board.id : undefined,
-        business_id: board.business_id || undefined, business_section_id: board.business_id ? group.id : undefined,
-      };
-      const out = await createTodoCore(actor, body, { quiet: true });
-      const todoId = out.todo?.id || out.id;
-      if (!todoId) continue;
-      made += 1;
-      if (!board.business_id) await db.query('UPDATE todos SET board_id = $1, business_section_id = $2 WHERE id = $3', [board.id, group.id, todoId]);
-      for (const [title, raw] of Object.entries(it.values || {})) {
-        const col = colIdByTitle.get(title.toLowerCase());
-        if (!col || col.system_key) continue;
-        let value = raw;
-        if (col.kind === 'status' && raw?.label) value = { label_id: labelIds.get(col.id)?.get(String(raw.label).toLowerCase()) };
-        const cleaned = cleanValue(col.kind, value, col.settings || {});
-        if (cleaned.error || cleaned.value === null) continue;
-        await db.query('INSERT INTO item_values (todo_id, column_id, value, updated_by) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
-          [todoId, col.id, JSON.stringify(cleaned.value), actor.id]);
+  const groupRows = (await db.query(
+    `INSERT INTO todo_sections (list_id, owner_id, business_id, board_id, name, description, sort_order, color)
+     SELECT NULL, $1, $2, $3, g.name, '', g.ord, g.color
+       FROM unnest($4::text[], $5::text[]) WITH ORDINALITY AS g(name, color, ord)
+     RETURNING id, sort_order`,
+    [actor.id, board.business_id, board.id, groups.map((g) => String(g.name).slice(0, 120)), groups.map((g) => (COLOR_NAMES.includes(g.color) ? g.color : 'blue'))]
+  )).rows;
+  const groupIdAt = new Map(groupRows.map((r) => [Number(r.sort_order), r.id]));
+
+  let made = 0;
+  if (withItems) {
+    const flat = [];
+    groups.forEach((g, i) => {
+      for (const it of (g.items || []).slice(0, ITEM_LIMIT)) {
+        const title = sanitizeText(it.title, 500);
+        if (title) flat.push({ it, title, groupId: groupIdAt.get(i + 1) });
+      }
+    });
+    if (flat.length) {
+      const prio = (n) => { const v = parseInt(n, 10); return v >= 1 && v <= 4 ? v : 4; };
+      const day = (d) => (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}/.test(d) ? d.slice(0, 10) : null);
+      const ids = (await db.query(
+        `INSERT INTO todos (created_by, title, notes, priority, due_date, start_date, business_id, board_id, business_section_id)
+         SELECT $1, x.title, x.notes, x.priority, x.due::date, x.start::date, $2, $3, x.gid
+           FROM unnest($4::text[], $5::text[], $6::int[], $7::text[], $8::text[], $9::int[]) WITH ORDINALITY AS x(title, notes, priority, due, start, gid, ord)
+          ORDER BY x.ord
+         RETURNING id`,
+        [
+          actor.id, board.business_id || null, board.id,
+          flat.map((f) => f.title), flat.map((f) => sanitizeText(f.it.notes, 5000) || ''), flat.map((f) => prio(f.it.priority)),
+          flat.map((f) => day(f.it.due_date)), flat.map((f) => day(f.it.start_date)), flat.map((f) => f.groupId),
+        ]
+      )).rows.map((r) => r.id);
+      made = ids.length;
+      // The maker is a member of each (a personal board's items sit in their own To-do; the Inbox until they are placed).
+      await db.query(
+        `INSERT INTO todo_members (todo_id, user_id, list_id, added_by)
+         SELECT d, $2::int, NULL::int, $2::int FROM unnest($1::int[]) AS d ON CONFLICT DO NOTHING`,
+        [ids, actor.id]
+      );
+      await db.query(
+        `INSERT INTO todo_events (todo_id, user_id, subject_id, kind, meta)
+         SELECT d, $2::int, $2::int, 'created', $3::jsonb FROM unnest($1::int[]) AS d`,
+        [ids, actor.id, JSON.stringify({ parent_id: null, business_id: board.business_id || null, review_state: 'accepted', from_template: true })]
+      );
+      const vTodo = []; const vCol = []; const vVal = [];
+      flat.forEach((f, i) => {
+        for (const [title, raw] of Object.entries(f.it.values || {})) {
+          const col = colIdByTitle.get(title.toLowerCase());
+          if (!col || col.system_key) continue;
+          let value = raw;
+          if (col.kind === 'status' && raw?.label) value = { label_id: labelIds.get(col.id)?.get(String(raw.label).toLowerCase()) };
+          const cleaned = cleanValue(col.kind, value, col.settings || {});
+          if (cleaned.error || cleaned.value === null) continue;
+          vTodo.push(ids[i]); vCol.push(col.id); vVal.push(JSON.stringify(cleaned.value));
+        }
+      });
+      if (vTodo.length) {
+        await db.query(
+          `INSERT INTO item_values (todo_id, column_id, value, updated_by)
+           SELECT t, c, v::jsonb, $4 FROM unnest($1::int[], $2::int[], $3::text[]) AS x(t, c, v) ON CONFLICT DO NOTHING`,
+          [vTodo, vCol, vVal, actor.id]
+        );
       }
     }
   }
