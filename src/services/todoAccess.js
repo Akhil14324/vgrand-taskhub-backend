@@ -52,6 +52,15 @@ function listOnlyParams(userId) {
 function personalPermissions(row) {
   const isMember = !!row.is_member;
   const isCreator = row.created_by === row._actor_id;
+  if (isMember && row.watching) {
+    // Following a to-do I gave away: see it and its sub-tasks, add sub-tasks, comment, and take it back by deleting
+    // it if I made it. The person it was given to does the work.
+    return {
+      can_edit: false, can_delete: isCreator, can_leave: !isCreator, can_request_delete: false, can_change_status: false,
+      can_hold: false, can_assign: false, can_approve: false, can_review: false, can_warn: false, can_nudge: !row.is_done,
+      can_comment: true, can_add_subtask: true,
+    };
+  }
   return {
     can_edit: isMember,
     can_delete: isMember && isCreator,

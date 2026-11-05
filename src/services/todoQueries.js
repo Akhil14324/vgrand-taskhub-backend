@@ -26,7 +26,7 @@ const TODO_SELECT = `
          ((t.due_date + COALESCE(t.due_time, TIME '23:59')) AT TIME ZONE '${TZ}') AS due_at,
          ((t.deadline_date + TIME '23:59') AT TIME ZONE '${TZ}') AS deadline_at,
          (tm.user_id IS NOT NULL) AS is_member,
-         tm.list_id, tm.section_id, tm.sort_order, tm.dumped_at, bo.position AS board_pos,
+         tm.list_id, tm.section_id, tm.sort_order, tm.dumped_at, tm.watching, bo.position AS board_pos,
          cu.name AS created_by_name, cu.username AS created_by_username,
          du.name AS done_by_name,
          au.name AS assignee_name, au.username AS assignee_username, au.profile_picture AS assignee_picture,
@@ -48,7 +48,7 @@ const TODO_SELECT = `
          (SELECT json_agg(json_build_object('id', u.id, 'name', u.name, 'username', u.username,
                                             'profile_picture', u.profile_picture) ORDER BY m2.added_at)
           FROM todo_members m2 JOIN users u ON u.id = m2.user_id
-          WHERE m2.todo_id = t.id) AS members,
+          WHERE m2.todo_id = t.id AND m2.watching IS NOT TRUE) AS members,
          cu.role AS _creator_role, cu.org_level AS _creator_org_level, cub.designation AS _creator_designation,
          au.role AS _assignee_role, au.org_level AS _assignee_org_level, aub.designation AS _assignee_designation,
          su.role AS _submitter_role, su.org_level AS _submitter_org_level, sub.designation AS _submitter_designation
@@ -85,11 +85,13 @@ const VISIBLE = `(tm.user_id IS NOT NULL OR 0 = ANY($3::int[]) OR (t.business_id
  * `dumped`: 'hide' (default) leaves out what the viewer sent to their Dump, 'only' returns just that, 'any' both.
  */
 const DUMPED = { hide: 'tm.dumped_at IS NULL', only: 'tm.dumped_at IS NOT NULL', any: 'TRUE' };
-async function listTodos(userId, { where = 'TRUE', params = [], tail = '', actor = null, listOnly = false, seeAll = false, dumped = 'hide' } = {}) {
+// Following a to-do I handed to someone (migration 064): hidden from normal lists, returned on request.
+const WATCHING = { hide: 'tm.watching IS NOT TRUE', only: 'tm.watching IS TRUE', any: 'TRUE' };
+async function listTodos(userId, { where = 'TRUE', params = [], tail = '', actor = null, listOnly = false, seeAll = false, dumped = 'hide', watching = 'hide' } = {}) {
   const a = actor || await loadActor(userId);
   const viewer = listOnly ? listOnlyParams(userId) : await viewerParams(userId, a, seeAll);
   const result = await db.query(
-    `${TODO_SELECT} WHERE ${VISIBLE} AND ${DUMPED[dumped] || DUMPED.hide} AND (${where}) ${tail}`,
+    `${TODO_SELECT} WHERE ${VISIBLE} AND ${DUMPED[dumped] || DUMPED.hide} AND ${WATCHING[watching] || WATCHING.hide} AND (${where}) ${tail}`,
     [...viewer, ...params]
   );
   return result.rows.map((row) => decorateTodo(row, a));
@@ -99,7 +101,7 @@ async function listTodos(userId, { where = 'TRUE', params = [], tail = '', actor
 async function getTodoFor(todoId, userId, actor = null) {
   const id = parseInt(todoId, 10);
   if (!id) return null;
-  const rows = await listTodos(userId, { where: 't.id = $5', params: [id], actor, seeAll: true, dumped: 'any' });
+  const rows = await listTodos(userId, { where: 't.id = $5', params: [id], actor, seeAll: true, dumped: 'any', watching: 'any' });
   return rows[0] || null;
 }
 

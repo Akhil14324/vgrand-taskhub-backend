@@ -5,7 +5,7 @@ const { sanitizeText } = require('../middleware/sanitize');
 const { notify, emitToUsers } = require('../utils/notify');
 const { loadActor } = require('../utils/org');
 const { todayInAppZone } = require('../utils/recurrence');
-const { listTodos, getTodoFor, memberIds } = require('../services/todoQueries');
+const { listTodos, getTodoFor, memberIds, descendantIds } = require('../services/todoQueries');
 const { buildTimeline } = require('../services/todoTimeline');
 const { openProcesses } = require('../services/processes');
 const {
@@ -126,7 +126,12 @@ router.get('/todos/:id', authenticate, requireMonitor, async (req, res, next) =>
     const through = viewerMember(req, members);
     if (!through) return res.status(404).json({ error: 'To-do not found' });
     const todo = await getTodoFor(todoId, through);
-    res.json({ todo, ...(await buildTimeline(todo)) });
+    // Every step under it, at any depth, so the people above see the whole process and not only the top task.
+    const stepIds = await descendantIds(todoId);
+    const subtasks = stepIds.length
+      ? await listTodos(through, { where: 't.id = ANY($5::int[])', params: [stepIds], watching: 'any', dumped: 'any', tail: 'ORDER BY t.created_at, t.id' })
+      : [];
+    res.json({ todo, subtasks, ...(await buildTimeline(todo)) });
   } catch (err) {
     next(err);
   }

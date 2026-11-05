@@ -178,8 +178,8 @@ async function addMentionedMembers(todo, text, explicitIds, actor, { quietFor = 
 /** Everyone on the parent also sits on its new sub-task; my own copy keeps the parent's placement. */
 async function attachSubtaskMembers(subtaskId, parent, userId) {
   await db.query(
-    `INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by, dumped_at)
-     SELECT $1::int, m.user_id, CASE WHEN m.user_id = $3::int THEN $4::int END, CASE WHEN m.user_id = $3::int THEN $5::int END, $3::int, m.dumped_at
+    `INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by, dumped_at, watching)
+     SELECT $1::int, m.user_id, CASE WHEN m.user_id = $3::int THEN $4::int END, CASE WHEN m.user_id = $3::int THEN $5::int END, $3::int, m.dumped_at, m.watching
      FROM todo_members m WHERE m.todo_id = $2
      ON CONFLICT DO NOTHING`,
     [subtaskId, parent.id, userId, parent.list_id, parent.section_id]
@@ -202,7 +202,7 @@ router.get('/', authenticate, async (req, res, next) => {
     const actor = await actorOf(req, res);
     if (!actor) return;
     const manageable = new Set([...actor.memberships.keys()].filter((id) => managesBusiness(actor, id)));
-    const [lists, sections, filters, todos, businesses, favorites] = await Promise.all([
+    const [lists, sections, filters, todos, businesses, favorites, watching] = await Promise.all([
       db.query('SELECT * FROM todo_lists WHERE owner_id = $1 ORDER BY sort_order, id', [actor.id]),
       db.query(
         `SELECT s.* FROM todo_sections s
@@ -225,8 +225,15 @@ router.get('/', authenticate, async (req, res, next) => {
         [isLeader(actor), [...actor.memberships.keys()]]
       ),
       db.query('SELECT kind, ref FROM todo_favorites WHERE owner_id = $1', [actor.id]),
+      // What I handed to someone and still follow (migration 064), with its sub-tasks: shown in the Assigned view only.
+      listTodos(actor.id, {
+        actor, watching: 'only',
+        where: `(t.is_done = FALSE OR t.done_at > NOW() - INTERVAL '30 days')`,
+        tail: 'ORDER BY t.is_done, t.created_at DESC LIMIT 1000',
+      }),
     ]);
     res.json({
+      watching,
       favorites: favorites.rows,
       lists: lists.rows,
       sections: sections.rows,
@@ -470,6 +477,8 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
   }
 
   let assigneeId = delegates.length > 1 ? null : delegate ? delegate.id : actor.id;
+  // A step added by the person who handed the to-do over (they only follow it) belongs to whoever does the work.
+  if (parent && !businessId && parent.watching && parent.assignee_id) assigneeId = parent.assignee_id;
   if (businessId) {
     if (assignTo) assigneeId = assignTo;
     else if (parent) assigneeId = parent.assignee_id || null;
@@ -549,6 +558,11 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
         [todo.id, person.id, actor.id]
       );
     }
+    // The giver keeps following it (Assigned view) without it landing on their own lists.
+    await db.query(
+      'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by, watching) VALUES ($1, $2, NULL, NULL, $2, TRUE) ON CONFLICT DO NOTHING',
+      [todo.id, actor.id]
+    );
   } else {
     await db.query(
       'INSERT INTO todo_members (todo_id, user_id, list_id, section_id, added_by) VALUES ($1, $2, $3, $4, $2)',
@@ -627,7 +641,7 @@ router.post('/', authenticate, async (req, res, next) => {
     if (!actor) return;
     const out = await createTodoCore(actor, req.body);
     if (out.error) return res.status(out.status).json({ error: out.error });
-    res.status(201).json({ todo: out.todo, assigned_to: out.assigned_to || undefined, assigned_names: out.assigned_names || undefined });
+    res.status(201).json({ id: out.id, todo: out.todo, assigned_to: out.assigned_to || undefined, assigned_names: out.assigned_names || undefined });
   } catch (err) {
     next(err);
   }
