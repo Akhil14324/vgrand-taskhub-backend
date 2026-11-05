@@ -2,13 +2,16 @@ const express = require('express');
 const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
-const { loadActor, isLeader, managesBusiness, isValidDesignation } = require('../utils/org');
+const { loadActor, isLeader, isPortalAdmin, managesBusiness, isValidDesignation } = require('../utils/org');
+const { defaultBoardFor } = require('../services/boards');
+const { COLOR_NAMES } = require('../utils/columns');
 const { ensureBusinessGroup } = require('../services/org');
 const { visibleBusinessIds, buildTree, SITE_KINDS, SITE_STATUSES } = require('../utils/orgTree');
 
 /**
  * Group -> company -> site (migration 053). Mounted at /api/org next to routes/org.js.
  *   GET    /tree                         what the viewer may see, for the sidebar
+ *   POST   /businesses                   { name, sector?, color?, description? }  a new workspace (leadership only)
  *   POST   /sites                        { business_id, name, kind?, status?, address? }
  *   PATCH  /sites/:id                    { name?, kind?, status?, address?, sort_order?, archived? }
  *   POST   /sites/:id/members            { user_id, designation? }  (also places them in the business)
@@ -60,6 +63,32 @@ router.get('/tree', authenticate, withActor, async (req, res, next) => {
       actor,
       canChange: (id) => canChange(actor, id),
     }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// A workspace is a business: it gets its own default board and shows up in the boards sidebar at once.
+const SECTOR_TYPES = { food: 'restaurant', liquor: 'bar', mining: 'mines', real_estate: 'construction', healthcare: 'hospital', software: 'it', other: 'other' };
+
+router.post('/businesses', authenticate, withActor, async (req, res, next) => {
+  try {
+    if (!isLeader(req.actor) && !isPortalAdmin(req.actor)) return res.status(403).json({ error: 'Only leadership can create a workspace' });
+    const name = sanitizeText(req.body.name, 120);
+    if (!name) return res.status(400).json({ error: 'Name the workspace' });
+    if ((await db.query('SELECT 1 FROM businesses WHERE lower(name) = lower($1)', [name])).rows.length) {
+      return res.status(409).json({ error: 'A workspace with that name already exists' });
+    }
+    const sector = SECTOR_TYPES[req.body.sector] ? req.body.sector : 'other';
+    const color = COLOR_NAMES.includes(req.body.color) ? req.body.color : 'blue';
+    const row = (await db.query(
+      `INSERT INTO businesses (name, type, description, color, sort_order, sector, group_id)
+       VALUES ($1, $2, $3, $4, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM businesses), $5, (SELECT MIN(id) FROM org_groups))
+       RETURNING id, name, type, color, sector`,
+      [name, SECTOR_TYPES[sector], sanitizeText(req.body.description, 1000) || '', color, sector]
+    )).rows[0];
+    await defaultBoardFor(db, row.id);
+    res.status(201).json({ business: row });
   } catch (err) {
     next(err);
   }
