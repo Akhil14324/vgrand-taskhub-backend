@@ -824,6 +824,21 @@ router.patch('/:id(\\d+)/groups/:gid(\\d+)', authenticate, withActor, boardParam
   }
 });
 
+// Deleting a group keeps its tasks: they move to "No group" (they are not deleted).
+router.delete('/:id(\\d+)/groups/:gid(\\d+)', authenticate, withActor, boardParam('manage'), async (req, res, next) => {
+  try {
+    if (isMine(req.board)) return res.status(400).json({ error: 'Lists are deleted from To-do' });
+    const group = (await db.query('SELECT id FROM todo_sections WHERE id = $1 AND board_id = $2', [int(req.params.gid), req.board.id])).rows[0];
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    await db.query('UPDATE todos SET business_section_id = NULL WHERE business_section_id = $1', [group.id]);
+    await db.query('DELETE FROM todo_sections WHERE id = $1', [group.id]);
+    await changed(req.board, 'groups');
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.put('/:id(\\d+)/groups/order', authenticate, withActor, boardParam('add'), async (req, res, next) => {
   try {
     if (isMine(req.board)) await reorder('todo_lists', req.body.ids, 'owner_id = $3', [req.actor.id]);
