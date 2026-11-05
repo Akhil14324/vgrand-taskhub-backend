@@ -2,7 +2,7 @@ const express = require('express');
 const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
-const { emitToUsers } = require('../utils/notify');
+const { emitToUsers, notify } = require('../utils/notify');
 const { loadActor } = require('../utils/org');
 const { listTodos, getTodoFor } = require('../services/todoQueries');
 const { canCreateBoard } = require('../utils/boardAccess');
@@ -22,6 +22,7 @@ const { definitionFromBoard, buildBoard } = require('../services/boardBuild');
 const columnsCatalog = require('../utils/columns');
 const { setDependencies } = require('../services/dependencies');
 const { recipeList, buildRecipe, isBoardProfile } = require('../utils/boardRecipes');
+const { runImport } = require('../services/boardImport');
 
 /**
  * Boards (migration 055), mounted at /api/boards. See MONDAY_FEATURE_SPEC.md sections 2–5.
@@ -45,6 +46,7 @@ const { recipeList, buildRecipe, isBoardProfile } = require('../utils/boardRecip
  *   POST   /:id/items                             { title, group_id?, parent_id?, values? , ...to-do fields }
  *   PUT    /:id/items/:todoId/values/:cid         { value }  custom columns only
  *   POST   /:id/views  PATCH /:id/views/:vid  PUT /:id/views/order  DELETE /:id/views/:vid
+ *   POST   /:id/import                            { mapping, rows, dry_run? }  rows from a spreadsheet -> new tasks
  *   PUT    /:id/members                           { user_id, role }
  *   DELETE /:id/members/:userId
  *
@@ -274,62 +276,26 @@ router.post('/:id(\\d+)/groups/:gid(\\d+)/duplicate', authenticate, withActor, b
   }
 });
 
-// POST /:id/import — { rows: [{ title, group?, due_date?, priority?, values?: { [column title]: raw } }], dry_run? }
-// Creates new items only (it never updates an existing one). A dry run answers what would happen.
+// POST /:id/import — { mapping: [{ to: 'skip'|'name'|'group'|'column'|'new', column_id?, title?, kind? }],
+//   rows: [[cell text ...]], dry_run?, skip_duplicates? (default true), create_groups? (default true), group_id?,
+//   date_order? ('dmy' default | 'mdy') }. Rows pasted from Excel / Google Sheets or read from .xlsx / .csv become
+// NEW tasks (nothing on the board is changed). See services/boardImport.js.
 router.post('/:id(\\d+)/import', authenticate, withActor, boardParam('add'), async (req, res, next) => {
   try {
-    const rows = (Array.isArray(req.body.rows) ? req.body.rows : []).slice(0, 5000);
-    if (!rows.length) return res.status(400).json({ error: 'Nothing to import' });
-    const cols = (await db.query('SELECT * FROM board_columns WHERE board_id = $1 AND archived_at IS NULL AND system_key IS NULL', [req.board.id])).rows;
-    const groups = (await db.query('SELECT id, name FROM todo_sections WHERE board_id = $1 AND NOT archived ORDER BY sort_order', [req.board.id])).rows;
-    const existing = new Set((await db.query('SELECT lower(title) AS t FROM todos WHERE board_id = $1', [req.board.id])).rows.map((r) => r.t));
-    const byTitle = new Map(cols.map((c) => [c.title.toLowerCase(), c]));
-    const labelMaps = new Map();
-    for (const c of cols.filter((x) => x.kind === 'status')) {
-      labelMaps.set(c.id, new Map((await db.query('SELECT id, lower(label) AS l FROM status_labels WHERE column_id = $1 AND archived_at IS NULL', [c.id])).rows.map((r) => [r.l, r.id])));
-    }
-    const plan = rows.map((r, i) => {
-      const title = sanitizeText(r.title, 500);
-      const problems = [];
-      if (!title) problems.push('no name');
-      const values = {};
-      for (const [k, raw] of Object.entries(r.values || {})) {
-        const col = byTitle.get(String(k).toLowerCase());
-        if (!col || raw === '' || raw === null || raw === undefined) continue;
-        let v = raw;
-        if (col.kind === 'status') v = { label_id: labelMaps.get(col.id)?.get(String(raw).toLowerCase()) };
-        if (col.kind === 'dropdown') {
-          const opt = (col.settings?.options || []).find((o) => o.label.toLowerCase() === String(raw).toLowerCase());
-          v = opt ? [opt.id] : '__none__';
-        }
-        const cleaned = cleanValue(col.kind, v, col.settings || {}, col.kind === 'status' ? { labelIds: [...(labelMaps.get(col.id)?.values() || [])] } : {});
-        if (cleaned.error) problems.push(`${col.title}: ${cleaned.error}`); else values[col.id] = cleaned.value;
-      }
-      const group = r.group ? groups.find((g) => g.name.toLowerCase() === String(r.group).toLowerCase()) : null;
-      return { row: i + 1, title, values, group_id: group?.id || groups[0]?.id || null, due_date: r.due_date, priority: r.priority, duplicate: existing.has((title || '').toLowerCase()), problems };
-    });
-    const summary = { rows: plan.length, ok: plan.filter((p) => !p.problems.length).length, with_problems: plan.filter((p) => p.problems.length).length, duplicates: plan.filter((p) => p.duplicate).length };
-    if (req.body.dry_run) return res.json({ summary, problems: plan.filter((p) => p.problems.length).slice(0, 50).map((p) => ({ row: p.row, problems: p.problems })), duplicates: plan.filter((p) => p.duplicate).slice(0, 50).map((p) => ({ row: p.row, title: p.title })) });
-    let made = 0;
-    const skipDuplicates = req.body.skip_duplicates !== false;
-    for (const p of plan) {
-      if (p.problems.length || (skipDuplicates && p.duplicate)) continue;
-      const out = await createTodoCore(req.actor, {
-        title: p.title, due_date: p.due_date || undefined, priority: p.priority || undefined,
-        board_id: req.board.business_id ? req.board.id : undefined, business_id: req.board.business_id || undefined,
-        business_section_id: req.board.business_id ? p.group_id : undefined,
-      }, { quiet: true });
-      const id = out.todo?.id || out.id;
-      if (!id) continue;
-      made += 1;
-      if (!req.board.business_id) await db.query('UPDATE todos SET board_id = $1, business_section_id = $2 WHERE id = $3', [req.board.id, p.group_id, id]);
-      for (const [cid, v] of Object.entries(p.values)) {
-        if (v === null) continue;
-        await db.query('INSERT INTO item_values (todo_id, column_id, value, updated_by) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING', [id, Number(cid), JSON.stringify(v), req.actor.id]);
-      }
-    }
+    const out = await runImport({ board: req.board, access: req.boardAccess, actor: req.actor, input: req.body || {}, createTodoCore });
+    if (out.status >= 300 || req.body.dry_run) return res.status(out.status).json(out.body);
     await changed(req.board, 'groups');
-    res.status(201).json({ summary, created: made });
+    // Owners hear once per import, not once per row; their To-do reloads.
+    for (const [userId, list] of out.owners) {
+      await notify([userId], {
+        type: 'todo_assigned',
+        title: list.length === 1 ? `${req.actor.name} assigned you a task` : `${req.actor.name} assigned you ${list.length} tasks`,
+        body: list.length === 1 ? `${list[0].title} · ${req.board.name}` : `${list.slice(0, 3).map((t) => t.title).join(', ')}${list.length > 3 ? ' ...' : ''} · ${req.board.name}`,
+        data: list.length === 1 ? { todoId: list[0].id } : {},
+      });
+    }
+    emitToUsers([req.actor.id, ...out.owners.keys()], 'todo:changed', { action: 'imported' });
+    res.status(201).json(out.body);
   } catch (err) {
     next(err);
   }
