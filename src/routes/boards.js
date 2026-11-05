@@ -572,10 +572,18 @@ router.post('/:id(\\d+)/columns', authenticate, withActor, boardParam('manage'),
       const kind = req.body.kind;
       if (!KINDS[kind] || KINDS[kind].system) return res.status(400).json({ error: 'Pick a column type' });
       const title = sanitizeText(req.body.title, 120) || KINDS[kind].label;
+      // A column added from one group's header belongs to that group only.
+      let groupId = int(req.body.group_id) || null;
+      if (groupId) {
+        const ok = isMine(board)
+          ? await db.query('SELECT 1 FROM todo_lists WHERE id = $1 AND owner_id = $2', [groupId, req.actor.id])
+          : await db.query('SELECT 1 FROM todo_sections WHERE id = $1 AND board_id = $2', [groupId, board.id]);
+        if (!ok.rows.length) return res.status(400).json({ error: 'That group is not on this board' });
+      }
       col = (await db.query(
-        `INSERT INTO board_columns (board_id, kind, title, width, sort_order, settings, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [board.id, kind, title, Math.min(Math.max(int(req.body.width) || 160, 60), 600), position, cleanSettings(kind, req.body.settings), req.actor.id]
+        `INSERT INTO board_columns (board_id, kind, title, width, sort_order, settings, created_by, group_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+        [board.id, kind, title, Math.min(Math.max(int(req.body.width) || 160, 60), 600), position, cleanSettings(kind, req.body.settings), req.actor.id, groupId]
       )).rows[0];
       if (kind === 'status') {
         await addStatusLabels(db, col.id, [
@@ -832,7 +840,9 @@ router.delete('/:id(\\d+)/groups/:gid(\\d+)', authenticate, withActor, boardPara
     if (!group) return res.status(404).json({ error: 'Group not found' });
     await db.query('UPDATE todos SET business_section_id = NULL WHERE business_section_id = $1', [group.id]);
     await db.query('DELETE FROM todo_sections WHERE id = $1', [group.id]);
+    await db.query('UPDATE board_columns SET archived_at = COALESCE(archived_at, NOW()) WHERE board_id = $1 AND group_id = $2', [req.board.id, group.id]);
     await changed(req.board, 'groups');
+    await changed(req.board, 'columns');
     res.json({ ok: true });
   } catch (err) {
     next(err);
