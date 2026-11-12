@@ -141,6 +141,22 @@ async function buildBoard(actor, place, def, { withItems = true, createTodoCore 
     [actor.id, board.business_id, board.id, groups.map((g) => String(g.name).slice(0, 120)), groups.map((g) => (COLOR_NAMES.includes(g.color) ? g.color : 'blue'))]
   )).rows;
   const groupIdAt = new Map(groupRows.map((r) => [Number(r.sort_order), r.id]));
+  // A group may name its parent group (`parent`, another group of this definition, migration 066). Only the rows
+  // just created above are pointed at their parent.
+  if (groups.some((g) => g.parent)) {
+    const idByName = new Map(groups.map((g, i) => [String(g.name), groupIdAt.get(i + 1)]));
+    const kids = []; const parents = [];
+    groups.forEach((g, i) => {
+      const pid = g.parent ? idByName.get(String(g.parent)) : null;
+      if (pid) { kids.push(groupIdAt.get(i + 1)); parents.push(pid); }
+    });
+    if (kids.length) {
+      await db.query(
+        'UPDATE todo_sections s SET parent_group_id = x.p FROM unnest($1::int[], $2::int[]) AS x(id, p) WHERE s.id = x.id',
+        [kids, parents]
+      );
+    }
+  }
 
   let made = 0;
   if (withItems) {
