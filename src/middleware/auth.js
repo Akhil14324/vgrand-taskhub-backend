@@ -5,6 +5,9 @@ const { runAsActor } = require('../utils/actorContext');
 
 dotenv.config();
 
+const USER_TTL_MS = 5000;
+const userCache = new Map(); // id -> { id, role, status, at }
+
 async function authenticate(req, res, next) {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) {
@@ -16,15 +19,22 @@ async function authenticate(req, res, next) {
 
     // Fetch the user's current role from the database to ensure
     // role changes (promote/demote) take effect without re-login
-    const result = await db.query(
-      'SELECT id, role, status FROM users WHERE id = $1',
-      [decoded.id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'User no longer exists' });
+    // Kept for a few seconds: the app fires many requests in a burst, and each used to cost a database
+    // round trip here. A role change or deactivation still takes effect within USER_TTL_MS.
+    let dbUser = userCache.get(decoded.id);
+    if (!dbUser || dbUser.at < Date.now() - USER_TTL_MS) {
+      const result = await db.query(
+        'SELECT id, role, status FROM users WHERE id = $1',
+        [decoded.id]
+      );
+      if (result.rows.length === 0) {
+        userCache.delete(decoded.id);
+        return res.status(401).json({ error: 'User no longer exists' });
+      }
+      dbUser = { ...result.rows[0], at: Date.now() };
+      userCache.set(decoded.id, dbUser);
+      if (userCache.size > 2000) userCache.delete(userCache.keys().next().value);
     }
-
-    const dbUser = result.rows[0];
     if (dbUser.status === 'inactive') {
       return res.status(403).json({ error: 'Account is inactive' });
     }

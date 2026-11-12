@@ -85,31 +85,42 @@ function displayTitle(u, designation, membershipTitle) {
  * Load everything needed to make permission decisions for one user.
  * Returns { id, name, username, role, org_level, global, memberships: Map<businessId, designation> }.
  */
+// The same person fires many requests in a burst; each used to cost two database round trips here.
+// Kept for a few seconds, so a membership or permission change shows up within ACTOR_TTL_MS.
+const ACTOR_TTL_MS = 5000;
+const actorCache = new Map(); // userId -> { at, actor }
+
 async function loadActor(userId) {
-  const result = await db.query(
-    `SELECT u.id, u.name, u.username, u.role, u.org_level, u.title, u.status,
-            COALESCE(json_agg(json_build_object('business_id', ub.business_id, 'designation', ub.designation))
-              FILTER (WHERE ub.business_id IS NOT NULL), '[]') AS memberships
-     FROM users u
-     LEFT JOIN user_businesses ub ON ub.user_id = u.id
-     WHERE u.id = $1
-     GROUP BY u.id`,
-    [userId]
-  );
+  const hit = actorCache.get(userId);
+  if (hit && hit.at > Date.now() - ACTOR_TTL_MS) return hit.actor;
+  // The person and their per-person switches (see utils/permissions.js) are read together. Before the
+  // migration has run there is no switches table: no overrides.
+  const [result, overrides] = await Promise.all([
+    db.query(
+      `SELECT u.id, u.name, u.username, u.role, u.org_level, u.title, u.status,
+              COALESCE(json_agg(json_build_object('business_id', ub.business_id, 'designation', ub.designation))
+                FILTER (WHERE ub.business_id IS NOT NULL), '[]') AS memberships
+       FROM users u
+       LEFT JOIN user_businesses ub ON ub.user_id = u.id
+       WHERE u.id = $1
+       GROUP BY u.id`,
+      [userId]
+    ),
+    db.query('SELECT permission, allowed FROM user_permissions WHERE user_id = $1', [userId]).catch((err) => {
+      if (err.code !== '42P01') throw err;
+      return { rows: [] };
+    }),
+  ]);
   const row = result.rows[0];
   if (!row) return null;
   const memberships = new Map();
   for (const m of row.memberships) memberships.set(Number(m.business_id), m.designation);
-  // Per-person switches (see utils/permissions.js). Before the migration has run there is no table: no overrides.
   const perms = new Map();
-  try {
-    const overrides = await db.query('SELECT permission, allowed FROM user_permissions WHERE user_id = $1', [userId]);
-    for (const p of overrides.rows) perms.set(p.permission, p.allowed);
-  } catch (err) {
-    if (err.code !== '42P01') throw err;
-  }
+  for (const p of overrides.rows) perms.set(p.permission, p.allowed);
   const actor = { ...row, global: globalLevel(row), memberships, perms };
   actor.can = (key) => hasPermission(actor, key, actorBestLevel(actor));
+  actorCache.set(userId, { at: Date.now(), actor });
+  if (actorCache.size > 2000) actorCache.delete(actorCache.keys().next().value);
   return actor;
 }
 
