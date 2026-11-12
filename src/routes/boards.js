@@ -86,8 +86,12 @@ function boardParam(need) {
   };
 }
 
-async function changed(board, what, extra = {}) {
-  emitToUsers(await boardAudience(board), 'board:changed', { boardId: board.id, what, ...extra });
+// Tells the other screens in the background: the person who made the change gets their answer without
+// waiting for the audience query.
+function changed(board, what, extra = {}) {
+  boardAudience(board)
+    .then((ids) => emitToUsers(ids, 'board:changed', { boardId: board.id, what, ...extra }))
+    .catch((err) => console.error('[boards] board:changed failed:', err.message));
 }
 
 // "My to-dos" (kind 'my_todos', migration 061): a board over the personal to-dos the viewer is on, whose groups
@@ -113,9 +117,16 @@ async function columnOf(req, res) {
 
 async function reorder(table, ids, where, params) {
   const list = (Array.isArray(ids) ? ids : []).map(int).filter(Boolean);
-  for (const [i, id] of list.entries()) {
-    await db.query(`UPDATE ${table} SET sort_order = $1 WHERE id = $2 AND ${where}`, [i + 1, id, ...params]);
-  }
+  if (!list.length) return 0;
+  // One statement for the whole order (it used to be one round trip per row). `where` is written for
+  // parameters starting at $3; here the ids are $1, so its numbers shift down by one.
+  const shifted = where.replace(/\$(\d+)/g, (_, n) => `$${Number(n) - 1}`);
+  await db.query(
+    `UPDATE ${table} t SET sort_order = o.ord::int
+     FROM unnest($1::int[]) WITH ORDINALITY AS o(id, ord)
+     WHERE t.id = o.id AND ${shifted.replace(/\b(board_id|column_id)\b/g, 't.$1')}`,
+    [list, ...params]
+  );
   return list.length;
 }
 
@@ -469,9 +480,10 @@ router.get('/:id(\\d+)', authenticate, withActor, boardParam('view'), async (req
       actor,
       where: scope.where,
       params: scope.params,
+      // Items with no saved position come last, in the order they were added (a new task lands at the bottom).
       tail: mine
-        ? 'ORDER BY tm.list_id NULLS FIRST, COALESCE(bo.position, tm.sort_order, 0), t.created_at'
-        : 'ORDER BY t.business_section_id NULLS FIRST, COALESCE(bo.position, tm.sort_order, 0), t.created_at',
+        ? 'ORDER BY tm.list_id NULLS FIRST, COALESCE(bo.position, tm.sort_order, 2147483647), t.created_at, t.id'
+        : 'ORDER BY t.business_section_id NULLS FIRST, COALESCE(bo.position, tm.sort_order, 2147483647), t.created_at, t.id',
     });
     // On "My to-dos" a group is one of the person's lists.
     if (mine) items = items.map((t) => (t.parent_id ? t : { ...t, business_section_id: t.list_id || null }));
@@ -584,8 +596,11 @@ router.post('/:id(\\d+)/columns', authenticate, withActor, boardParam('manage'),
         ]);
       }
     }
-    const labels = (await db.query('SELECT * FROM status_labels WHERE column_id = $1 AND archived_at IS NULL ORDER BY sort_order', [col.id])).rows;
-    await changed(board, 'columns');
+    const isStatus = col.kind === 'status';
+    const labels = isStatus
+      ? (await db.query('SELECT * FROM status_labels WHERE column_id = $1 AND archived_at IS NULL ORDER BY sort_order', [col.id])).rows
+      : [];
+    changed(board, 'columns');
     res.status(201).json({ column: { ...col, labels: labels.length ? labels : undefined } });
   } catch (err) {
     next(err);
@@ -824,7 +839,22 @@ router.patch('/:id(\\d+)/groups/:gid(\\d+)', authenticate, withActor, boardParam
   }
 });
 
-router.put('/:id(\\d+)/groups/order', authenticate, withActor, boardParam('add'), async (req, res, next) => {
+// DELETE /:id/groups/:gid — removes the group only. Its items are never deleted: they move to "No group"
+// (todos.business_section_id is ON DELETE SET NULL), and the group row is copied to deleted_rows by the trigger.
+router.delete('/:id(\\d+)/groups/:gid(\\d+)', authenticate, withActor, boardParam('manage'), async (req, res, next) => {
+  try {
+    const group = (await db.query('SELECT id FROM todo_sections WHERE id = $1 AND board_id = $2', [int(req.params.gid), req.board.id])).rows[0];
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    const moved = await db.query('SELECT COUNT(*)::int AS n FROM todos WHERE business_section_id = $1', [group.id]);
+    await db.query('DELETE FROM todo_sections WHERE id = $1', [group.id]);
+    await changed(req.board, 'groups');
+    res.json({ ok: true, moved_items: moved.rows[0].n });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put('/:id(\\d+)/groups/order',authenticate, withActor, boardParam('add'), async (req, res, next) => {
   try {
     if (isMine(req.board)) await reorder('todo_lists', req.body.ids, 'owner_id = $3', [req.actor.id]);
     else await reorder('todo_sections', req.body.ids, 'board_id = $3', [req.board.id]);

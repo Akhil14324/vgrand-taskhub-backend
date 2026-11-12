@@ -129,9 +129,11 @@ async function boardMembers(boardId) {
 
 /** Board plus the actor's access to it, or null when they cannot see it. */
 async function boardFor(boardId, actor) {
-  const board = await loadBoard(boardId);
+  // The board and its members are read together (two round trips became one).
+  const id = parseInt(boardId, 10);
+  if (!id) return null;
+  const [board, members] = await Promise.all([loadBoard(id), boardMembers(id)]);
   if (!board) return null;
-  const members = await boardMembers(board.id);
   const access = boardAccess(actor, board, members);
   if (!access.view) return null;
   return { board, members, access };

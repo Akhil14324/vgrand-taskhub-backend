@@ -5,6 +5,8 @@ const { monitorablePeople } = require('../services/monitor');
 const { todayInAppZone } = require('../utils/recurrence');
 const { emitToUsers } = require('../utils/notify');
 const { cleanBox, statusOf, summarize, editable, sendProblem } = require('../utils/timebox');
+const { cleanReport, SYSTEM_PROMPT } = require('../utils/dayReport');
+const { chatJSON } = require('../utils/openai');
 
 /**
  * /api/timebox: the Timebox planner (migration 058). One box per person per day.
@@ -63,6 +65,7 @@ function shape(row, date, today, { mine }) {
     can_send: mine && !sendProblem(date, today, row),
     summary: summarize(row),
     box,
+    report: mine ? row?.report || null : null,
   };
 }
 
@@ -131,6 +134,82 @@ router.post('/day/:date/send', authenticate, async (req, res, next) => {
     // The people above see it arrive in their Team list (no notification: forty boxes a night would be noise).
     above(req.user.id).then((ids) => emitToUsers(ids, 'timebox:changed', { date, user_id: req.user.id })).catch(() => {});
     res.json({ ...shape(row, date, today, { mine: true }), mine: true, seen_by: [] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The end-of-day report (migration 065): written by the AI from the day, then edited by its owner.
+//   POST /day/:date/report/generate  { notes? }   draft it from the box, the work finished that day and the notes
+//   PUT  /day/:date/report           { report }   save the owner's edits
+// It stays editable after the timebox is sent: it is the owner's own write-up of the day.
+// ---------------------------------------------------------------------------
+const TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
+
+/** The row for (user, date), created empty if the day has none yet, so a report can hang on it. */
+async function ensureBox(userId, date) {
+  await db.query('INSERT INTO timeboxes (user_id, box_date) VALUES ($1, $2::date) ON CONFLICT (user_id, box_date) DO NOTHING', [userId, date]);
+  return loadBox(userId, date);
+}
+
+async function saveReport(boxId, report) {
+  return (await db.query('UPDATE timeboxes SET report = $2 WHERE id = $1 RETURNING *', [boxId, JSON.stringify(report)])).rows[0];
+}
+
+router.post('/day/:date/report/generate', authenticate, async (req, res, next) => {
+  try {
+    const date = dateParam(req, res);
+    if (!date) return;
+    const notes = String(req.body?.notes || '').slice(0, 4000);
+    const me = (await db.query('SELECT name FROM users WHERE id = $1', [req.user.id])).rows[0];
+    const row = await ensureBox(req.user.id, date);
+    // Work finished on that day (in the company's timezone) that is theirs or shared with them.
+    const [done, people] = await Promise.all([
+      db.query(
+        `SELECT t.title, LEFT(COALESCE(t.notes, ''), 240) AS notes, b.name AS business, t.duration_minutes
+         FROM todos t LEFT JOIN businesses b ON b.id = t.business_id
+         WHERE t.is_done AND (t.done_at AT TIME ZONE $3)::date = $2::date
+           AND (t.assignee_id = $1 OR EXISTS (SELECT 1 FROM todo_members m WHERE m.todo_id = t.id AND m.user_id = $1))
+         ORDER BY t.done_at LIMIT 60`,
+        [req.user.id, date, TIMEZONE]
+      ),
+      db.query("SELECT COUNT(*)::int AS n FROM users WHERE status <> 'inactive'"),
+    ]);
+    const facts = {
+      person: me?.name || 'the founder',
+      date,
+      group_size: people.rows[0].n,
+      priorities: (row.priorities || []).map((p) => ({ text: p.text, done: !!p.done })),
+      planned_blocks: (row.blocks || []).map((b) => ({ from: b.start, to: b.end, text: b.text, done: b.done })),
+      brain_dump: (row.brain_dump || []).map((p) => p.text),
+      own_words_about_the_day: row.reflection || '',
+      extra_notes_from_the_person: notes,
+      tasks_finished_today: done.rows,
+    };
+    if (!facts.priorities.length && !facts.planned_blocks.length && !done.rows.length && !notes && !facts.own_words_about_the_day) {
+      return res.status(400).json({ error: 'There is nothing to write a report from yet. Plan the day, finish a task or type a few notes.' });
+    }
+    const drafted = await chatJSON({ system: SYSTEM_PROMPT, user: JSON.stringify(facts), temperature: 0.4, maxTokens: 1400 });
+    const draft = cleanReport(drafted);
+    // A group cannot save time for more people than it has.
+    const capped = cleanReport({ ...draft, time_saved: { ...draft.time_saved, people: Math.min(draft.time_saved.people, people.rows[0].n) } });
+    const saved = await saveReport(row.id, { ...capped, generated_at: new Date().toISOString() });
+    res.json({ report: saved.report });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put('/day/:date/report', authenticate, async (req, res, next) => {
+  try {
+    const date = dateParam(req, res);
+    if (!date) return;
+    if (!req.body?.report || typeof req.body.report !== 'object') return res.status(400).json({ error: 'Send the report to save' });
+    const row = await ensureBox(req.user.id, date);
+    const prev = row.report || {};
+    const saved = await saveReport(row.id, { ...cleanReport(req.body.report), generated_at: prev.generated_at || null, edited_at: new Date().toISOString() });
+    res.json({ report: saved.report });
   } catch (err) {
     next(err);
   }
