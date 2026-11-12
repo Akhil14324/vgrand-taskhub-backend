@@ -3,12 +3,13 @@ const { buildBoard } = require('../services/boardBuild');
 const { DEFAULT_COLUMNS, DEFAULT_VIEWS } = require('../utils/columns');
 
 /**
- * "Pending Remaining Works" for Elite Homes (VGrand Infra): one private site board, a top group of that name and one
- * flat group per flat (60) under it, each with its own tasks from the handwritten remaining-works sheet.
- * Runs once, tracked as ELITE_PENDING_MARKER. Only adds rows (needs migration 066). Nothing existing is changed.
+ * "Pending Remaining Works" for Elite Homes (VGrand Infra): one private site board with one group of that name.
+ * Each flat (60) is a main task in it (101A ...), and the work listed for the flat on the handwritten
+ * remaining-works sheet are that task's sub-tasks. (v1 made one group per flat; v2 replaces it.)
+ * Runs once, tracked as ELITE_PENDING_MARKER. Only adds rows Nothing existing is changed.
  * NOT wired into migrations/run.js on purpose: run it by hand with `npm run seed:elite-homes`.
  */
-const ELITE_PENDING_MARKER = 'seed:elite-homes-pending-works-v1';
+const ELITE_PENDING_MARKER = 'seed:elite-homes-pending-works-v2';
 const BOARD_NAME = 'Elite Homes - Remaining Works';
 const TOP_GROUP = 'Pending Remaining Works';
 const NOTE = 'Source: handwritten remaining-works sheet';
@@ -95,10 +96,6 @@ async function seedEliteHomesPending({ log = console.log } = {}) {
   const names = flats.map((f) => f.flat);
   if (flats.length !== 60 || new Set(names).size !== 60) throw new Error(`Sheet must have 60 distinct flats, has ${flats.length}`);
 
-  const col = await db.directPool.query(
-    "SELECT 1 FROM information_schema.columns WHERE table_name = 'todo_sections' AND column_name = 'parent_group_id'");
-  if (!col.rows.length) throw new Error('Migration 066 has not been applied (todo_sections.parent_group_id missing). Run npm run migrate first.');
-
   const site = (await db.directPool.query(
     `SELECT s.id, s.business_id FROM sites s JOIN businesses b ON b.id = s.business_id
       WHERE b.name ILIKE '%infra%' AND s.name = 'Elite Homes' ORDER BY b.id LIMIT 1`)).rows[0];
@@ -117,10 +114,10 @@ async function seedEliteHomesPending({ log = console.log } = {}) {
     icon: 'home-outline', color: 'blue', item_word: 'Task',
     columns: DEFAULT_COLUMNS.map((k) => ({ system_key: k })),
     views: DEFAULT_VIEWS,
-    groups: [
-      { name: TOP_GROUP, color: 'blue', items: [] },
-      ...flats.map((f) => ({ name: f.flat, color: 'grey', parent: TOP_GROUP, items: f.tasks.map((title) => ({ title, notes: NOTE })) })),
-    ],
+    groups: [{
+      name: TOP_GROUP, color: 'blue',
+      items: flats.map((f) => ({ title: f.flat, notes: NOTE, subtasks: f.tasks.map((title) => ({ title, notes: NOTE })) })),
+    }],
   };
   log('Building Elite Homes - Remaining Works...');
   const out = await buildBoard(actor, {
@@ -128,7 +125,7 @@ async function seedEliteHomesPending({ log = console.log } = {}) {
     description: 'Pending remaining works per flat, from the handwritten sheet.',
   }, def, { withItems: true });
   await db.directPool.query('INSERT INTO migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [ELITE_PENDING_MARKER]);
-  log(`  ✓ board ${out.board.id}: ${def.groups.length} groups, ${out.items} tasks.`);
+  log(`  ✓ board ${out.board.id}: ${flats.length} main tasks, ${out.items - flats.length} sub-tasks.`);
   return { created: true, boardId: out.board.id, items: out.items };
 }
 

@@ -194,6 +194,37 @@ async function buildBoard(actor, place, def, { withItems = true, createTodoCore 
          SELECT d, $2::int, $2::int, 'created', $3::jsonb FROM unnest($1::int[]) AS d`,
         [ids, actor.id, JSON.stringify({ parent_id: null, business_id: board.business_id || null, review_state: 'accepted', from_template: true })]
       );
+      // Sub-tasks (`subtasks`: [title | { title, notes }]) of a new item: one more bulk insert, on the same board.
+      const subs = [];
+      flat.forEach((f, i) => {
+        for (const st of (f.it.subtasks || []).slice(0, ITEM_LIMIT)) {
+          const t = sanitizeText(typeof st === 'string' ? st : st?.title, 500);
+          if (t) subs.push({ parent: ids[i], title: t, notes: sanitizeText(typeof st === 'string' ? '' : st?.notes, 5000) || '' });
+        }
+      });
+      if (subs.length) {
+        const subIds = (await db.query(
+          `INSERT INTO todos (created_by, title, notes, parent_id, business_id, board_id)
+           SELECT $1, x.title, x.notes, x.parent, $2, $3
+             FROM unnest($4::text[], $5::text[], $6::int[]) WITH ORDINALITY AS x(title, notes, parent, ord)
+            ORDER BY x.ord
+           RETURNING id`,
+          [actor.id, board.business_id || null, board.id, subs.map((x) => x.title), subs.map((x) => x.notes), subs.map((x) => x.parent)]
+        )).rows.map((r) => r.id);
+        await db.query(
+          `INSERT INTO todo_members (todo_id, user_id, list_id, added_by)
+           SELECT d, $2::int, NULL::int, $2::int FROM unnest($1::int[]) AS d ON CONFLICT DO NOTHING`,
+          [subIds, actor.id]
+        );
+        await db.query(
+          `INSERT INTO todo_events (todo_id, user_id, subject_id, kind, meta)
+           SELECT d, $2::int, $2::int, 'created',
+                  jsonb_build_object('parent_id', p, 'business_id', $3::int, 'review_state', 'accepted', 'from_template', true)
+             FROM unnest($1::int[], $4::int[]) AS x(d, p)`,
+          [subIds, actor.id, board.business_id || null, subs.map((x) => x.parent)]
+        );
+        made += subIds.length;
+      }
       const vTodo = []; const vCol = []; const vVal = [];
       flat.forEach((f, i) => {
         for (const [title, raw] of Object.entries(f.it.values || {})) {
