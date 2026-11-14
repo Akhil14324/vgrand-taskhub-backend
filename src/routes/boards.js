@@ -17,6 +17,7 @@ const { createTodoCore, announce } = require('./todos');
 const { logEvent } = require('../services/todoTimeline');
 const { computeFormulas, computeMirrors, plainValue } = require('../utils/boardCompute');
 const { configured: aiConfigured, chatJSON } = require('../utils/openai');
+const { cleanWidgets, aiPrompt } = require('../utils/boardDashboard');
 const { BUILT_INS, checkDefinition } = require('../utils/boardTemplates');
 const { definitionFromBoard, buildBoard } = require('../services/boardBuild');
 const columnsCatalog = require('../utils/columns');
@@ -1134,12 +1135,37 @@ function cleanViewSettings(raw = {}) {
   for (const k of ['group_by', 'group_dir', 'header_height', 'item_height', 'date_column', 'timeline_column', 'zoom', 'density', 'chart', 'search']) {
     if (raw[k] !== undefined && raw[k] !== null) s[k] = String(raw[k]).slice(0, 200);
   }
+  if (raw.widgets !== undefined) s.widgets = cleanWidgets(raw.widgets);
   if (raw.pinned !== undefined) s.pinned = Math.min(Math.max(int(raw.pinned) || 0, 0), 5);
   if (raw.show_done !== undefined) s.show_done = !!raw.show_done;
   if (raw.collapsed_groups !== undefined && Array.isArray(raw.collapsed_groups)) s.collapsed_groups = raw.collapsed_groups.map(int).filter(Boolean).slice(0, 500);
   const size = JSON.stringify(s).length;
   return size > 20000 ? {} : s;
 }
+
+// POST /:id/dashboard/ai — { request, widgets, schema } the AI proposes a new widget list; nothing is saved here,
+// the client previews it and saves through the view's settings (OpenAI only).
+router.post('/:id(\\d+)/dashboard/ai', authenticate, withActor, boardParam('view'), async (req, res, next) => {
+  try {
+    if (!aiConfigured()) return res.status(503).json({ error: 'AI is not set up on the server' });
+    const request = String(req.body.request || '').trim();
+    if (!request) return res.status(400).json({ error: 'Say what you want on the dashboard' });
+    const cols = (await db.query('SELECT id, title, kind, system_key FROM board_columns WHERE board_id = $1 AND archived_at IS NULL', [req.board.id])).rows;
+    const schema = {
+      columns: cols.map((c) => ({ id: String(c.id), title: c.title, kind: c.kind })),
+      dimensions: ['status', 'person', 'group', 'priority', 'due_week', 'due_month', 'created_week',
+        ...cols.filter((c) => !c.system_key && !['files', 'long_text', 'updates', 'dependency', 'ai'].includes(c.kind)).map((c) => `col:${c.id}`)],
+      numeric_columns: cols.filter((c) => ['numbers', 'formula', 'rating'].includes(c.kind)).map((c) => ({ id: String(c.id), title: c.title })),
+    };
+    const current = cleanWidgets(req.body.widgets, schema);
+    const reply = await chatJSON({ ...aiPrompt({ request, widgets: current, schema }), maxTokens: 3000 });
+    const widgets = cleanWidgets(reply.widgets, schema);
+    if (!widgets.length) return res.status(422).json({ error: 'The AI did not come back with a dashboard. Try saying it another way.' });
+    res.json({ widgets, summary: String(reply.summary || '').slice(0, 300) });
+  } catch (err) {
+    next(err);
+  }
+});
 
 async function viewOf(req, res) {
   const view = (await db.query('SELECT * FROM board_views WHERE id = $1 AND board_id = $2', [int(req.params.vid), req.board.id])).rows[0];
