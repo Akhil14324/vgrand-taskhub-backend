@@ -24,6 +24,7 @@ const columnsCatalog = require('../utils/columns');
 const { setDependencies } = require('../services/dependencies');
 const { recipeList, buildRecipe, isBoardProfile } = require('../utils/boardRecipes');
 const { runImport } = require('../services/boardImport');
+const { buildProcess } = require('../utils/process');
 
 /**
  * Boards (migration 055), mounted at /api/boards. See MONDAY_FEATURE_SPEC.md sections 2–5.
@@ -1037,6 +1038,55 @@ router.get('/:id(\\d+)/activity', authenticate, withActor, boardParam('view'), a
 // PUT /:id/items/:todoId/depends-on — { ids: [todoId, ...] } what this task waits for (replaces the list).
 // The task, and everything that waits for it, moves to start after the latest of them; later, when one of
 // them changes its date, the tasks that wait for it move by the same days (services/dependencies.js).
+// GET /:id/items/:todoId/process — one task as a process: where its time went (steps and how long each took,
+// time in each stage, who held it, what it waited for, blockers). Read only; the maths is utils/process.js.
+router.get('/:id(\\d+)/items/:todoId(\\d+)/process', authenticate, withActor, boardParam('view'), async (req, res, next) => {
+  try {
+    const todo = await getTodoFor(int(req.params.todoId), req.actor.id, req.actor);
+    if (!todo || !onBoard(todo, req.board)) return res.status(404).json({ error: 'Task not found on this board' });
+    const [events, steps, waitsFor, neededBy, blockers] = await Promise.all([
+      db.query('SELECT kind, from_value, to_value, subject_id, meta, created_at FROM todo_events WHERE todo_id = $1 ORDER BY created_at, id', [todo.id]),
+      db.query(
+        `WITH RECURSIVE tree AS (
+           SELECT t.id, t.parent_id, 1 AS depth FROM todos t WHERE t.parent_id = $1
+           UNION ALL
+           SELECT c.id, c.parent_id, tree.depth + 1 FROM todos c JOIN tree ON c.parent_id = tree.id WHERE tree.depth < 8
+         )
+         SELECT t.id, t.parent_id, t.title, t.status, t.is_done, t.created_at, t.assigned_at, t.started_at, t.done_at, t.due_date,
+                t.status_since, t.status_seconds, t.duration_minutes, u.name AS assignee_name
+         FROM tree JOIN todos t ON t.id = tree.id LEFT JOIN users u ON u.id = t.assignee_id LIMIT 500`,
+        [todo.id]
+      ),
+      db.query(
+        `SELECT t.id, t.title, t.is_done, t.done_at, t.due_date, u.name AS assignee_name, d.created_at AS linked_at
+         FROM todo_dependencies d JOIN todos t ON t.id = d.depends_on_id LEFT JOIN users u ON u.id = t.assignee_id
+         WHERE d.todo_id = $1 ORDER BY d.created_at`,
+        [todo.id]
+      ),
+      db.query(
+        `SELECT t.id, t.title, t.is_done, t.due_date, u.name AS assignee_name
+         FROM todo_dependencies d JOIN todos t ON t.id = d.todo_id LEFT JOIN users u ON u.id = t.assignee_id
+         WHERE d.depends_on_id = $1 ORDER BY t.due_date NULLS LAST, t.id`,
+        [todo.id]
+      ),
+      db.query(
+        `SELECT b.kind, b.note, b.raised_at, b.resolved_at, bu.name AS blocked_by_user_name, bt.title AS blocked_by_todo_title
+         FROM todo_blockers b LEFT JOIN users bu ON bu.id = b.blocked_by_user_id LEFT JOIN todos bt ON bt.id = b.blocked_by_todo_id
+         WHERE b.todo_id = $1 ORDER BY b.raised_at`,
+        [todo.id]
+      ),
+    ]);
+    const ids = [...new Set([todo.created_by, todo.assignee_id, ...events.rows.flatMap((e) => [e.subject_id, e.meta?.to_id, e.meta?.assignee_id])].filter(Boolean))];
+    const names = new Map(ids.length ? (await db.query('SELECT id, name FROM users WHERE id = ANY($1::int[])', [ids])).rows.map((u) => [u.id, u.name]) : []);
+    res.json(buildProcess({
+      todo, events: events.rows, steps: steps.rows, waitsFor: waitsFor.rows, neededBy: neededBy.rows, blockers: blockers.rows,
+      nameOf: (id) => names.get(Number(id)) || null,
+    }));
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.put('/:id(\\d+)/items/:todoId(\\d+)/depends-on', authenticate, withActor, boardParam('view'), async (req, res, next) => {
   try {
     const todo = await getTodoFor(int(req.params.todoId), req.actor.id, req.actor);
