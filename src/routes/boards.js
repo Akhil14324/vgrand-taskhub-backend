@@ -15,7 +15,7 @@ const {
 } = require('../services/boards');
 const { createTodoCore, announce } = require('./todos');
 const { logEvent } = require('../services/todoTimeline');
-const { computeFormulas, computeMirrors, plainValue } = require('../utils/boardCompute');
+const { computeFormulas, computeMirrors, plainValue, mirrorLooks } = require('../utils/boardCompute');
 const { configured: aiConfigured, chatJSON } = require('../utils/openai');
 const { cleanWidgets, aiPrompt } = require('../utils/boardDashboard');
 const { BUILT_INS, checkDefinition } = require('../utils/boardTemplates');
@@ -386,6 +386,7 @@ async function computedValues({ items, columns, values, actor, ids }) {
   const relationCols = columns.filter((c) => c.kind === 'board_relation');
   const linkedIds = [...new Set(items.flatMap((t) => relationCols.flatMap((c) => values[t.id]?.[c.id] || [])))].slice(0, 500);
   let linked = { items: [], columns: [], values: {} };
+  let mirrors = {};
   if (linkedIds.length) {
     const linkedItems = await listTodos(actor.id, { actor, where: 't.id = ANY($5::int[])', params: [linkedIds] });
     const boardIds = [...new Set(linkedItems.map((t) => t.board_id).filter(Boolean))];
@@ -395,9 +396,16 @@ async function computedValues({ items, columns, values, actor, ids }) {
     ]);
     const lv = {};
     for (const r of lvals.rows) { if (!lv[r.todo_id]) lv[r.todo_id] = {}; lv[r.todo_id][r.column_id] = r.value; }
-    const lcolsVisible = lcols.rows.filter((c) => c.settings?.view !== 'managers');
+    // The linked columns' status labels, so a mirrored status reads and is coloured like the original.
+    const statusCols = lcols.rows.filter((c) => c.kind === 'status').map((c) => c.id);
+    const llabels = statusCols.length
+      ? (await db.query('SELECT column_id, label, color, maps_to, id FROM status_labels WHERE column_id = ANY($1::int[]) AND archived_at IS NULL ORDER BY sort_order, id', [statusCols])).rows
+      : [];
+    const lcolsVisible = lcols.rows.filter((c) => c.settings?.view !== 'managers')
+      .map((c) => (c.kind === 'status' ? { ...c, labels: llabels.filter((l) => l.column_id === c.id) } : c));
     linked = { items: linkedItems, columns: lcolsVisible, values: lv };
     merge(computeMirrors(items, columns, values, linked, nameOf));
+    mirrors = mirrorLooks(columns, linked);
   }
 
   const fileIds = [...new Set(items.flatMap((t) => columns.filter((c) => c.kind === 'files').flatMap((c) => values[t.id]?.[c.id] || [])))];
@@ -412,6 +420,7 @@ async function computedValues({ items, columns, values, actor, ids }) {
   return {
     cells,
     attachments,
+    mirrors,
     linked: Object.fromEntries(linked.items.map((t) => [t.id, { id: t.id, title: t.title, board_id: t.board_id, is_done: t.is_done }])),
   };
 }
@@ -489,6 +498,7 @@ router.get('/:id(\\d+)', authenticate, withActor, boardParam('view'), async (req
       values,
       attachments: extra.attachments,
       linked: extra.linked,
+      mirrors: extra.mirrors,
       ai_enabled: aiConfigured(),
     });
   } catch (err) {

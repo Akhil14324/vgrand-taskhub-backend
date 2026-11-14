@@ -24,7 +24,18 @@ const ids = (v) => (Array.isArray(v) ? v : []).map((x) => parseInt(x, 10)).filte
 
 router.get('/', authenticate, async (req, res, next) => {
   try {
-    res.json(await draftsFor(req.user.id, { meetingId: parseInt(req.query.meeting_id, 10) || null }));
+    const meetingId = parseInt(req.query.meeting_id, 10) || null;
+    let ownerId = req.user.id;
+    if (meetingId) {
+      // The super admin (level 0) reading someone else's meeting sees that meeting's waiting tasks, to read only:
+      // every route that changes a draft still works on the caller's own drafts.
+      const m = (await db.query('SELECT owner_id FROM meeting_notes WHERE id = $1', [meetingId])).rows[0];
+      if (m && m.owner_id !== req.user.id) {
+        const actor = await loadActor(req.user.id);
+        if (actor && actor.global === 0) ownerId = m.owner_id;
+      }
+    }
+    res.json(await draftsFor(ownerId, { meetingId }));
   } catch (err) {
     next(err);
   }

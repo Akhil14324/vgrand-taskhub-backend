@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert');
-const { formulaSource, computeFormulas, computeMirrors, plainValue } = require('./boardCompute');
+const { formulaSource, computeFormulas, computeMirrors, plainValue, mirrorLooks } = require('./boardCompute');
 const { evaluate } = require('./automation/expr');
 
 const columns = [
@@ -61,4 +61,10 @@ test('plain values: dropdown labels, checkbox, person names', () => {
   assert.strictEqual(plainValue({ id: 1 }, dd, { 1: { 40: ['b'] } }), 'UPI');
   assert.strictEqual(plainValue({ id: 1 }, { id: 41, kind: 'checkbox' }, { 1: { 41: true } }), true);
   assert.strictEqual(plainValue({ id: 1 }, { id: 42, kind: 'person' }, { 1: { 42: [3, 8] } }, (id) => ({ 3: 'Kaushal', 8: 'Nagarjuna' })[id]), 'Kaushal,Nagarjuna');
+});
+
+test('a mirror knows the kind and the label colours of the column it mirrors', () => {
+  const cols = [{ id: 21, kind: 'mirror', settings: { relation_column_id: 20, target_column_id: 30 } }, { id: 22, kind: 'mirror', settings: { relation_column_id: 20, target_column_id: 99 } }];
+  const linked = { columns: [{ id: 30, kind: 'status', system_key: 'status', labels: [{ label: 'Done', color: 'green', maps_to: 'done' }, { label: 'Stuck', color: 'red', maps_to: 'blocked' }] }] };
+  assert.deepStrictEqual(mirrorLooks(cols, linked), { 21: { kind: 'status', system_key: 'status', colors: { Done: 'green', Stuck: 'red' }, unit: undefined, max: undefined } });
 });

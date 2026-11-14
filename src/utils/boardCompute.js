@@ -132,4 +132,23 @@ function computeMirrors(items, columns, values, linked, nameOf) {
   return out;
 }
 
-module.exports = { plainValue, formulaSource, computeFormulas, computeMirrors };
+/**
+ * How each mirror column should be drawn: the kind of the column it mirrors and the colour of every label or
+ * option that column has, by its text. { [mirrorColumnId]: { kind, system_key, colors: { text: colourName } } }.
+ * The mirrored values themselves stay plain text (filters, search and formulas read them as before).
+ */
+function mirrorLooks(columns, linked) {
+  const out = {};
+  for (const m of columns) {
+    if (m.kind !== 'mirror' || !m.settings?.target_column_id) continue;
+    const col = (linked.columns || []).find((c) => c.id === m.settings.target_column_id);
+    if (!col) continue;
+    const colors = {};
+    for (const l of col.labels || []) if (l.label) colors[l.label] = l.color;
+    for (const o of col.settings?.options || []) if (o.label) colors[o.label] = o.color;
+    out[m.id] = { kind: col.kind, system_key: col.system_key || null, colors, unit: col.settings?.unit || undefined, max: col.settings?.max || undefined };
+  }
+  return out;
+}
+
+module.exports = { plainValue, formulaSource, computeFormulas, computeMirrors, mirrorLooks };

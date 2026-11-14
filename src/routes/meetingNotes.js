@@ -14,7 +14,8 @@ const { isLeader } = require('../utils/org');
 const { cleanReply, cleanHistory, fitTranscript, askPrompt } = require('../utils/meetingAsk');
 
 // /api/meeting-notes: meetings recorded or pasted on their own, not attached to a to-do. Only the person who
-// recorded one can see it. A recording arrives in numbered pieces (1 minute each from the current client), kept in
+// recorded one can see it, plus the super admin (level 0), who can read every meeting and ask about it but never
+// changes one that is not their own. A recording arrives in numbered pieces (1 minute each from the current client), kept in
 // meeting_pieces so a retried upload is never transcribed twice and the transcript is always in order.
 const router = express.Router();
 const audio = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } }).single('file');
@@ -37,18 +38,36 @@ async function mine(req) {
   return row || null;
 }
 
+/**
+ * The meeting row if this person may READ it: their own, or any meeting for the super admin (level 0). The row
+ * carries `mine` and, for someone else's, `owner_name`. Everything that changes a meeting keeps using mine().
+ */
+async function readable(req) {
+  const id = parseInt(req.params.id, 10) || 0;
+  const row = (await db.query(
+    'SELECT m.*, u.name AS owner_name FROM meeting_notes m LEFT JOIN users u ON u.id = m.owner_id WHERE m.id = $1', [id]
+  )).rows[0];
+  if (!row) return null;
+  if (row.owner_id === req.user.id) return { ...row, mine: true };
+  const actor = await loadActor(req.user.id);
+  return actor && actor.global === 0 ? { ...row, mine: false } : null;
+}
+
 const SHAPE = (s) => s.slice(9, -1);
 
 // GET /api/meeting-notes — the newest first.
 router.get('/', authenticate, async (req, res, next) => {
   try {
+    const actor = await loadActor(req.user.id);
+    const all = !!actor && actor.global === 0;
     const rows = (await db.query(
-      `SELECT m.id, m.title, m.pieces, length(m.transcript) AS chars, m.extracted IS NOT NULL AS has_notes, m.created_at, m.updated_at,
+      `SELECT m.id, m.title, m.pieces, (m.owner_id = $1) AS mine, CASE WHEN m.owner_id = $1 THEN NULL ELSE u.name END AS owner_name, length(m.transcript) AS chars, m.extracted IS NOT NULL AS has_notes, m.created_at, m.updated_at,
               left(m.extracted->>'summary', 220) AS summary,
               (SELECT COALESCE(SUM(p.duration_ms), 0) FROM meeting_pieces p WHERE p.meeting_id = m.id)::bigint AS duration_ms,
               (SELECT COUNT(*) FROM todo_drafts d WHERE d.meeting_id = m.id AND d.status = 'draft')::int AS drafts
-       FROM meeting_notes m WHERE m.owner_id = $1 ORDER BY m.created_at DESC LIMIT 100`,
-      [req.user.id]
+       FROM meeting_notes m LEFT JOIN users u ON u.id = m.owner_id
+       WHERE m.owner_id = $1 OR $2::boolean ORDER BY m.created_at DESC LIMIT 300`,
+      [req.user.id, all]
     )).rows;
     res.json({ meetings: rows });
   } catch (err) {
@@ -79,9 +98,9 @@ router.post('/', authenticate, async (req, res, next) => {
 // GET /api/meeting-notes/:id
 router.get('/:id(\\d+)', authenticate, async (req, res, next) => {
   try {
-    const row = await mine(req);
+    const row = await readable(req);
     if (!row) return res.status(404).json({ error: 'Meeting not found' });
-    res.json({ meeting: row });
+    res.json({ meeting: row.mine ? row : { ...row, chat: [] } });
   } catch (err) {
     next(err);
   }
@@ -296,7 +315,7 @@ router.post('/:id(\\d+)/extract', authenticate, async (req, res, next) => {
 // kept on the meeting (the newest 60 entries), so the chat is there the next time it is opened.
 router.post('/:id(\\d+)/ask', authenticate, async (req, res, next) => {
   try {
-    const row = await mine(req);
+    const row = await readable(req);
     if (!row) return res.status(404).json({ error: 'Meeting not found' });
     const question = clean(req.body.question, 1000);
     if (!question) return res.status(400).json({ error: 'Ask a question first' });
@@ -304,7 +323,10 @@ router.post('/:id(\\d+)/ask', authenticate, async (req, res, next) => {
     if (transcript.length < 40) return res.status(400).json({ error: 'There is not enough said yet to answer from' });
 
     const fitted = fitTranscript(transcript);
-    const history = cleanHistory(row.chat);
+    // The super admin reading someone else's meeting: their questions are not kept with it (the page sends back
+    // what was asked so far), so the recorder's own saved questions are never touched or shown.
+    const earlier = row.mine ? row.chat : (Array.isArray(req.body.chat) ? req.body.chat.slice(-60) : []);
+    const history = cleanHistory(earlier);
     const out = await chatJSON({
       ...askPrompt({
         title: row.title,
@@ -319,8 +341,8 @@ router.post('/:id(\\d+)/ask', authenticate, async (req, res, next) => {
     const reply = cleanReply(out);
     const at = new Date().toISOString();
     const entries = [{ role: 'user', text: question, at }, { role: 'assistant', text: reply.answer, visual: reply.visual || undefined, at }];
-    const chat = [...(Array.isArray(row.chat) ? row.chat : []), ...entries].slice(-60);
-    await db.query('UPDATE meeting_notes SET chat = $2, updated_at = NOW() WHERE id = $1', [row.id, JSON.stringify(chat)]);
+    const chat = [...(Array.isArray(earlier) ? earlier : []), ...entries].slice(-60);
+    if (row.mine) await db.query('UPDATE meeting_notes SET chat = $2, updated_at = NOW() WHERE id = $1', [row.id, JSON.stringify(chat)]);
     res.json({ ...reply, cut: fitted.cut, chat });
   } catch (err) {
     fail(res, err, next);
