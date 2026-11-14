@@ -9,7 +9,6 @@ const { isAssignable } = require('../services/todoGovernance');
 const { BLOCKER_LABELS, logEvent, setStatus, assignTodo } = require('../services/todoTimeline');
 const { releaseNext } = require('../services/workflows');
 const { readStepGo } = require('../utils/quickAction');
-const { createMeet, configured: meetConfigured } = require('../utils/googleMeet');
 
 // Step reviews and meetings. Mounted next to the to-do router on /api/todos.
 const router = express.Router();
@@ -125,73 +124,6 @@ router.post('/:id(\\d+)/step-review', authenticate, async (req, res, next) => {
     await broadcast(step.id);
     res.json({ todo: await getTodoFor(step.id, actor.id, actor), parent: await getTodoFor(parent.id, actor.id, actor) });
   } catch (err) {
-    next(err);
-  }
-});
-
-// GET /api/todos/:id/meetings
-router.get('/:id(\\d+)/meetings', authenticate, async (req, res, next) => {
-  try {
-    const todo = await openTodoFor(req, res);
-    if (!todo) return;
-    const rows = (await db.query(
-      `SELECT m.id, m.title, m.meet_url, length(m.transcript) AS transcript_chars, m.starts_at, m.ends_at, m.attendee_ids, m.created_by, u.name AS created_by_name,
-              (SELECT COALESCE(json_agg(json_build_object('id', a.id, 'name', a.name)), '[]'::json)
-                 FROM users a WHERE a.id = ANY(m.attendee_ids)) AS attendees
-       FROM todo_meetings m LEFT JOIN users u ON u.id = m.created_by
-       WHERE m.todo_id = $1 ORDER BY m.created_at DESC LIMIT 20`,
-      [todo.id]
-    )).rows;
-    res.json({ meetings: rows, available: meetConfigured() });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// POST /api/todos/:id/meetings — { attendee_ids, title?, starts_at?, minutes? } makes a Google Meet link.
-router.post('/:id(\\d+)/meetings', authenticate, async (req, res, next) => {
-  try {
-    const todo = await openTodoFor(req, res);
-    if (!todo) return;
-    const actor = req.actor;
-    const ids = [...new Set((Array.isArray(req.body.attendee_ids) ? req.body.attendee_ids : [])
-      .map(Number).filter((n) => n > 0 && n !== actor.id))].slice(0, 50);
-    const people = ids.length
-      ? (await db.query(`SELECT id, name, email FROM users WHERE id = ANY($1::int[]) AND status != 'inactive'`, [ids])).rows
-      : [];
-    const start = req.body.starts_at ? new Date(req.body.starts_at) : new Date();
-    if (Number.isNaN(start.getTime())) return res.status(400).json({ error: 'That start time is not valid' });
-    const minutes = Math.max(10, Math.min(480, parseInt(req.body.minutes, 10) || 30));
-    const end = new Date(start.getTime() + minutes * 60000);
-    const title = sanitizeText(req.body.title, 200) || `Meeting: ${todo.title}`;
-    const me = (await db.query('SELECT email FROM users WHERE id = $1', [actor.id])).rows[0];
-    const meet = await createMeet({
-      title,
-      description: `Meeting about the to-do "${todo.title}" in TaskHub.`,
-      start,
-      end,
-      attendees: [me?.email, ...people.map((p) => p.email)].filter(Boolean),
-      requestId: `todo-${todo.id}-${Date.now()}`,
-    });
-    const row = (await db.query(
-      `INSERT INTO todo_meetings (todo_id, created_by, title, meet_url, event_id, starts_at, ends_at, attendee_ids)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, title, meet_url, starts_at, ends_at, attendee_ids`,
-      [todo.id, actor.id, title, meet.url, meet.eventId, start, end, people.map((p) => p.id)]
-    )).rows[0];
-    await logEvent({ todoId: todo.id, userId: actor.id, subjectId: todo.assignee_id, kind: 'meeting', to: title, note: meet.url });
-    if (people.length) {
-      await notify(people.map((p) => p.id), {
-        type: 'todo_meeting',
-        title: `${actor.name} started a meeting`,
-        body: title,
-        data: { todoId: todo.id, meetUrl: meet.url },
-      });
-    }
-    res.status(201).json({
-      meeting: { ...row, attendees: people.map((p) => ({ id: p.id, name: p.name })), created_by_name: actor.name },
-    });
-  } catch (err) {
-    if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
 });

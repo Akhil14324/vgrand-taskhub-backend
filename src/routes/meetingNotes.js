@@ -11,6 +11,7 @@ const { splitText } = require('../utils/transcript');
 const { MEETING_TASK_SHAPE, cleanMeetingTasks, mergeTasks } = require('../utils/drafts');
 const { vocabulary, saveMeetingDrafts, draftsFor } = require('../services/drafts');
 const { isLeader } = require('../utils/org');
+const { cleanReply, cleanHistory, fitTranscript, askPrompt } = require('../utils/meetingAsk');
 
 // /api/meeting-notes: meetings recorded or pasted on their own, not attached to a to-do. Only the person who
 // recorded one can see it. A recording arrives in numbered pieces (1 minute each from the current client), kept in
@@ -42,8 +43,11 @@ const SHAPE = (s) => s.slice(9, -1);
 router.get('/', authenticate, async (req, res, next) => {
   try {
     const rows = (await db.query(
-      `SELECT id, title, pieces, length(transcript) AS chars, extracted IS NOT NULL AS has_notes, created_at, updated_at
-       FROM meeting_notes WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 100`,
+      `SELECT m.id, m.title, m.pieces, length(m.transcript) AS chars, m.extracted IS NOT NULL AS has_notes, m.created_at, m.updated_at,
+              left(m.extracted->>'summary', 220) AS summary,
+              (SELECT COALESCE(SUM(p.duration_ms), 0) FROM meeting_pieces p WHERE p.meeting_id = m.id)::bigint AS duration_ms,
+              (SELECT COUNT(*) FROM todo_drafts d WHERE d.meeting_id = m.id AND d.status = 'draft')::int AS drafts
+       FROM meeting_notes m WHERE m.owner_id = $1 ORDER BY m.created_at DESC LIMIT 100`,
       [req.user.id]
     )).rows;
     res.json({ meetings: rows });
@@ -284,6 +288,53 @@ router.post('/:id(\\d+)/extract', authenticate, async (req, res, next) => {
     res.json(result);
   } catch (err) {
     fail(res, err, next);
+  }
+});
+
+// POST /api/meeting-notes/:id/ask — { question } a question about this meeting, answered from its saved transcript.
+// The answer may carry one picture (a chart or a flow chart, utils/meetingAsk.js). Both sides of the exchange are
+// kept on the meeting (the newest 60 entries), so the chat is there the next time it is opened.
+router.post('/:id(\\d+)/ask', authenticate, async (req, res, next) => {
+  try {
+    const row = await mine(req);
+    if (!row) return res.status(404).json({ error: 'Meeting not found' });
+    const question = clean(req.body.question, 1000);
+    if (!question) return res.status(400).json({ error: 'Ask a question first' });
+    const transcript = String(row.transcript || '').trim();
+    if (transcript.length < 40) return res.status(400).json({ error: 'There is not enough said yet to answer from' });
+
+    const fitted = fitTranscript(transcript);
+    const history = cleanHistory(row.chat);
+    const out = await chatJSON({
+      ...askPrompt({
+        title: row.title,
+        date: new Date(row.created_at).toISOString().slice(0, 10),
+        transcript: fitted.text,
+        summary: row.extracted?.summary || '',
+        question,
+        history,
+      }),
+      maxTokens: 2500,
+    });
+    const reply = cleanReply(out);
+    const at = new Date().toISOString();
+    const entries = [{ role: 'user', text: question, at }, { role: 'assistant', text: reply.answer, visual: reply.visual || undefined, at }];
+    const chat = [...(Array.isArray(row.chat) ? row.chat : []), ...entries].slice(-60);
+    await db.query('UPDATE meeting_notes SET chat = $2, updated_at = NOW() WHERE id = $1', [row.id, JSON.stringify(chat)]);
+    res.json({ ...reply, cut: fitted.cut, chat });
+  } catch (err) {
+    fail(res, err, next);
+  }
+});
+
+// DELETE /api/meeting-notes/:id/ask — clears the questions and answers of this meeting (the transcript stays).
+router.delete('/:id(\\d+)/ask', authenticate, async (req, res, next) => {
+  try {
+    if (!(await mine(req))) return res.status(404).json({ error: 'Meeting not found' });
+    await db.query("UPDATE meeting_notes SET chat = '[]'::jsonb WHERE id = $1", [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
   }
 });
 

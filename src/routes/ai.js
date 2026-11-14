@@ -3,16 +3,12 @@ const multer = require('multer');
 const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
-const { loadActor } = require('../utils/org');
-const { getTodoFor } = require('../services/todoQueries');
 const { todayInAppZone, APP_TIMEZONE } = require('../utils/recurrence');
-const { chatJSON, visionJSON, transcribe, configured } = require('../utils/openai');
-const { createTodoCore } = require('./todos');
+const { chatJSON, visionJSON, configured } = require('../utils/openai');
 
 // /api/ai: everything that uses GPT. Each call needs OPENAI_API_KEY on the server (see utils/openai.js).
 const router = express.Router();
 const image = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }).single('file');
-const audio = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } }).single('file');
 
 const clean = (v, n) => sanitizeText(v, n) || '';
 
@@ -132,103 +128,6 @@ router.post('/photo', authenticate, (req, res, next) => {
       fail(res, err, next);
     }
   });
-});
-
-// ---- meetings ------------------------------------------------------------------------------------------
-
-async function openMeeting(req, res) {
-  const actor = await loadActor(req.user.id);
-  const meeting = (await db.query('SELECT * FROM todo_meetings WHERE id = $1', [parseInt(req.params.id, 10) || 0])).rows[0];
-  const todo = meeting && actor ? await getTodoFor(meeting.todo_id, actor.id, actor) : null;
-  if (!meeting || !todo) {
-    res.status(404).json({ error: 'Meeting not found' });
-    return null;
-  }
-  return { meeting, todo, actor };
-}
-
-// POST /api/ai/meetings/:id/audio — one recorded piece (field "file", up to 25 MB). Its text is added to the transcript.
-router.post('/meetings/:id(\\d+)/audio', authenticate, (req, res, next) => {
-  audio(req, res, async (uploadErr) => {
-    try {
-      if (uploadErr) return res.status(400).json({ error: uploadErr.message });
-      const ctx = await openMeeting(req, res);
-      if (!ctx) return;
-      if (!req.file) return res.status(400).json({ error: 'No recording was sent' });
-      const text = await transcribe(req.file.buffer, req.file.originalname || 'part.webm', req.file.mimetype || 'audio/webm');
-      const row = (await db.query(
-        `UPDATE todo_meetings SET transcript = CASE WHEN transcript = '' THEN $2 ELSE transcript || E'\\n' || $2 END
-         WHERE id = $1 RETURNING length(transcript) AS chars`,
-        [ctx.meeting.id, text]
-      )).rows[0];
-      res.json({ ok: true, added: text.length, chars: row.chars });
-    } catch (err) {
-      fail(res, err, next);
-    }
-  });
-});
-
-// POST /api/ai/meetings/:id/transcript — { text, replace? } a pasted transcript from any other tool.
-router.post('/meetings/:id(\\d+)/transcript', authenticate, async (req, res, next) => {
-  try {
-    const ctx = await openMeeting(req, res);
-    if (!ctx) return;
-    const text = clean(req.body.text, 200000);
-    if (!text) return res.status(400).json({ error: 'Paste the transcript first' });
-    const row = (await db.query(
-      `UPDATE todo_meetings SET transcript = CASE WHEN $3 OR transcript = '' THEN $2 ELSE transcript || E'\\n' || $2 END
-       WHERE id = $1 RETURNING length(transcript) AS chars`,
-      [ctx.meeting.id, text, !!req.body.replace]
-    )).rows[0];
-    res.json({ ok: true, chars: row.chars });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// POST /api/ai/meetings/:id/extract — summary and action items from the transcript so far.
-// { create: true } also makes each task as a to-do, handed to the person it is for (no review step).
-router.post('/meetings/:id(\\d+)/extract', authenticate, async (req, res, next) => {
-  try {
-    const ctx = await openMeeting(req, res);
-    if (!ctx) return;
-    const transcript = String(ctx.meeting.transcript || '').slice(0, 60000);
-    if (transcript.trim().length < 40) return res.status(400).json({ error: 'There is not enough said yet to work from' });
-    const people = await peopleForPrompt();
-    const out = await chatJSON({
-      system: `You read a meeting transcript and pull out what was decided and who has to do what. ${datePrompt()} `
-        + `The meeting was about the task "${ctx.todo.title}". People who can be given work: ${people.text}. `
-        + 'The speech may be in English, in Telugu, or in both mixed together (Telugu is often written in English letters). '
-        + 'Understand all of it, and write every title, summary and decision in clear English. '
-        + 'Match the names people say to the closest person. Only list real action items that someone agreed to or was asked to do, not discussion. '
-        + `Reply as JSON: {"summary":"2 to 4 plain sentences","decisions":["..."],"tasks":${TASK_SHAPE.slice(9, -1)}}`,
-      user: transcript,
-      maxTokens: 2000,
-    });
-    const result = {
-      summary: clean(String(out.summary || ''), 1500),
-      decisions: (Array.isArray(out.decisions) ? out.decisions : []).map((d) => clean(String(d), 300)).filter(Boolean).slice(0, 10),
-      tasks: cleanTasks(out.tasks, people, req.user.id),
-    };
-    await db.query('UPDATE todo_meetings SET extracted = $2 WHERE id = $1', [ctx.meeting.id, JSON.stringify(result)]);
-    if (req.body.create) {
-      const made = [];
-      const failed = [];
-      for (const t of result.tasks) {
-        // Tasks for someone else go to them as a personal to-do; the rest stay on the speaker's own list.
-        const body = { title: t.title, due_date: t.due_date || undefined, due_time: t.due_time || undefined, priority: t.priority || undefined };
-        if (t.assignee) body.delegate_to = t.assignee.id;
-        const out2 = await createTodoCore(ctx.actor, body);
-        if (out2.todo) made.push({ title: t.title, assignee: t.assignee ? t.assignee.name : null });
-        else failed.push(t.title);
-      }
-      result.created = made;
-      result.failed = failed;
-    }
-    res.json(result);
-  } catch (err) {
-    fail(res, err, next);
-  }
 });
 
 module.exports = router;
