@@ -240,3 +240,5 @@ router.get('/me', authenticate, async (req, res, next) => {
 });
 
 module.exports = router;
+// Used by routes/access.js when the super admin signs in as someone.
+module.exports.sessionUser = sessionUser;

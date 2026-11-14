@@ -1,4 +1,5 @@
 const express = require('express');
+const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { loadActor, actorBestLevel, displayTitle } = require('../utils/org');
@@ -6,6 +7,31 @@ const { PERMISSIONS, isPermissionKey } = require('../utils/permissions');
 const { listTodos } = require('../services/todoQueries');
 
 const router = express.Router();
+
+// POST /api/access/login-as/:userId — a super admin (a super_admin account with no tier) opens the app as another
+// person: the answer is a session for that person, good for four hours, exactly like their own sign-in. Each use
+// is written to admin_logins. Nobody else can call this, whatever switches they hold.
+router.post('/login-as/:userId(\\d+)', authenticate, async (req, res, next) => {
+  try {
+    const actor = await loadActor(req.user.id);
+    if (!actor || actor.global !== 0) return res.status(403).json({ error: 'Only the super admin can do this' });
+    const userId = parseInt(req.params.userId, 10);
+    if (userId === actor.id) return res.status(400).json({ error: 'That is your own account' });
+    const target = (await db.query("SELECT id, username, role, business_id FROM users WHERE id = $1 AND status <> 'inactive'", [userId])).rows[0];
+    if (!target) return res.status(404).json({ error: 'Person not found' });
+    await db.query('INSERT INTO admin_logins (admin_id, user_id) VALUES ($1, $2)', [actor.id, target.id]);
+    const token = jwt.sign(
+      { id: target.id, username: target.username, role: target.role, business_id: target.business_id, by: actor.id },
+      process.env.JWT_SECRET,
+      { expiresIn: '4h' }
+    );
+    // Required here, not at the top: routes/auth.js is loaded after this file in some paths.
+    const { sessionUser } = require('./auth');
+    res.json({ token, user: await sessionUser(target.id) });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /** Only people with the manage_access switch get past this. */
 async function requireManager(req, res, next) {
