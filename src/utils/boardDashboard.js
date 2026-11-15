@@ -50,4 +50,4 @@ function aiPrompt({ request, widgets, schema }) {
   };
 }
 
-module.exports = { cleanWidgets, aiPrompt, TYPES, CHARTS };
+module.exports = { cleanWidgets, aiPrompt, TYPES, CHARTS, BUILTIN_DIMS };

@@ -59,11 +59,22 @@ function cleanFlow(raw) {
   return { kind: 'flow', title: text(raw.title, 100), nodes, edges };
 }
 
-/** The model's reply made safe: { answer, visual } where visual is a chart, a flow chart or null. */
+/** A dashboard of the meeting: up to 8 headline numbers and up to 6 charts, or null when it has neither. */
+function cleanDashboard(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const tiles = (Array.isArray(raw.tiles) ? raw.tiles : []).map((t) => ({
+    label: text(t?.label, 40), value: text(t?.value, 24), note: text(t?.note, 80) || null,
+  })).filter((t) => t.label && t.value).slice(0, 8);
+  const charts = (Array.isArray(raw.charts) ? raw.charts : []).map(cleanChart).filter(Boolean).slice(0, 6);
+  if (!tiles.length && !charts.length) return null;
+  return { kind: 'dashboard', title: text(raw.title, 100), tiles, charts };
+}
+
+/** The model's reply made safe: { answer, visual } where visual is a chart, a flow chart, a dashboard or null. */
 function cleanReply(raw) {
   const answer = String(raw?.answer ?? '').trim().slice(0, 6000);
   const v = raw?.visual;
-  const visual = v?.kind === 'flow' ? cleanFlow(v) : v?.kind === 'chart' ? cleanChart(v) : null;
+  const visual = v?.kind === 'flow' ? cleanFlow(v) : v?.kind === 'chart' ? cleanChart(v) : v?.kind === 'dashboard' ? cleanDashboard(v) : null;
   return { answer: answer || (visual ? 'Here it is.' : 'I could not find that in this meeting.'), visual };
 }
 
@@ -89,10 +100,12 @@ function askPrompt({ title, date, transcript, summary, question, history }) {
     system: 'You answer questions about one recorded meeting, using only what was said in it. '
       + 'The speech may be in English, Telugu or both mixed (Telugu is often written in English letters); always answer in clear, plain English. '
       + 'If the meeting does not say, answer that it was not discussed; never guess. Keep answers short and direct, and name people as they were named. '
-      + 'When they ask for a chart, graph or dashboard, add "visual" of kind "chart" with numbers you counted from the meeting (for example tasks per person, topics by how often they came up). '
+      + 'When they ask for a dashboard (or an overview of the whole meeting in numbers), add "visual" of kind "dashboard": 4 to 8 "tiles" of headline numbers counted from the meeting (tasks agreed, decisions made, people given work, open questions, dates or amounts mentioned) and 2 to 5 "charts". '
+      + 'When they ask for one chart or graph, add "visual" of kind "chart" with numbers you counted from the meeting (for example tasks per person, topics by how often they came up). '
       + 'When they ask for a flow chart, a process or steps, add "visual" of kind "flow": boxes in order with arrows. Otherwise set "visual" to null. '
       + 'Reply as JSON: {"answer":"...","visual":null | '
       + '{"kind":"chart","chart":"column|bar|line|pie|donut","title":"...","categories":["..."],"series":[{"label":"...","values":[1,2]}]} | '
+      + '{"kind":"dashboard","title":"...","tiles":[{"label":"...","value":"12","note":"short or null"}],"charts":[{"chart":"column|bar|line|pie|donut","title":"...","categories":["..."],"series":[{"label":"...","values":[1,2]}]}]} | '
       + '{"kind":"flow","title":"...","nodes":[{"id":"a","label":"...","kind":"start|step|decision|end","who":"name or null"}],"edges":[{"from":"a","to":"b","label":"optional"}]}}',
     user: `Meeting: "${title}" on ${date}.\n`
       + (summary ? `Summary already written: ${summary}\n` : '')
@@ -102,4 +115,4 @@ function askPrompt({ title, date, transcript, summary, question, history }) {
   };
 }
 
-module.exports = { cleanChart, cleanFlow, cleanReply, cleanHistory, fitTranscript, askPrompt, MAX_TRANSCRIPT_CHARS };
+module.exports = { cleanChart, cleanFlow, cleanDashboard, cleanReply, cleanHistory, fitTranscript, askPrompt, MAX_TRANSCRIPT_CHARS };

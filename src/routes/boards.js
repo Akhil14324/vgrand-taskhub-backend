@@ -17,7 +17,7 @@ const { createTodoCore, announce } = require('./todos');
 const { logEvent } = require('../services/todoTimeline');
 const { computeFormulas, computeMirrors, plainValue, mirrorLooks } = require('../utils/boardCompute');
 const { configured: aiConfigured, chatJSON } = require('../utils/openai');
-const { cleanWidgets, aiPrompt } = require('../utils/boardDashboard');
+const { cleanWidgets, aiPrompt, BUILTIN_DIMS } = require('../utils/boardDashboard');
 const { BUILT_INS, checkDefinition } = require('../utils/boardTemplates');
 const { definitionFromBoard, buildBoard } = require('../services/boardBuild');
 const columnsCatalog = require('../utils/columns');
@@ -409,6 +409,30 @@ async function computedValues({ items, columns, values, actor, ids }) {
     mirrors = mirrorLooks(columns, linked);
   }
 
+  const backlinks = {};
+  if (ids.length) {
+    const rows = (await db.query(
+      `SELECT iv.todo_id, c.title AS column_title, c.board_id, b.name AS board_name, e.val::int AS target
+       FROM item_values iv
+       JOIN board_columns c ON c.id = iv.column_id AND c.kind = 'board_relation' AND c.archived_at IS NULL
+       JOIN boards b ON b.id = c.board_id
+       CROSS JOIN LATERAL jsonb_array_elements_text(CASE WHEN jsonb_typeof(iv.value) = 'array' THEN iv.value ELSE '[]'::jsonb END) AS e(val)
+       WHERE e.val ~ '^[0-9]{1,9}$' AND e.val::int = ANY($1::int[]) AND iv.todo_id <> e.val::int
+       LIMIT 3000`,
+      [ids]
+    )).rows;
+    if (rows.length) {
+      // Only links from tasks the viewer may see are shown.
+      const seen = new Map((await listTodos(actor.id, { actor, where: 't.id = ANY($5::int[])', params: [[...new Set(rows.map((x) => x.todo_id))]] })).map((t) => [t.id, t]));
+      for (const x of rows) {
+        const t = seen.get(x.todo_id);
+        if (!t) continue;
+        if (!backlinks[x.target]) backlinks[x.target] = [];
+        backlinks[x.target].push({ id: t.id, title: t.title, is_done: t.is_done, board_id: x.board_id, board_name: x.board_name, column: x.column_title });
+      }
+    }
+  }
+
   const fileIds = [...new Set(items.flatMap((t) => columns.filter((c) => c.kind === 'files').flatMap((c) => values[t.id]?.[c.id] || [])))];
   const attachments = {};
   if (fileIds.length) {
@@ -422,6 +446,7 @@ async function computedValues({ items, columns, values, actor, ids }) {
     cells,
     attachments,
     mirrors,
+    backlinks,
     linked: Object.fromEntries(linked.items.map((t) => [t.id, { id: t.id, title: t.title, board_id: t.board_id, is_done: t.is_done }])),
   };
 }
@@ -500,6 +525,7 @@ router.get('/:id(\\d+)', authenticate, withActor, boardParam('view'), async (req
       attachments: extra.attachments,
       linked: extra.linked,
       mirrors: extra.mirrors,
+      backlinks: extra.backlinks,
       ai_enabled: aiConfigured(),
     });
   } catch (err) {
@@ -1205,25 +1231,40 @@ function cleanViewSettings(raw = {}) {
 
 // POST /:id/dashboard/ai — { request, widgets, schema } the AI proposes a new widget list; nothing is saved here,
 // the client previews it and saves through the view's settings (OpenAI only).
+/** The AI's proposal for a dashboard over these columns (none for the Home one). Answers the request itself. */
+async function proposeDashboard(req, res, cols) {
+  if (!aiConfigured()) return res.status(503).json({ error: 'AI is not set up on the server' });
+  const request = String(req.body.request || '').trim();
+  if (!request) return res.status(400).json({ error: 'Say what you want on the dashboard' });
+  const schema = {
+    columns: cols.map((c) => ({ id: String(c.id), title: c.title, kind: c.kind })),
+    dimensions: [...BUILTIN_DIMS,
+      ...cols.filter((c) => !c.system_key && !['files', 'long_text', 'updates', 'dependency', 'ai'].includes(c.kind)).map((c) => `col:${c.id}`)],
+    numeric_columns: cols.filter((c) => ['numbers', 'formula', 'rating'].includes(c.kind)).map((c) => ({ id: String(c.id), title: c.title })),
+  };
+  const current = cleanWidgets(req.body.widgets, schema);
+  const reply = await chatJSON({ ...aiPrompt({ request, widgets: current, schema }), maxTokens: 3000 });
+  const widgets = cleanWidgets(reply.widgets, schema);
+  if (!widgets.length) return res.status(422).json({ error: 'The AI did not come back with a dashboard. Try saying it another way.' });
+  return res.json({ widgets, summary: String(reply.summary || '').slice(0, 300) });
+}
+
 router.post('/:id(\\d+)/dashboard/ai', authenticate, withActor, boardParam('view'), async (req, res, next) => {
   try {
-    if (!aiConfigured()) return res.status(503).json({ error: 'AI is not set up on the server' });
-    const request = String(req.body.request || '').trim();
-    if (!request) return res.status(400).json({ error: 'Say what you want on the dashboard' });
     const cols = (await db.query('SELECT id, title, kind, system_key FROM board_columns WHERE board_id = $1 AND archived_at IS NULL', [req.board.id])).rows;
-    const schema = {
-      columns: cols.map((c) => ({ id: String(c.id), title: c.title, kind: c.kind })),
-      dimensions: ['status', 'person', 'group', 'priority', 'due_week', 'due_month', 'created_week',
-        ...cols.filter((c) => !c.system_key && !['files', 'long_text', 'updates', 'dependency', 'ai'].includes(c.kind)).map((c) => `col:${c.id}`)],
-      numeric_columns: cols.filter((c) => ['numbers', 'formula', 'rating'].includes(c.kind)).map((c) => ({ id: String(c.id), title: c.title })),
-    };
-    const current = cleanWidgets(req.body.widgets, schema);
-    const reply = await chatJSON({ ...aiPrompt({ request, widgets: current, schema }), maxTokens: 3000 });
-    const widgets = cleanWidgets(reply.widgets, schema);
-    if (!widgets.length) return res.status(422).json({ error: 'The AI did not come back with a dashboard. Try saying it another way.' });
-    res.json({ widgets, summary: String(reply.summary || '').slice(0, 300) });
+    return await proposeDashboard(req, res, cols);
   } catch (err) {
-    next(err);
+    return next(err);
+  }
+});
+
+// POST /home-dashboard/ai — the same for a person's own dashboard on Home: it is drawn from the to-dos they can
+// see, so there are no board columns, only the built-in ways to split (status, person, group = company, dates).
+router.post('/home-dashboard/ai', authenticate, async (req, res, next) => {
+  try {
+    return await proposeDashboard(req, res, []);
+  } catch (err) {
+    return next(err);
   }
 });
 

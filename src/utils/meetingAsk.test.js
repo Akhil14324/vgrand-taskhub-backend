@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert');
-const { cleanChart, cleanFlow, cleanReply, cleanHistory, fitTranscript } = require('./meetingAsk');
+const { cleanChart, cleanFlow, cleanReply, cleanDashboard, cleanHistory, fitTranscript } = require('./meetingAsk');
 
 test('a chart keeps numbers in step with its categories', () => {
   const c = cleanChart({ chart: 'pie', title: 'Tasks per person', categories: ['Vinod', 'Kaushal', ''], series: [{ label: 'Tasks', values: [3, 'x', 9] }] });
@@ -56,4 +56,13 @@ test('a very long transcript keeps its start and end', () => {
   assert.ok(out.text.startsWith('START'));
   assert.ok(out.text.endsWith('END'));
   assert.equal(fitTranscript('short', 200).cut, false);
+});
+
+test('a dashboard keeps its usable tiles and charts and drops the rest', () => {
+  const d = cleanDashboard({ title: 'Site meeting', tiles: [{ label: 'Tasks', value: 12 }, { label: '', value: 3 }], charts: [{ chart: 'bar', categories: ['Ravi', 'Sita'], series: [{ label: 'Tasks', values: [3, 2] }] }, { categories: [] }] });
+  assert.strictEqual(d.kind, 'dashboard');
+  assert.deepStrictEqual(d.tiles, [{ label: 'Tasks', value: '12', note: null }]);
+  assert.strictEqual(d.charts.length, 1);
+  assert.strictEqual(cleanDashboard({ tiles: [], charts: [] }), null);
+  assert.strictEqual(cleanReply({ answer: 'Here', visual: { kind: 'dashboard', tiles: [{ label: 'Decisions', value: '4' }] } }).visual.tiles.length, 1);
 });
