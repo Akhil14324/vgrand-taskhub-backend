@@ -13,6 +13,7 @@ const { chatJSON } = require('../utils/openai');
  *   GET  /day/:date?user_id=     a box (mine, or a sent one of someone below me)
  *   PUT  /day/:date              { priorities, brain_dump, blocks, reflection }  save my box (not once it is sent)
  *   POST /day/:date/send         send it: locked, and now readable by the people above me
+ *   POST /day/:date/move         { to }  correct the day of my whole box (a sent one stays sent), to an empty day in the last week
  *   GET  /days?user_id=&from=&to= the status of each day in a range (the date strip)
  *   GET  /team?date=             everyone below me: who planned, who sent, and the numbers
  * "Above" is the Team monitor's rule (services/monitor.js): leadership sees everyone below them, a business head the
@@ -134,6 +135,39 @@ router.post('/day/:date/send', authenticate, async (req, res, next) => {
     // The people above see it arrive in their Team list (no notification: forty boxes a night would be noise).
     above(req.user.id).then((ids) => emitToUsers(ids, 'timebox:changed', { date, user_id: req.user.id })).catch(() => {});
     res.json({ ...shape(row, date, today, { mine: true }), mine: true, seen_by: [] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Wrong day: the owner moves a whole box (sent or not) to another day in the past week. Nothing in it changes and a
+// sent box stays sent, so this is a correction of the date, not a way to reopen or rewrite a locked day. The target
+// day must be empty, so nothing is ever overwritten.
+router.post('/day/:date/move', authenticate, async (req, res, next) => {
+  try {
+    const from = dateParam(req, res);
+    if (!from) return;
+    const to = String(req.body?.to || '');
+    if (!DATE.test(to) || Number.isNaN(Date.parse(`${to}T00:00:00Z`))) return res.status(400).json({ error: 'Pick the day it belongs to' });
+    const today = todayInAppZone();
+    const diff = Math.round((Date.parse(`${today}T00:00:00Z`) - Date.parse(`${to}T00:00:00Z`)) / 86400000);
+    if (to === from) return res.status(400).json({ error: 'That is the same day' });
+    if (diff < 0 || diff > 7) return res.status(400).json({ error: 'You can move it to a day in the last 7 days, up to today' });
+    const source = await loadBox(req.user.id, from);
+    if (!source) return res.status(404).json({ error: 'There is no timebox on that day' });
+    const target = await loadBox(req.user.id, to);
+    if (target) {
+      const empty = !target.submitted_at && !target.report && !target.reflection
+        && !(target.blocks || []).length && !(target.priorities || []).length && !(target.brain_dump || []).length;
+      if (!empty) return res.status(409).json({ error: 'That day already has a timebox. It is not overwritten.' });
+      await db.query('DELETE FROM timeboxes WHERE id = $1', [target.id]);
+    }
+    const row = (await db.query('UPDATE timeboxes SET box_date = $2::date, updated_at = NOW() WHERE id = $1 RETURNING *', [source.id, to])).rows[0];
+    console.log(`[timebox] user ${req.user.id} moved their timebox from ${from} to ${to}${source.submitted_at ? ' (sent)' : ''}`);
+    emitToUsers([req.user.id], 'timebox:changed', { date: from });
+    emitToUsers([req.user.id], 'timebox:changed', { date: to });
+    if (source.submitted_at) above(req.user.id).then((ids) => { emitToUsers(ids, 'timebox:changed', { date: from, user_id: req.user.id }); emitToUsers(ids, 'timebox:changed', { date: to, user_id: req.user.id }); }).catch(() => {});
+    res.json({ ...shape(row, to, today, { mine: true }), mine: true, seen_by: row.submitted_at ? await seenBy(row.id) : [] });
   } catch (err) {
     next(err);
   }
