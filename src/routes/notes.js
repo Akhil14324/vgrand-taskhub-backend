@@ -3,14 +3,15 @@ const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
 const { uploadOne, storeUpload, MAX_SIZE } = require('../utils/uploads');
+const { sanitizeHtml, plainText, cleanSheet, sheetText } = require('../utils/noteContent');
 
 /**
  * Notes (migration 060), mounted at /api/notes. A private notepad: only the person who wrote a note can see it.
  *
  *   GET    /                       { q? } my notes, pinned first, newest change first, each with its pictures
- *   POST   /                       { title?, body? }
+ *   POST   /                       { title?, kind?: 'text' | 'sheet', html?, content?, body? }
  *   GET    /:id
- *   PATCH  /:id                    { title?, body?, pinned? }
+ *   PATCH  /:id                    { title?, html? (text note), content? (sheet), body?, pinned? }
  *   DELETE /:id
  *   POST   /:id/images             multipart "file" (a picture)
  *   DELETE /:id/images/:imageId
@@ -53,9 +54,15 @@ router.get('/', authenticate, async (req, res, next) => {
 
 router.post('/', authenticate, async (req, res, next) => {
   try {
+    // A text note may arrive formatted (html) or plain (body); a sheet arrives as its grid. The plain words are
+    // always kept in body, which is what search and the list read.
+    const kind = req.body.kind === 'sheet' ? 'sheet' : 'text';
+    const html = kind === 'text' && req.body.html !== undefined ? sanitizeHtml(req.body.html) : null;
+    const content = kind === 'sheet' ? cleanSheet(req.body.content) : null;
+    const body = content ? sheetText(content) : html !== null ? plainText(html) : sanitizeText(req.body.body, 50000) || '';
     const row = (await db.query(
-      'INSERT INTO notes (user_id, title, body) VALUES ($1, $2, $3) RETURNING *',
-      [req.user.id, sanitizeText(req.body.title, 200) || '', sanitizeText(req.body.body, 50000) || '']
+      'INSERT INTO notes (user_id, title, body, kind, html, content) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [req.user.id, sanitizeText(req.body.title, 200) || '', body, kind, html, content ? JSON.stringify(content) : null]
     )).rows[0];
     res.status(201).json({ note: (await withImages([row]))[0] });
   } catch (err) {
@@ -78,9 +85,24 @@ router.patch('/:id(\\d+)', authenticate, async (req, res, next) => {
     const note = await own(req, res);
     if (!note) return;
     const title = req.body.title !== undefined ? sanitizeText(req.body.title, 200) || '' : note.title;
-    const body = req.body.body !== undefined ? sanitizeText(req.body.body, 50000) || '' : note.body;
+    let body = req.body.body !== undefined ? sanitizeText(req.body.body, 50000) || '' : note.body;
+    let html = note.html;
+    let content = note.content;
+    if (note.kind === 'sheet' && req.body.content !== undefined) {
+      content = cleanSheet(req.body.content);
+      body = sheetText(content);
+    } else if (note.kind !== 'sheet' && req.body.html !== undefined) {
+      html = sanitizeHtml(req.body.html);
+      body = plainText(html);
+    }
     const pinned = req.body.pinned !== undefined ? !!req.body.pinned : note.pinned;
-    const row = (await db.query('UPDATE notes SET title = $2, body = $3, pinned = $4, updated_at = NOW() WHERE id = $1 RETURNING *', [note.id, title, body, pinned])).rows[0];
+    // Pinning alone does not count as an edit, so it leaves "last changed" as it was.
+    const edited = req.body.title !== undefined || req.body.body !== undefined || req.body.html !== undefined || req.body.content !== undefined;
+    const row = (await db.query(
+      `UPDATE notes SET title = $2, body = $3, pinned = $4, html = $5, content = $6, updated_at = CASE WHEN $7 THEN NOW() ELSE updated_at END
+       WHERE id = $1 RETURNING *`,
+      [note.id, title, body, pinned, html, content ? JSON.stringify(content) : null, edited]
+    )).rows[0];
     res.json({ note: (await withImages([row]))[0] });
   } catch (err) {
     next(err);

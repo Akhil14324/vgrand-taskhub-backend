@@ -124,11 +124,12 @@ const DEFAULT_VIEWS = [
   { kind: 'gantt', name: 'Gantt', settings: {} },
   { kind: 'kanban', name: 'Kanban', settings: { group_by: 'status' } },
   { kind: 'calendar', name: 'Calendar', settings: {} },
+  { kind: 'dashboard', name: 'Dashboard', settings: {} },
 ];
 
 const AI_ACTIONS = ['summarize', 'categorize', 'extract', 'translate', 'sentiment', 'reply', 'custom'];
 
-const VIEW_KINDS = ['table', 'kanban', 'calendar', 'timeline', 'gantt', 'chart', 'workload', 'map', 'form', 'gallery', 'summary', 'activity'];
+const VIEW_KINDS = ['table', 'kanban', 'calendar', 'timeline', 'gantt', 'chart', 'workload', 'map', 'form', 'gallery', 'summary', 'activity', 'dashboard'];
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const HOUR_RE = /^([01]\d|2[0-3]):[0-5]\d$/;

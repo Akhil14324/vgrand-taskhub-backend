@@ -15,14 +15,16 @@ const {
 } = require('../services/boards');
 const { createTodoCore, announce } = require('./todos');
 const { logEvent } = require('../services/todoTimeline');
-const { computeFormulas, computeMirrors, plainValue } = require('../utils/boardCompute');
+const { computeFormulas, computeMirrors, plainValue, mirrorLooks } = require('../utils/boardCompute');
 const { configured: aiConfigured, chatJSON } = require('../utils/openai');
+const { cleanWidgets, aiPrompt, BUILTIN_DIMS } = require('../utils/boardDashboard');
 const { BUILT_INS, checkDefinition } = require('../utils/boardTemplates');
 const { definitionFromBoard, buildBoard } = require('../services/boardBuild');
 const columnsCatalog = require('../utils/columns');
 const { setDependencies } = require('../services/dependencies');
 const { recipeList, buildRecipe, isBoardProfile } = require('../utils/boardRecipes');
 const { runImport } = require('../services/boardImport');
+const { buildProcess } = require('../utils/process');
 
 /**
  * Boards (migration 055), mounted at /api/boards. See MONDAY_FEATURE_SPEC.md sections 2–5.
@@ -385,6 +387,7 @@ async function computedValues({ items, columns, values, actor, ids }) {
   const relationCols = columns.filter((c) => c.kind === 'board_relation');
   const linkedIds = [...new Set(items.flatMap((t) => relationCols.flatMap((c) => values[t.id]?.[c.id] || [])))].slice(0, 500);
   let linked = { items: [], columns: [], values: {} };
+  let mirrors = {};
   if (linkedIds.length) {
     const linkedItems = await listTodos(actor.id, { actor, where: 't.id = ANY($5::int[])', params: [linkedIds] });
     const boardIds = [...new Set(linkedItems.map((t) => t.board_id).filter(Boolean))];
@@ -394,9 +397,40 @@ async function computedValues({ items, columns, values, actor, ids }) {
     ]);
     const lv = {};
     for (const r of lvals.rows) { if (!lv[r.todo_id]) lv[r.todo_id] = {}; lv[r.todo_id][r.column_id] = r.value; }
-    const lcolsVisible = lcols.rows.filter((c) => c.settings?.view !== 'managers');
+    // The linked columns' status labels, so a mirrored status reads and is coloured like the original.
+    const statusCols = lcols.rows.filter((c) => c.kind === 'status').map((c) => c.id);
+    const llabels = statusCols.length
+      ? (await db.query('SELECT column_id, label, color, maps_to, id FROM status_labels WHERE column_id = ANY($1::int[]) AND archived_at IS NULL ORDER BY sort_order, id', [statusCols])).rows
+      : [];
+    const lcolsVisible = lcols.rows.filter((c) => c.settings?.view !== 'managers')
+      .map((c) => (c.kind === 'status' ? { ...c, labels: llabels.filter((l) => l.column_id === c.id) } : c));
     linked = { items: linkedItems, columns: lcolsVisible, values: lv };
     merge(computeMirrors(items, columns, values, linked, nameOf));
+    mirrors = mirrorLooks(columns, linked);
+  }
+
+  const backlinks = {};
+  if (ids.length) {
+    const rows = (await db.query(
+      `SELECT iv.todo_id, c.title AS column_title, c.board_id, b.name AS board_name, e.val::int AS target
+       FROM item_values iv
+       JOIN board_columns c ON c.id = iv.column_id AND c.kind = 'board_relation' AND c.archived_at IS NULL
+       JOIN boards b ON b.id = c.board_id
+       CROSS JOIN LATERAL jsonb_array_elements_text(CASE WHEN jsonb_typeof(iv.value) = 'array' THEN iv.value ELSE '[]'::jsonb END) AS e(val)
+       WHERE e.val ~ '^[0-9]{1,9}$' AND e.val::int = ANY($1::int[]) AND iv.todo_id <> e.val::int
+       LIMIT 3000`,
+      [ids]
+    )).rows;
+    if (rows.length) {
+      // Only links from tasks the viewer may see are shown.
+      const seen = new Map((await listTodos(actor.id, { actor, where: 't.id = ANY($5::int[])', params: [[...new Set(rows.map((x) => x.todo_id))]] })).map((t) => [t.id, t]));
+      for (const x of rows) {
+        const t = seen.get(x.todo_id);
+        if (!t) continue;
+        if (!backlinks[x.target]) backlinks[x.target] = [];
+        backlinks[x.target].push({ id: t.id, title: t.title, is_done: t.is_done, board_id: x.board_id, board_name: x.board_name, column: x.column_title });
+      }
+    }
   }
 
   const fileIds = [...new Set(items.flatMap((t) => columns.filter((c) => c.kind === 'files').flatMap((c) => values[t.id]?.[c.id] || [])))];
@@ -411,6 +445,8 @@ async function computedValues({ items, columns, values, actor, ids }) {
   return {
     cells,
     attachments,
+    mirrors,
+    backlinks,
     linked: Object.fromEntries(linked.items.map((t) => [t.id, { id: t.id, title: t.title, board_id: t.board_id, is_done: t.is_done }])),
   };
 }
@@ -488,6 +524,8 @@ router.get('/:id(\\d+)', authenticate, withActor, boardParam('view'), async (req
       values,
       attachments: extra.attachments,
       linked: extra.linked,
+      mirrors: extra.mirrors,
+      backlinks: extra.backlinks,
       ai_enabled: aiConfigured(),
     });
   } catch (err) {
@@ -1026,6 +1064,55 @@ router.get('/:id(\\d+)/activity', authenticate, withActor, boardParam('view'), a
 // PUT /:id/items/:todoId/depends-on — { ids: [todoId, ...] } what this task waits for (replaces the list).
 // The task, and everything that waits for it, moves to start after the latest of them; later, when one of
 // them changes its date, the tasks that wait for it move by the same days (services/dependencies.js).
+// GET /:id/items/:todoId/process — one task as a process: where its time went (steps and how long each took,
+// time in each stage, who held it, what it waited for, blockers). Read only; the maths is utils/process.js.
+router.get('/:id(\\d+)/items/:todoId(\\d+)/process', authenticate, withActor, boardParam('view'), async (req, res, next) => {
+  try {
+    const todo = await getTodoFor(int(req.params.todoId), req.actor.id, req.actor);
+    if (!todo || !onBoard(todo, req.board)) return res.status(404).json({ error: 'Task not found on this board' });
+    const [events, steps, waitsFor, neededBy, blockers] = await Promise.all([
+      db.query('SELECT kind, from_value, to_value, subject_id, meta, created_at FROM todo_events WHERE todo_id = $1 ORDER BY created_at, id', [todo.id]),
+      db.query(
+        `WITH RECURSIVE tree AS (
+           SELECT t.id, t.parent_id, 1 AS depth FROM todos t WHERE t.parent_id = $1
+           UNION ALL
+           SELECT c.id, c.parent_id, tree.depth + 1 FROM todos c JOIN tree ON c.parent_id = tree.id WHERE tree.depth < 8
+         )
+         SELECT t.id, t.parent_id, t.title, t.status, t.is_done, t.created_at, t.assigned_at, t.started_at, t.done_at, t.due_date,
+                t.status_since, t.status_seconds, t.duration_minutes, u.name AS assignee_name
+         FROM tree JOIN todos t ON t.id = tree.id LEFT JOIN users u ON u.id = t.assignee_id LIMIT 500`,
+        [todo.id]
+      ),
+      db.query(
+        `SELECT t.id, t.title, t.is_done, t.done_at, t.due_date, u.name AS assignee_name, d.created_at AS linked_at
+         FROM todo_dependencies d JOIN todos t ON t.id = d.depends_on_id LEFT JOIN users u ON u.id = t.assignee_id
+         WHERE d.todo_id = $1 ORDER BY d.created_at`,
+        [todo.id]
+      ),
+      db.query(
+        `SELECT t.id, t.title, t.is_done, t.due_date, u.name AS assignee_name
+         FROM todo_dependencies d JOIN todos t ON t.id = d.todo_id LEFT JOIN users u ON u.id = t.assignee_id
+         WHERE d.depends_on_id = $1 ORDER BY t.due_date NULLS LAST, t.id`,
+        [todo.id]
+      ),
+      db.query(
+        `SELECT b.kind, b.note, b.raised_at, b.resolved_at, bu.name AS blocked_by_user_name, bt.title AS blocked_by_todo_title
+         FROM todo_blockers b LEFT JOIN users bu ON bu.id = b.blocked_by_user_id LEFT JOIN todos bt ON bt.id = b.blocked_by_todo_id
+         WHERE b.todo_id = $1 ORDER BY b.raised_at`,
+        [todo.id]
+      ),
+    ]);
+    const ids = [...new Set([todo.created_by, todo.assignee_id, ...events.rows.flatMap((e) => [e.subject_id, e.meta?.to_id, e.meta?.assignee_id])].filter(Boolean))];
+    const names = new Map(ids.length ? (await db.query('SELECT id, name FROM users WHERE id = ANY($1::int[])', [ids])).rows.map((u) => [u.id, u.name]) : []);
+    res.json(buildProcess({
+      todo, events: events.rows, steps: steps.rows, waitsFor: waitsFor.rows, neededBy: neededBy.rows, blockers: blockers.rows,
+      nameOf: (id) => names.get(Number(id)) || null,
+    }));
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.put('/:id(\\d+)/items/:todoId(\\d+)/depends-on', authenticate, withActor, boardParam('view'), async (req, res, next) => {
   try {
     const todo = await getTodoFor(int(req.params.todoId), req.actor.id, req.actor);
@@ -1134,12 +1221,52 @@ function cleanViewSettings(raw = {}) {
   for (const k of ['group_by', 'group_dir', 'header_height', 'item_height', 'date_column', 'timeline_column', 'zoom', 'density', 'chart', 'search']) {
     if (raw[k] !== undefined && raw[k] !== null) s[k] = String(raw[k]).slice(0, 200);
   }
+  if (raw.widgets !== undefined) s.widgets = cleanWidgets(raw.widgets);
   if (raw.pinned !== undefined) s.pinned = Math.min(Math.max(int(raw.pinned) || 0, 0), 5);
   if (raw.show_done !== undefined) s.show_done = !!raw.show_done;
   if (raw.collapsed_groups !== undefined && Array.isArray(raw.collapsed_groups)) s.collapsed_groups = raw.collapsed_groups.map(int).filter(Boolean).slice(0, 500);
   const size = JSON.stringify(s).length;
   return size > 20000 ? {} : s;
 }
+
+// POST /:id/dashboard/ai — { request, widgets, schema } the AI proposes a new widget list; nothing is saved here,
+// the client previews it and saves through the view's settings (OpenAI only).
+/** The AI's proposal for a dashboard over these columns (none for the Home one). Answers the request itself. */
+async function proposeDashboard(req, res, cols) {
+  if (!aiConfigured()) return res.status(503).json({ error: 'AI is not set up on the server' });
+  const request = String(req.body.request || '').trim();
+  if (!request) return res.status(400).json({ error: 'Say what you want on the dashboard' });
+  const schema = {
+    columns: cols.map((c) => ({ id: String(c.id), title: c.title, kind: c.kind })),
+    dimensions: [...BUILTIN_DIMS,
+      ...cols.filter((c) => !c.system_key && !['files', 'long_text', 'updates', 'dependency', 'ai'].includes(c.kind)).map((c) => `col:${c.id}`)],
+    numeric_columns: cols.filter((c) => ['numbers', 'formula', 'rating'].includes(c.kind)).map((c) => ({ id: String(c.id), title: c.title })),
+  };
+  const current = cleanWidgets(req.body.widgets, schema);
+  const reply = await chatJSON({ ...aiPrompt({ request, widgets: current, schema }), maxTokens: 3000 });
+  const widgets = cleanWidgets(reply.widgets, schema);
+  if (!widgets.length) return res.status(422).json({ error: 'The AI did not come back with a dashboard. Try saying it another way.' });
+  return res.json({ widgets, summary: String(reply.summary || '').slice(0, 300) });
+}
+
+router.post('/:id(\\d+)/dashboard/ai', authenticate, withActor, boardParam('view'), async (req, res, next) => {
+  try {
+    const cols = (await db.query('SELECT id, title, kind, system_key FROM board_columns WHERE board_id = $1 AND archived_at IS NULL', [req.board.id])).rows;
+    return await proposeDashboard(req, res, cols);
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// POST /home-dashboard/ai — the same for a person's own dashboard on Home: it is drawn from the to-dos they can
+// see, so there are no board columns, only the built-in ways to split (status, person, group = company, dates).
+router.post('/home-dashboard/ai', authenticate, async (req, res, next) => {
+  try {
+    return await proposeDashboard(req, res, []);
+  } catch (err) {
+    return next(err);
+  }
+});
 
 async function viewOf(req, res) {
   const view = (await db.query('SELECT * FROM board_views WHERE id = $1 AND board_id = $2', [int(req.params.vid), req.board.id])).rows[0];

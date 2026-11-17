@@ -113,7 +113,7 @@ async function buildBoard(actor, place, def, { withItems = true, createTodoCore 
     cols.push(await addSystemColumn(db, board.id, 'status', order + 1, actor.id));
   }
 
-  const views = def.views?.length ? def.views : [{ kind: 'table', name: 'Main table' }, { kind: 'kanban', name: 'Kanban' }];
+  const views = def.views?.length ? def.views : [{ kind: 'table', name: 'Main table' }, { kind: 'kanban', name: 'Kanban' }, { kind: 'dashboard', name: 'Dashboard' }];
   await db.query(
     `INSERT INTO board_views (board_id, owner_id, kind, name, settings, sort_order)
      SELECT $1, NULL, v.kind, v.name, v.settings::jsonb, v.ord

@@ -12,8 +12,8 @@
 
 const status = (labels) => ({ kind: 'status', title: 'Stage', labels: labels.map(([label, color]) => ({ label, color })) });
 const dropdown = (title, options) => ({ kind: 'dropdown', title, settings: { options: options.map(([label, color], i) => ({ id: `o${i + 1}`, label, color })) } });
-const VIEWS = [{ kind: 'table', name: 'Main table' }, { kind: 'kanban', name: 'Kanban' }, { kind: 'calendar', name: 'Calendar' }];
-const PLAN_VIEWS = [{ kind: 'table', name: 'Main table' }, { kind: 'gantt', name: 'Gantt' }, { kind: 'workload', name: 'Workload' }];
+const VIEWS = [{ kind: 'table', name: 'Main table' }, { kind: 'kanban', name: 'Kanban' }, { kind: 'calendar', name: 'Calendar' }, { kind: 'dashboard', name: 'Dashboard' }];
+const PLAN_VIEWS = [{ kind: 'table', name: 'Main table' }, { kind: 'gantt', name: 'Gantt' }, { kind: 'workload', name: 'Workload' }, { kind: 'dashboard', name: 'Dashboard' }];
 
 const BUILT_INS = {
   restaurant_daily: {

@@ -5,6 +5,7 @@ const { authenticate } = require('../middleware/auth');
 const { sanitizeText, validatePassword } = require('../middleware/sanitize');
 const { USERNAME_PATTERN, USERNAME_RULE, cleanUsername, suggestUsername } = require('../utils/mentions');
 const { notify } = require('../utils/notify');
+const { todayInAppZone } = require('../utils/recurrence');
 const {
   LEADERSHIP,
   DESIGNATIONS,
@@ -157,6 +158,26 @@ router.get('/structure', authenticate, async (req, res, next) => {
 });
 
 // GET /api/org/directory?q= — everyone, for @mentions, pickers and "who's who"
+// GET /api/org/load — how much each person is carrying right now, as counts only (no titles): open tasks, late
+// ones and what is due in the next 7 days. Shown next to each name wherever work is given to someone.
+router.get('/load', authenticate, async (req, res, next) => {
+  try {
+    const today = todayInAppZone();
+    const rows = (await db.query(
+      `SELECT t.assignee_id AS id, COUNT(*)::int AS open,
+              COUNT(*) FILTER (WHERE t.due_date < $1::date)::int AS late,
+              COUNT(*) FILTER (WHERE t.due_date >= $1::date AND t.due_date <= $1::date + 6)::int AS week
+       FROM todos t
+       WHERE t.assignee_id IS NOT NULL AND NOT t.is_done AND t.parent_id IS NULL AND t.review_state IS DISTINCT FROM 'rejected'
+       GROUP BY t.assignee_id`,
+      [today]
+    )).rows;
+    res.json({ today, load: Object.fromEntries(rows.map((x) => [x.id, { open: x.open, late: x.late, week: x.week }])) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get('/directory', authenticate, async (req, res, next) => {
   try {
     const q = sanitizeText(req.query.q, 50);
