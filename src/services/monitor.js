@@ -72,6 +72,9 @@ async function monitorablePeople(actorId) {
     if (u.id === actor.id) continue;
     let allowed = explicit.has(u.id);
     if (!allowed && isLeaderTier && bestLevel(u) > actor.global) allowed = true;
+    // The owner account (super_admin with no leadership tier, level 0) is watched by the Chairman and Chief of Staff
+    // as well, so Vinod and Kaushal see the owner's to-dos.
+    if (!allowed && (actor.global === 1 || actor.global === 2) && bestLevel(u) === 0) allowed = true;
     if (!allowed) {
       allowed = u.memberships.some((m) =>
         headOf.has(Number(m.business_id))
