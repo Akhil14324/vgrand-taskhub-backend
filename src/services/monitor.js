@@ -109,7 +109,7 @@ const OPEN_FIELDS = `
   t.id, t.title, t.status, t.status_since, t.status_seconds, t.assignee_id, t.assigned_at, t.created_at,
   t.started_at, t.is_done, t.done_at, t.duration_minutes, t.due_date,
   ((t.due_date + COALESCE(t.due_time, TIME '23:59')) AT TIME ZONE '${String(APP_TIMEZONE).replace(/'/g, "''")}') AS due_at,
-  ((t.deadline_date + TIME '23:59') AT TIME ZONE '${String(APP_TIMEZONE).replace(/'/g, "''")}') AS deadline_at`;
+  ((t.deadline_date + COALESCE(t.deadline_time, TIME '23:59')) AT TIME ZONE '${String(APP_TIMEZONE).replace(/'/g, "''")}') AS deadline_at`;
 
 /** Open work of these people (main to-dos they are accountable for), grouped with colour counts. */
 async function openStats(userIds, now = Date.now()) {

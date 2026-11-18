@@ -13,7 +13,7 @@ const TZ = String(APP_TIMEZONE).replace(/'/g, "''");
 const TODO_SELECT = `
   SELECT t.id, t.title, t.notes, t.due_date, to_char(t.due_time, 'HH24:MI') AS due_time,
          t.priority, t.recurrence, t.is_done, t.done_at, t.done_by, t.created_by, t.created_at, t.updated_at,
-         t.parent_id, t.labels, t.deadline_date, t.duration_minutes, t.reminder_offsets,
+         t.parent_id, t.labels, t.deadline_date, to_char(t.deadline_time, 'HH24:MI') AS deadline_time, t.duration_minutes, t.reminder_offsets,
          t.remind_date, to_char(t.remind_time, 'HH24:MI') AS remind_time, t.remind_repeat, t.business_section_id,
          t.sprint_id, t.story_points, t.item_type, t.epic_id, t.release_id, t.board_id, t.start_date,
          (SELECT sp.name FROM sprints sp WHERE sp.id = t.sprint_id) AS sprint_name,
@@ -24,7 +24,7 @@ const TODO_SELECT = `
          t.submitted_by, t.submitted_at, t.review_state, t.reviewed_by, t.reviewed_at, t.review_note, t.is_warned, t.step_state,
          (SELECT p.created_by FROM todos p WHERE p.id = t.parent_id) AS parent_created_by,
          ((t.due_date + COALESCE(t.due_time, TIME '23:59')) AT TIME ZONE '${TZ}') AS due_at,
-         ((t.deadline_date + TIME '23:59') AT TIME ZONE '${TZ}') AS deadline_at,
+         ((t.deadline_date + COALESCE(t.deadline_time, TIME '23:59')) AT TIME ZONE '${TZ}') AS deadline_at,
          (tm.user_id IS NOT NULL) AS is_member,
          tm.list_id, tm.section_id, tm.sort_order, tm.dumped_at, tm.watching, bo.position AS board_pos,
          cu.name AS created_by_name, cu.username AS created_by_username,

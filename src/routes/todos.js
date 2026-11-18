@@ -520,16 +520,16 @@ async function createTodoCore(actor, body, { quiet = false } = {}) {
     `INSERT INTO todos (created_by, title, notes, due_date, due_time, priority, recurrence,
                         parent_id, labels, deadline_date, duration_minutes, reminder_offsets,
                         assignee_id, assigned_at, business_id, source_business_id, requires_approval, review_state,
-                        remind_date, remind_time, remind_repeat)
+                        remind_date, remind_time, remind_repeat, deadline_time)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::int,
-             CASE WHEN $13::int IS NOT NULL THEN NOW() END, $14, $15, $16, $17, $18, $19, $20)
+             CASE WHEN $13::int IS NOT NULL THEN NOW() END, $14, $15, $16, $17, $18, $19, $20, $21)
      RETURNING id, title, business_id`,
     [
       actor.id, title, notes || '', dueDate, dueTime, parsePriority(body.priority), recurrence,
       parent ? parent.id : null, parseLabels(body.labels), parseDate(body.deadline_date),
       parseDuration(body.duration_minutes), dueTime ? parseOffsets(body.reminder_offsets) : [],
       assigneeId, businessId, sourceBusinessId, requiresApproval, reviewState,
-      remind.date, remind.time, remind.repeat,
+      remind.date, remind.time, remind.repeat, parseDate(body.deadline_date) ? parseTime(body.deadline_time) : null,
     ]
   );
   const todo = inserted.rows[0];
@@ -771,6 +771,7 @@ router.put('/:id(\\d+)', authenticate, async (req, res, next) => {
       : existing.recurrence;
     const labels = req.body.labels !== undefined ? parseLabels(req.body.labels) : existing.labels;
     const deadline = req.body.deadline_date !== undefined ? parseDate(req.body.deadline_date) : existing.deadline_date;
+    const deadlineTime = !deadline ? null : req.body.deadline_time !== undefined ? parseTime(req.body.deadline_time) : (existing.deadline_time || null);
     const startDate = req.body.start_date !== undefined ? parseDate(req.body.start_date) : (existing.start_date || null);
     const duration = req.body.duration_minutes !== undefined ? parseDuration(req.body.duration_minutes) : existing.duration_minutes;
     const offsets = dueTime
@@ -849,11 +850,11 @@ router.put('/:id(\\d+)', authenticate, async (req, res, next) => {
          reminders_sent = CASE WHEN $11::boolean OR $12::boolean THEN '{}'::int[] ELSE reminders_sent END,
          remind_date = $15, remind_time = $16, remind_repeat = $17,
          remind_sent_at = CASE WHEN $18::boolean THEN NULL ELSE remind_sent_at END,
-         business_section_id = $19, start_date = $20
+         business_section_id = $19, start_date = $20, deadline_time = $21
        WHERE id = $13`,
       [title, notes || '', dueDate, dueTime, priority, recurrence, labels, deadline, duration, offsets,
         scheduleChanged, offsetsChanged, existing.id, requiresApproval,
-        remind.date, remind.time, remind.repeat, remindChanged, businessSectionId, startDate]
+        remind.date, remind.time, remind.repeat, remindChanged, businessSectionId, startDate, deadlineTime]
     );
     // The tasks that wait for this one move with it.
     if (dueDate !== existing.due_date) await followDueChange(existing, existing.due_date, dueDate, actor.id);
@@ -1416,10 +1417,10 @@ async function duplicateTree(actor, src, placement, parentId = src.parent_id) {
   const inserted = await db.query(
     `INSERT INTO todos (created_by, title, notes, due_date, due_time, priority, recurrence,
                         parent_id, labels, deadline_date, duration_minutes, reminder_offsets,
-                        assignee_id, assigned_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $1, NOW()) RETURNING id`,
+                        assignee_id, assigned_at, deadline_time)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $1, NOW(), $13) RETURNING id`,
     [actor.id, src.title, src.notes || '', src.due_date, src.due_time, src.priority, src.recurrence,
-      parentId, src.labels || [], src.deadline_date, src.duration_minutes, src.reminder_offsets || []]
+      parentId, src.labels || [], src.deadline_date, src.duration_minutes, src.reminder_offsets || [], src.deadline_time || null]
   );
   const id = inserted.rows[0].id;
   await db.query(
