@@ -117,9 +117,12 @@ router.get('/structure', authenticate, async (req, res, next) => {
       ...extra,
     });
 
+    // The leadership circle: every tier holder, plus the super admin (level 0, no tier of its own), who is shown
+    // first and with no tier label.
     const leaders = persons
-      .filter((p) => p.org_level && LEADERSHIP[p.org_level])
-      .map((p) => brief(p, { tier: LEADERSHIP[p.org_level].label }));
+      .filter((p) => (p.org_level && LEADERSHIP[p.org_level]) || globalLevel(p) === 0)
+      .sort((x, y) => (globalLevel(x) === 0 ? 0 : 1) - (globalLevel(y) === 0 ? 0 : 1))
+      .map((p) => brief(p, { tier: p.org_level && LEADERSHIP[p.org_level] ? LEADERSHIP[p.org_level].label : null }));
 
     const businessNodes = businesses.rows.map((b) => {
       const members = [];
