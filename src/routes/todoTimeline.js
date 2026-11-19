@@ -155,6 +155,9 @@ router.get('/gantt', authenticate, async (req, res, next) => {
         due_at: t.due_at,
         due_date: t.due_date,
         done_at: t.done_at,
+        // The newest edit or timeline event (status, comment, hand-over ...): "Last worked N days ago" on the chart.
+        last_worked_at: iso([t.updated_at, (byTodo.get(t.id) || []).at(-1)?.created_at]
+          .filter(Boolean).map((d) => new Date(d)).sort((a, b) => b - a)[0] || null),
         start: iso(built.start),
         end: iso(built.end),
         running: !t.is_done,
