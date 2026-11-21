@@ -252,7 +252,7 @@ router.get('/', authenticate, async (req, res, next) => {
   }
 });
 
-// GET /api/todos/completed?before=<ISO time> — completion history, newest first, 40 per page.
+// GET /api/todos/completed?before=<ISO time>&from=<day>&to=<day> — completion history, newest first, 40 per page.
 // Sub-tasks that were completed together with their parent are left out.
 router.get('/completed', authenticate, async (req, res, next) => {
   try {
@@ -261,13 +261,19 @@ router.get('/completed', authenticate, async (req, res, next) => {
     const before = req.query.before && !Number.isNaN(Date.parse(req.query.before))
       ? new Date(req.query.before).toISOString()
       : null;
+    // from / to: completion days (YYYY-MM-DD, app timezone), inclusive.
+    const ymd = (v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
+    const from = ymd(req.query.from);
+    const to = ymd(req.query.to);
     const rows = await listTodos(actor.id, {
       actor,
       where: `t.is_done = TRUE AND t.done_at IS NOT NULL
               AND (tm.user_id IS NOT NULL OR t.done_by = $1)
               AND ($5::timestamptz IS NULL OR t.done_at < $5)
+              AND ($6::date IS NULL OR (t.done_at AT TIME ZONE $8)::date >= $6::date)
+              AND ($7::date IS NULL OR (t.done_at AT TIME ZONE $8)::date <= $7::date)
               AND NOT EXISTS (SELECT 1 FROM todos p WHERE p.id = t.parent_id AND p.is_done = TRUE)`,
-      params: [before],
+      params: [before, from, to, APP_TIMEZONE],
       tail: 'ORDER BY t.done_at DESC LIMIT 41',
     });
     res.json({ todos: rows.slice(0, 40), has_more: rows.length > 40 });
