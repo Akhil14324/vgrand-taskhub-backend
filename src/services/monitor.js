@@ -105,6 +105,28 @@ function parseDays(value) {
   return WINDOWS.includes(n) ? n : 30;
 }
 
+const YMD = /^\d{4}-\d{2}-\d{2}$/;
+
+/** A period is a number of days back, or an inclusive day range { from, to } (YYYY-MM-DD, app timezone). */
+function parsePeriod(query = {}) {
+  const from = YMD.test(query.from || '') ? query.from : null;
+  const to = YMD.test(query.to || '') ? query.to : null;
+  if (from || to) return { from: from || to, to: to || from };
+  return { days: parseDays(query.days) };
+}
+
+/** SQL for "created_at falls in the period"; its params start at $n. */
+function periodClause(period, n, column = 'created_at') {
+  const p = typeof period === 'number' ? { days: period } : period;
+  if (p.from) {
+    return {
+      sql: `(${column} AT TIME ZONE $${n + 2})::date BETWEEN $${n}::date AND $${n + 1}::date`,
+      params: [p.from, p.to, APP_TIMEZONE],
+    };
+  }
+  return { sql: `${column} > NOW() - make_interval(days => $${n})`, params: [p.days] };
+}
+
 const OPEN_FIELDS = `
   t.id, t.title, t.status, t.status_since, t.status_seconds, t.assignee_id, t.assigned_at, t.created_at,
   t.started_at, t.is_done, t.done_at, t.duration_minutes, t.due_date,
@@ -134,7 +156,8 @@ async function openStats(userIds, now = Date.now()) {
 }
 
 /** Completed-work numbers from the event log (so recurring and deleted to-dos still count). */
-async function completionStats(userIds, days) {
+async function completionStats(userIds, period) {
+  const pc = periodClause(period, 2);
   const result = await db.query(
     `SELECT subject_id AS user_id,
             COUNT(*)::int AS completed,
@@ -148,18 +171,18 @@ async function completionStats(userIds, days) {
               FILTER (WHERE meta->>'estimate_min' IS NOT NULL AND meta->>'active_s' IS NOT NULL) AS estimate_ratio
      FROM todo_events
      WHERE kind = 'completed' AND subject_id = ANY($1::int[])
-       AND created_at > NOW() - make_interval(days => $2)
+       AND ${pc.sql}
        AND COALESCE((meta->>'is_subtask')::boolean, FALSE) = FALSE
      GROUP BY subject_id`,
-    [userIds, days]
+    [userIds, ...pc.params]
   );
   const rescheduled = await db.query(
     `SELECT subject_id AS user_id, COUNT(*)::int AS reschedules
      FROM todo_events
      WHERE kind = 'due_changed' AND from_value IS NOT NULL AND subject_id = ANY($1::int[])
-       AND created_at > NOW() - make_interval(days => $2)
+       AND ${pc.sql}
      GROUP BY subject_id`,
-    [userIds, days]
+    [userIds, ...pc.params]
   );
   const map = new Map();
   const num = (v) => (v === null || v === undefined ? null : Math.round(Number(v)));
@@ -189,15 +212,16 @@ const EMPTY_COMPLETION = {
  * when all its steps are, so the overview counts the steps as well: how many exist, how many are finished, and
  * how many were finished in the period. A sub-task that has its own sub-tasks is not a step, its sub-tasks are.
  */
-async function stepStats(userIds, days) {
+async function stepStats(userIds, period) {
+  const pc = periodClause(period, 2);
   const [processes, finished] = await Promise.all([
     openProcesses({ userIds }),
     db.query(
       `SELECT subject_id AS user_id, COUNT(*)::int AS n FROM todo_events
-       WHERE kind = 'completed' AND subject_id = ANY($1::int[]) AND created_at > NOW() - make_interval(days => $2)
+       WHERE kind = 'completed' AND subject_id = ANY($1::int[]) AND ${pc.sql}
          AND COALESCE((meta->>'is_subtask')::boolean, FALSE) = TRUE
        GROUP BY subject_id`,
-      [userIds, days]
+      [userIds, ...pc.params]
     ),
   ]);
   const out = new Map(userIds.map((id) => [id, { total: 0, done: 0, processes: 0, finished: 0, pct: null, stalled: 0, _w: 0, _g: 0 }]));
@@ -221,9 +245,9 @@ async function stepStats(userIds, days) {
 }
 
 /** Per-person numbers for the overview list. */
-async function statsForPeople(userIds, days) {
+async function statsForPeople(userIds, period) {
   if (!userIds.length) return new Map();
-  const [open, done, steps] = await Promise.all([openStats(userIds), completionStats(userIds, days), stepStats(userIds, days)]);
+  const [open, done, steps] = await Promise.all([openStats(userIds), completionStats(userIds, period), stepStats(userIds, period)]);
   const out = new Map();
   for (const id of userIds) {
     out.set(id, {
@@ -295,6 +319,7 @@ module.exports = {
   actorCanMonitor,
   monitorablePeople,
   parseDays,
+  parsePeriod,
   statsForPeople,
   teamTotals,
   weeklyCompletions,

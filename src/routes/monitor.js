@@ -4,14 +4,14 @@ const { authenticate } = require('../middleware/auth');
 const { sanitizeText } = require('../middleware/sanitize');
 const { notify, emitToUsers } = require('../utils/notify');
 const { loadActor } = require('../utils/org');
-const { todayInAppZone } = require('../utils/recurrence');
+const { todayInAppZone, APP_TIMEZONE } = require('../utils/recurrence');
 const { listTodos, getTodoFor, memberIds, descendantIds } = require('../services/todoQueries');
 const { buildTimeline } = require('../services/todoTimeline');
 const { openProcesses } = require('../services/processes');
 const {
   actorCanMonitor,
   monitorablePeople,
-  parseDays,
+  parsePeriod,
   statsForPeople,
   teamTotals,
   weeklyCompletions,
@@ -46,13 +46,13 @@ router.get('/access', authenticate, async (req, res, next) => {
 // GET /api/monitor/overview?days=7|30|90 — everyone I may watch, with numbers, plus team totals
 router.get('/overview', authenticate, requireMonitor, async (req, res, next) => {
   try {
-    const days = parseDays(req.query.days);
+    const period = parsePeriod(req.query);
     const { people } = req.monitor;
     const ids = people.map((p) => p.id);
-    const [stats, processes] = await Promise.all([statsForPeople(ids, days), openProcesses({ userIds: ids })]);
+    const [stats, processes] = await Promise.all([statsForPeople(ids, period), openProcesses({ userIds: ids })]);
     const nameOf = new Map(people.map((p) => [p.id, p.name]));
     res.json({
-      days,
+      ...period,
       today: todayInAppZone(),
       team: teamTotals(stats),
       people: people.map((p) => ({ ...p, stats: stats.get(p.id) })),
@@ -74,16 +74,19 @@ router.get('/people/:id', authenticate, requireMonitor, async (req, res, next) =
     const personId = parseInt(req.params.id, 10);
     const person = req.monitor.people.find((p) => p.id === personId);
     if (!person) return res.status(404).json({ error: 'Person not found' });
-    const days = parseDays(req.query.days);
+    const period = parsePeriod(req.query);
 
     const [stats, week, todos, activity] = await Promise.all([
-      statsForPeople([personId], days),
+      statsForPeople([personId], period),
       weeklyCompletions(personId),
       // Everything on the person's own list: personal to-dos and the business tasks they are on.
       listTodos(personId, {
         listOnly: true,
         dumped: 'any',
-        where: `(t.is_done = FALSE OR t.done_at > NOW() - INTERVAL '30 days' OR t.due_date >= CURRENT_DATE - 30)`,
+        where: period.from
+          ? `(t.is_done = FALSE OR (t.done_at AT TIME ZONE $5)::date BETWEEN $6::date AND $7::date)`
+          : `(t.is_done = FALSE OR t.done_at > NOW() - INTERVAL '30 days' OR t.due_date >= CURRENT_DATE - 30)`,
+        params: period.from ? [APP_TIMEZONE, period.from, period.to] : [],
         tail: 'ORDER BY t.is_done, t.due_date ASC NULLS LAST, t.priority ASC, t.created_at DESC LIMIT 400',
       }),
       db.query(
@@ -100,7 +103,7 @@ router.get('/people/:id', authenticate, requireMonitor, async (req, res, next) =
 
     res.json({
       person,
-      days,
+      ...period,
       stats: stats.get(personId),
       week,
       today: todayInAppZone(),
