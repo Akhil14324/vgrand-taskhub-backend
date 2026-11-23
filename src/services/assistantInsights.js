@@ -206,13 +206,17 @@ function buildReport(rows, me, period = 'day', now = Date.now()) {
   };
 }
 
-/** Everything the person can see that is open or was finished in the last two weeks (incl. what they handed out). */
-async function loadRows(actor) {
+/**
+ * Everything the person can see that is open or was finished in the last `days` days (default two weeks; the
+ * monthly report asks for 62 so it can compare with the month before), including what they handed out.
+ */
+async function loadRows(actor, days = 15) {
+  const span = Math.min(90, Math.max(1, parseInt(days, 10) || 15)); // a whole number, so it is safe in the SQL text
   return listTodos(actor.id, {
     actor,
     watching: 'any',
-    where: "(t.is_done = FALSE OR t.done_at >= NOW() - INTERVAL '15 days') AND t.review_state <> 'rejected'",
-    tail: 'ORDER BY t.id DESC LIMIT 2000',
+    where: `(t.is_done = FALSE OR t.done_at >= NOW() - INTERVAL '${span} days') AND t.review_state <> 'rejected'`,
+    tail: 'ORDER BY t.id DESC LIMIT 3000',
   });
 }
 

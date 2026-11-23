@@ -5,11 +5,33 @@
 const configured = () => !!process.env.OPENAI_API_KEY;
 const MODEL = () => process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const TRANSCRIBE_MODEL = () => process.env.OPENAI_TRANSCRIBE_MODEL || 'whisper-1';
+// Optional: OPENAI_BASE_URL (a proxy or a local test server; default OpenAI) and OPENAI_TIMEOUT_MS (default 45 s).
+const BASE = () => (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
+const TIMEOUT_MS = () => Math.max(5000, Number(process.env.OPENAI_TIMEOUT_MS) || 45000);
 
 function upstream(message) {
   const err = new Error(message);
   err.status = 502;
   return err;
+}
+
+/** POST to the chat-completions endpoint with a time limit, so a slow answer never hangs a request. */
+async function postChat(body) {
+  try {
+    return await fetch(`${BASE()}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TIMEOUT_MS()),
+    });
+  } catch (err) {
+    if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      const timeout = new Error('The AI took too long to answer. Please try again.');
+      timeout.status = 504;
+      throw timeout;
+    }
+    throw upstream('The AI could not be reached. Please try again.');
+  }
 }
 
 function notConfigured() {
@@ -21,16 +43,12 @@ function notConfigured() {
 /** One chat completion that must answer with a JSON object. Returns the parsed object. */
 async function chatJSON({ system, user, temperature = 0.2, maxTokens = 1500 }) {
   if (!configured()) throw notConfigured();
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: MODEL(),
-      temperature,
-      max_tokens: maxTokens,
-      response_format: { type: 'json_object' },
-      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-    }),
+  const res = await postChat({
+    model: MODEL(),
+    temperature,
+    max_tokens: maxTokens,
+    response_format: { type: 'json_object' },
+    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw upstream(data.error?.message || 'The AI could not answer');
@@ -44,11 +62,7 @@ async function chatJSON({ system, user, temperature = 0.2, maxTokens = 1500 }) {
 /** One chat turn that may call tools. Returns the assistant message ({ content, tool_calls }). */
 async function chatTools({ messages, tools, temperature = 0.2, maxTokens = 1200 }) {
   if (!configured()) throw notConfigured();
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: MODEL(), temperature, max_tokens: maxTokens, messages, tools, tool_choice: 'auto' }),
-  });
+  const res = await postChat({ model: MODEL(), temperature, max_tokens: maxTokens, messages, tools, tool_choice: 'auto' });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw upstream(data.error?.message || 'The AI could not answer');
   return data.choices?.[0]?.message || { content: '' };
