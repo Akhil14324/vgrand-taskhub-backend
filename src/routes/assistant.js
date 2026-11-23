@@ -9,6 +9,8 @@ const { chatTools, configured } = require('../utils/openai');
 const { businessHealth } = require('../services/insights');
 const { atRisk } = require('../services/risk');
 const { callApi, mustCall } = require('../services/automation/internalApi');
+const { chatJSON } = require('../utils/openai');
+const insights = require('../services/assistantInsights');
 
 // /api/assistant: a chief of staff you can talk to. It answers from the person's own view of the data and
 // never changes anything on its own: changes come back as proposals the person confirms, and are then made
@@ -16,6 +18,15 @@ const { callApi, mustCall } = require('../services/automation/internalApi');
 const router = express.Router();
 
 const str = (v, n = 300) => sanitizeText(String(v ?? ''), n) || '';
+
+/** "Recent AI activity" (migration 072). Never fails the request it belongs to. */
+async function logActivity(userId, kind, summary) {
+  try {
+    await db.query('INSERT INTO assistant_activity (user_id, kind, summary) VALUES ($1, $2, $3)', [userId, kind, String(summary).slice(0, 300)]);
+  } catch (err) {
+    if (err.code !== '42P01') console.error('[assistant] activity log failed:', err.message);
+  }
+}
 const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || '');
 
 // ---- tools the model can use ------------------------------------------------------------------------
@@ -36,6 +47,14 @@ const READ_TOOLS = [
   fn('team_status', 'How each business is doing this week (leaders only): finished, open, overdue, stuck.'),
   fn('find_person', 'Look up a colleague by name or username.', { name: { type: 'string' } }, ['name']),
   fn('recall', 'Search the company memory (to-dos, comments, updates, meeting summaries and decisions) to answer "what did we decide / who did / when did" questions.', { question: { type: 'string' } }, ['question']),
+  fn('overview', 'The person\'s own numbers right now: due today, pending, completed today, overdue, no date, not updated, waiting on others, upcoming deadlines, date clashes, and data-based insights. Use it for "what should I do today", "show my pending / overdue tasks" and workload questions.'),
+  fn('assigned_work', 'To-dos assigned TO the person by others, or assigned BY the person to others, with status, progress and last update.', {
+    direction: { type: 'string', enum: ['to_me', 'by_me'] },
+    status: { type: 'string', enum: ['open', 'overdue', 'stale', 'done'] },
+  }, ['direction']),
+  fn('stale_todos', 'Open to-dos (the person\'s own and the ones they gave out) not updated for a number of days.', { days: { type: 'integer', description: 'default 3' } }),
+  fn('team_workload', 'Open, overdue, due-this-week and stuck work per person the person can see, and who is overloaded or light.'),
+  fn('progress_report', 'Daily or weekly progress report from the data: completed, pending, delayed, progress %, trend.', { period: { type: 'string', enum: ['day', 'week'] } }, ['period']),
 ];
 
 const WRITE_TOOLS = [
@@ -48,7 +67,8 @@ const WRITE_TOOLS = [
   fn('complete_todo', 'Propose ticking a to-do as done.', { id: { type: 'integer' } }, ['id']),
   fn('assign_todo', 'Propose giving a to-do to someone.', { id: { type: 'integer' }, username: { type: 'string' } }, ['id', 'username']),
   fn('add_comment', 'Propose a comment on a to-do.', { id: { type: 'integer' }, text: { type: 'string' } }, ['id', 'text']),
-  fn('add_steps', 'Propose adding steps (sub-tasks) to a to-do.', { id: { type: 'integer' }, steps: { type: 'array', items: { type: 'string' } } }, ['id', 'steps']),
+  fn('add_steps', 'Propose adding steps (sub-tasks) to a to-do. Use it to break a big task into smaller ones.', { id: { type: 'integer' }, steps: { type: 'array', items: { type: 'string' } } }, ['id', 'steps']),
+  fn('set_priority', 'Propose a new priority for a to-do (1 highest, 4 lowest).', { id: { type: 'integer' }, priority: { type: 'integer' } }, ['id', 'priority']),
 ];
 const WRITE_NAMES = new Set(WRITE_TOOLS.map((t) => t.function.name));
 
@@ -133,6 +153,35 @@ async function runRead(actor, name, args) {
     }
     case 'find_person': return findUsers(args.name);
     case 'recall': return recall(actor, args.question);
+    case 'overview': {
+      const o = insights.buildOverview(await insights.loadRows(actor), actor);
+      return { today: o.today, counts: o.counts, due_today: o.due_today, overdue: o.overdue, upcoming: o.upcoming, stale: o.stale, waiting_on_others: o.waiting_on_others, conflicts: o.conflicts, insights: o.insights.map((i) => i.text) };
+    }
+    case 'assigned_work': {
+      const rows = await insights.loadRows(actor);
+      const { toMe, byMe } = insights.classify(rows, actor.id);
+      const today = todayInAppZone();
+      let list = args.direction === 'by_me' ? byMe : toMe;
+      if (args.status === 'done') list = list.filter((t) => t.is_done);
+      else {
+        list = list.filter((t) => !t.is_done);
+        if (args.status === 'overdue') list = list.filter((t) => insights.keyDate(t) && insights.keyDate(t) < today);
+        if (args.status === 'stale') list = list.filter((t) => Date.now() - new Date(t.updated_at).getTime() >= insights.STALE_DAYS * 86400000);
+      }
+      return list.slice(0, 30).map((t) => insights.slimTodo(t));
+    }
+    case 'stale_todos': {
+      const days = Math.min(60, Math.max(1, parseInt(args.days, 10) || insights.STALE_DAYS));
+      const { mine, byMe } = insights.classify(await insights.loadRows(actor), actor.id);
+      const cut = Date.now() - days * 86400000;
+      return [...mine, ...byMe].filter((t) => !t.is_done && new Date(t.updated_at).getTime() <= cut)
+        .sort((a, b) => new Date(a.updated_at) - new Date(b.updated_at)).slice(0, 30).map((t) => insights.slimTodo(t));
+    }
+    case 'team_workload': {
+      const { team } = insights.classify(await insights.loadRows(actor), actor.id);
+      return insights.workload(team, todayInAppZone(), actor.id);
+    }
+    case 'progress_report': return insights.buildReport(await insights.loadRows(actor), actor, args.period === 'week' ? 'week' : 'day');
     default: return { error: 'Unknown tool' };
   }
 }
@@ -147,7 +196,8 @@ async function describe(actor, name, a) {
     case 'complete_todo': return `Mark ${await title(a.id)} as done`;
     case 'assign_todo': return `Give ${await title(a.id)} to @${str(a.username, 40)}`;
     case 'add_comment': return `Comment on ${await title(a.id)}: "${str(a.text, 120)}"`;
-    case 'add_steps': return `Add ${(a.steps || []).length} steps to ${await title(a.id)}`;
+    case 'add_steps': return `Add ${(a.steps || []).length} steps to ${await title(a.id)}: ${(a.steps || []).slice(0, 6).map((s) => str(s, 60)).join('; ')}`;
+    case 'set_priority': return `Set ${await title(a.id)} to priority ${parseInt(a.priority, 10) || '?'}`;
     default: return name;
   }
 }
@@ -160,7 +210,11 @@ function systemPrompt(actor) {
     + 'You cannot change anything yourself: to create, move, complete, assign, comment or add steps, call the matching tool, which only PROPOSES the change for the person to confirm. '
     + 'For several changes, call the tool several times. Reply in short plain sentences with no markdown, no lists of ids, as if speaking aloud. '
     + 'When you proposed changes, say briefly what you propose and that it needs their OK. If something is not possible or not allowed, say so plainly. '
-    + 'Dates are YYYY-MM-DD when calling tools; turn "tomorrow" or "next Friday" into real dates from today.';
+    + 'Dates are YYYY-MM-DD when calling tools; turn "tomorrow" or "next Friday" into real dates from today. '
+    + 'For "what should I do", pending, overdue, workload or progress questions use overview, assigned_work, stale_todos, team_workload or progress_report. '
+    + 'Base every statement on tool results; never invent tasks, numbers or people. When creating a to-do from a request like "remind me to X by Friday", '
+    + 'pick a clear title, the real date and a sensible priority (1 urgent, 2 high, 3 normal, 4 low), and propose it with create_todo. '
+    + 'To break a big task into smaller ones, search for it, then propose add_steps with 3 to 8 concrete steps.';
 }
 
 // POST /api/assistant/chat — { messages: [{ role: 'user' | 'assistant', content }] } -> { reply, proposals: [{ tool, args, summary }] }
@@ -198,6 +252,7 @@ router.post('/chat', authenticate, async (req, res, next) => {
       }
     }
     if (!reply) reply = proposals.length ? 'Here is what I would do. Please check it.' : 'I could not work that out. Try asking another way.';
+    logActivity(actor.id, 'question', history[history.length - 1].content);
     res.json({ reply, proposals });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ error: err.message });
@@ -227,6 +282,12 @@ async function carryOut(actor, tool, a) {
         delegate_to: person ? person.id : undefined,
         notes: person && steps.length ? steps.map((s) => `- ${s}`).join('\n') : undefined,
       };
+      // No duplicates: an open to-do of mine with the same title is reused instead of made again.
+      const same = (await db.query(
+        `SELECT id FROM todos WHERE created_by = $1 AND is_done = FALSE AND LOWER(TRIM(title)) = LOWER(TRIM($2)) AND parent_id IS NULL LIMIT 1`,
+        [uid, body.title]
+      )).rows[0];
+      if (same) return `"${body.title}" is already on your list, so I did not add it again`;
       const out = await mustCall(uid, 'POST', '/todos', body);
       if (out.todo && steps.length) for (const s of steps) await mustCall(uid, 'POST', '/todos', { title: s, parent_id: out.todo.id });
       return `Created "${body.title}"${person ? ` for ${person.name}` : ''}`;
@@ -255,6 +316,14 @@ async function carryOut(actor, tool, a) {
       for (const s of steps) await mustCall(uid, 'POST', '/todos', { title: s, parent_id: parseInt(a.id, 10) });
       return `${steps.length} steps added`;
     }
+    case 'set_priority': {
+      const p = parseInt(a.priority, 10);
+      if (![1, 2, 3, 4].includes(p)) throw new Error('Priority must be 1 to 4');
+      const t = await getTodoFor(a.id, uid, actor);
+      if (!t) throw new Error('I could not find that to-do');
+      await mustCall(uid, 'PUT', `/todos/${t.id}`, { priority: p });
+      return `"${t.title}" is now priority ${p}`;
+    }
     default:
       throw new Error('Unknown action');
   }
@@ -269,13 +338,169 @@ router.post('/execute', authenticate, async (req, res, next) => {
     for (const act of actions) {
       if (!WRITE_NAMES.has(act.tool)) { results.push({ ok: false, message: 'Unknown action' }); continue; }
       try {
-        results.push({ ok: true, message: await carryOut(actor, act.tool, act.args || {}) });
+        const message = await carryOut(actor, act.tool, act.args || {});
+        results.push({ ok: true, message });
+        logActivity(actor.id, 'action', message);
       } catch (err) {
         results.push({ ok: false, message: err.message });
       }
     }
     res.json({ results });
   } catch (err) {
+    next(err);
+  }
+});
+
+// ---- the AI Assistant dashboard ---------------------------------------------------------------------------
+
+// GET /api/assistant/overview — counts, lists and data-based insights (no AI call, so it is fast and always works).
+router.get('/overview', authenticate, async (req, res, next) => {
+  try {
+    const actor = await loadActor(req.user.id);
+    res.json({ ...insights.buildOverview(await insights.loadRows(actor), actor), ai: configured(), name: actor.name });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/assistant/report?period=day|week — the numbers of the daily or weekly report.
+router.get('/report', authenticate, async (req, res, next) => {
+  try {
+    const actor = await loadActor(req.user.id);
+    res.json(insights.buildReport(await insights.loadRows(actor), actor, req.query.period === 'week' ? 'week' : 'day'));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/assistant/activity — the person's recent assistant activity.
+router.get('/activity', authenticate, async (req, res, next) => {
+  try {
+    const rows = (await db.query(
+      'SELECT id, kind, summary, created_at FROM assistant_activity WHERE user_id = $1 ORDER BY created_at DESC LIMIT 15', [req.user.id]
+    ).catch((err) => { if (err.code === '42P01') return { rows: [] }; throw err; })).rows;
+    res.json({ activity: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// AI answers are kept a while per person and per state of their to-dos, and one request at a time is made for the
+// same thing: opening the dashboard twice, or two tabs, never pays for the same answer twice.
+const aiCache = new Map(); // key -> { at, value }
+const aiInflight = new Map(); // key -> Promise
+const AI_TTL_MS = 20 * 60 * 1000;
+function cachedAi(key, force, make) {
+  const hit = aiCache.get(key);
+  if (!force && hit && Date.now() - hit.at < AI_TTL_MS) return Promise.resolve({ ...hit.value, cached: true });
+  if (aiInflight.has(key)) return aiInflight.get(key);
+  const p = make()
+    .then((value) => {
+      aiCache.set(key, { at: Date.now(), value });
+      if (aiCache.size > 500) aiCache.delete(aiCache.keys().next().value);
+      return value;
+    })
+    .finally(() => aiInflight.delete(key));
+  aiInflight.set(key, p);
+  return p;
+}
+/** Changes whenever one of the person's to-dos changes, so a cached answer is never about old data. */
+const stateKey = (rows) => rows.reduce((h, t) => (h * 31 + t.id + new Date(t.updated_at).getTime() % 100000) % 2147483647, rows.length);
+
+const SUGGEST_SYSTEM = `You are a productivity manager inside a to-do app. You get the person's real open to-dos as JSON
+(id, title, priority 1 highest..4 lowest, status, due_date, deadline_date, progress %, steps, updated_days_ago, assignee, created_by,
+role: "mine" = the person does it, "given_out" = the person gave it to someone else and only follows up).
+Only "mine" to-dos go in do_today, most_important, can_postpone, before_deadline, running_long and priority_changes;
+"given_out" to-dos may only appear in needs_attention (as a follow-up with the assignee).
+Answer with a JSON object with exactly these keys:
+"headline": one or two sentences, e.g. "You have 5 to-dos due today. Start with X because its deadline is closest.",
+"do_today": [{"id", "why"}] up to 5, in the order to do them,
+"most_important": [{"id", "why"}] up to 3,
+"needs_attention": [{"id", "why"}] up to 4 (late, stuck, not updated, close deadline),
+"can_postpone": [{"id", "why"}] up to 3 (low priority, far date, nothing depends on it),
+"before_deadline": [{"id", "why"}] up to 4 (must be finished before an upcoming deadline),
+"running_long": [{"id", "why"}] up to 3 (in progress a long time or little progress),
+"priority_changes": [{"id", "priority", "why"}] up to 4, only when the current priority clearly does not fit,
+"organize": [string] up to 3 short tips on organising this workload,
+"coach": [string] up to 3 short, personal productivity tips based on these to-dos.
+Use ONLY ids from the input. Never invent to-dos, people, dates or numbers. Keep every "why" under 20 words. Plain text, no markdown.
+Empty arrays are fine when nothing fits.`;
+
+// POST /api/assistant/suggestions — { force? } AI suggestions on the person's real to-dos, checked against them.
+router.post('/suggestions', authenticate, async (req, res, next) => {
+  try {
+    if (!configured()) return res.status(503).json({ error: 'AI suggestions are not switched on yet. Ask the owner to add the OpenAI key.' });
+    const actor = await loadActor(req.user.id);
+    const rows = await insights.loadRows(actor);
+    const { mine, byMe } = insights.classify(rows, actor.id);
+    const open = [...mine, ...byMe].filter((t) => !t.is_done);
+    if (!open.length) return res.json({ headline: 'Nothing is open on your list, so there is nothing to suggest right now.', empty: true });
+    const pick = open.sort((a, b) => (insights.keyDate(a) || '9999').localeCompare(insights.keyDate(b) || '9999') || a.priority - b.priority).slice(0, 60);
+    const byId = new Map(pick.map((t) => [t.id, t]));
+    const givenOut = new Set(byMe.map((t) => t.id)); // someone else does these: only "needs attention" (follow up)
+    const result = await cachedAi(`sug:${actor.id}:${stateKey(rows)}`, !!req.body?.force, async () => {
+      const today = todayInAppZone();
+      const raw = await chatJSON({
+        system: SUGGEST_SYSTEM,
+        user: JSON.stringify({ today, person: actor.name, todos: pick.map((t) => ({ ...insights.slimTodo(t), role: givenOut.has(t.id) ? 'given_out' : 'mine' })) }),
+        maxTokens: 1600,
+      });
+      // Keep only what refers to real to-dos of this person, with the title from the database (never the model's).
+      const items = (list, n, followUp = false) => (Array.isArray(list) ? list : [])
+        .filter((x) => x && byId.has(Number(x.id)) && (followUp || !givenOut.has(Number(x.id))))
+        .slice(0, n)
+        .map((x) => ({ id: Number(x.id), title: byId.get(Number(x.id)).title, why: str(x.why, 200) }));
+      const tips = (list) => (Array.isArray(list) ? list : []).map((s) => str(s, 240)).filter(Boolean).slice(0, 3);
+      const out = {
+        headline: str(raw.headline, 400),
+        do_today: items(raw.do_today, 5),
+        most_important: items(raw.most_important, 3),
+        needs_attention: items(raw.needs_attention, 4, true),
+        can_postpone: items(raw.can_postpone, 3),
+        before_deadline: items(raw.before_deadline, 4),
+        running_long: items(raw.running_long, 3),
+        priority_changes: (Array.isArray(raw.priority_changes) ? raw.priority_changes : [])
+          .filter((x) => x && byId.has(Number(x.id)) && !givenOut.has(Number(x.id)) && [1, 2, 3, 4].includes(Number(x.priority)) && Number(x.priority) !== byId.get(Number(x.id)).priority)
+          .slice(0, 4)
+          .map((x) => ({ id: Number(x.id), title: byId.get(Number(x.id)).title, from: byId.get(Number(x.id)).priority, priority: Number(x.priority), why: str(x.why, 200) })),
+        organize: tips(raw.organize),
+        coach: tips(raw.coach),
+        generated_at: new Date().toISOString(),
+      };
+      logActivity(actor.id, 'suggestions', out.headline || 'Suggestions made');
+      return out;
+    });
+    res.json(result);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+// POST /api/assistant/report/summary — { period, force? } a short written summary of the report's real numbers.
+router.post('/report/summary', authenticate, async (req, res, next) => {
+  try {
+    if (!configured()) return res.status(503).json({ error: 'AI summaries are not switched on yet. Ask the owner to add the OpenAI key.' });
+    const actor = await loadActor(req.user.id);
+    const period = req.body?.period === 'week' ? 'week' : 'day';
+    const rows = await insights.loadRows(actor);
+    const report = insights.buildReport(rows, actor, period);
+    const result = await cachedAi(`rep:${period}:${actor.id}:${stateKey(rows)}`, !!req.body?.force, async () => {
+      const raw = await chatJSON({
+        system: `You write a short ${period === 'week' ? 'weekly' : 'daily'} progress report for one person from the JSON you get (their real to-dos).
+Answer with JSON: {"summary": 2-3 sentences, "highlights": [up to 4 short strings: accomplishments or trends], "recommendations": [up to 4 short strings for ${period === 'week' ? 'next week' : 'tomorrow'}]}.
+Use only what is in the data; quote to-do titles exactly; never invent numbers. Plain text, no markdown.`,
+        user: JSON.stringify(report),
+        maxTokens: 700,
+      });
+      const list = (l) => (Array.isArray(l) ? l : []).map((s) => str(s, 240)).filter(Boolean).slice(0, 4);
+      const out = { summary: str(raw.summary, 600), highlights: list(raw.highlights), recommendations: list(raw.recommendations), generated_at: new Date().toISOString() };
+      logActivity(actor.id, 'report', `${period === 'week' ? 'Weekly' : 'Daily'} report: ${out.summary}`);
+      return out;
+    });
+    res.json(result);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
 });
