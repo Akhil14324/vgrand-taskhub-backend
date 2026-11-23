@@ -4,7 +4,6 @@ const { isLeader } = require('../utils/org');
 const { shift } = require('../utils/streak');
 const { streakFor, weekStart } = require('./engagement');
 const { countCleanMonths, computeBadges } = require('../utils/badges');
-const { cleanBuddy } = require('../utils/buddyProfile');
 
 /** My milestone badges and the numbers behind them. */
 async function badgesFor(userId) {
@@ -90,13 +89,6 @@ async function weekWall(actor, offset = 0) {
     [APP_TIMEZONE, start]
   );
   const top = [...people.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)).slice(0, 5);
-  if (top.length) { // their cats, so the wall can show the winner's cat with a trophy
-    const prefs = (await db.query('SELECT id, preferences FROM users WHERE id = ANY($1::int[])', [top.map((p) => p.id)])).rows;
-    for (const p of top) {
-      const pr = prefs.find((x) => x.id === p.id)?.preferences || {};
-      p.buddy = pr.features?.buddy === false ? null : (cleanBuddy(pr.buddy) || cleanBuddy({}));
-    }
-  }
   return {
     week_start: start,
     week_end: shift(start, 6),

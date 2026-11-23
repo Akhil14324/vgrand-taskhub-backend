@@ -7,6 +7,7 @@ const { loadActor } = require('../utils/org');
 const { todayInAppZone, APP_TIMEZONE } = require('../utils/recurrence');
 const { listTodos, getTodoFor, memberIds, descendantIds } = require('../services/todoQueries');
 const { buildTimeline } = require('../services/todoTimeline');
+const { resolvePeriod, buildReport } = require('../services/monitorReport');
 const { openProcesses } = require('../services/processes');
 const {
   actorCanMonitor,
@@ -47,7 +48,10 @@ router.get('/access', authenticate, async (req, res, next) => {
 router.get('/overview', authenticate, requireMonitor, async (req, res, next) => {
   try {
     const period = parsePeriod(req.query);
-    const { people } = req.monitor;
+    // person_id narrows the whole overview (totals included) to one person the viewer may watch.
+    const only = req.query.person_id ? parseInt(req.query.person_id, 10) : null;
+    if (only && !req.monitor.ids.has(only)) return res.status(404).json({ error: 'Person not found' });
+    const people = only ? req.monitor.people.filter((p) => p.id === only) : req.monitor.people;
     const ids = people.map((p) => p.id);
     const [stats, processes] = await Promise.all([statsForPeople(ids, period), openProcesses({ userIds: ids })]);
     const nameOf = new Map(people.map((p) => [p.id, p.name]));
@@ -63,6 +67,27 @@ router.get('/overview', authenticate, requireMonitor, async (req, res, next) => 
         .slice(0, 20)
         .map((p) => ({ id: p.id, title: p.title, assignee_id: p.assignee_id, assignee_name: nameOf.get(p.assignee_id) || '', done: p.done, total: p.total, pct: p.pct, idle_days: p.idleDays, days_to_due: p.daysToDue })),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/monitor/report?preset=today|yesterday|last7|last30|this_week|last_week|this_month|last_month|custom
+//     &from=&to=&person_id=&page=&limit= — the period's numbers and one section per day (newest first, paged by day).
+// Only people the viewer may watch are ever counted; person_id narrows it to one of them.
+router.get('/report', authenticate, requireMonitor, async (req, res, next) => {
+  try {
+    const today = todayInAppZone();
+    const period = resolvePeriod({ preset: req.query.preset || 'last7', from: req.query.from, to: req.query.to }, today);
+    let ids = req.monitor.people.map((p) => p.id);
+    let personId = null;
+    if (req.query.person_id) {
+      personId = parseInt(req.query.person_id, 10);
+      if (!req.monitor.ids.has(personId)) return res.status(404).json({ error: 'Person not found' });
+      ids = [personId];
+    }
+    const report = await buildReport(ids, period, { page: req.query.page, limit: req.query.limit });
+    res.json({ ...report, today, person_id: personId });
   } catch (err) {
     next(err);
   }

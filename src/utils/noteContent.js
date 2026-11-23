@@ -1,9 +1,9 @@
 // What a note may hold (pure, unit-tested). A text note is a small, safe subset of HTML written by the app's own
-// editor (headings, bold / italic / underline, three text sizes, bullets, numbers and tick lists). A sheet note is
+// editor (headings, bold / italic / underline, three text sizes, bullets, numbers, tick lists and a divider). A sheet note is
 // a plain grid of cell texts. Anything else is cut away here, so nothing a browser could run is ever stored.
 
-const TAGS = new Set(['h1', 'h2', 'h3', 'p', 'div', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'ul', 'ol', 'li', 'font', 'span', 'blockquote']);
-const VOID = new Set(['br']);
+const TAGS = new Set(['h1', 'h2', 'h3', 'p', 'div', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'ul', 'ol', 'li', 'font', 'span', 'blockquote', 'hr']);
+const VOID = new Set(['br', 'hr']);
 const MAX_HTML = 200000;
 const MAX_ROWS = 2000;
 const MAX_COLS = 52;

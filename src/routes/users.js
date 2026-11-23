@@ -8,7 +8,7 @@ const { loadActor, actorBestLevel } = require('../utils/org');
 const { setMemberships, syncLeaderGroups, deactivateUser } = require('../services/org');
 const { notify } = require('../utils/notify');
 const { cleanFeatures } = require('../utils/features');
-const { cleanBuddy } = require('../utils/buddyProfile');
+const { cleanNotifPrefs } = require('../utils/notificationPrefs');
 
 const router = express.Router();
 
@@ -298,28 +298,6 @@ router.get('/me/warnings', authenticate, async (req, res, next) => {
   }
 });
 
-// Water, stretch and cat-voice settings (`reminders`). Each value must be one of the listed options; the
-// client sends the whole object and the app falls back to its default for anything missing.
-const REMINDER_OPTIONS = {
-  waterGoal: [4, 6, 8, 10, 12],
-  waterEvery: [30, 60, 90, 120],
-  waterFrom: [7, 8, 9, 10],
-  waterTo: [18, 20, 21, 22],
-  stretchEvery: [60, 90, 120, 180],
-  stretchFrom: [8, 9, 10],
-  stretchTo: [17, 18, 19, 20],
-  catMeows: ['never', 'rarely', 'normal', 'often'],
-  catVolume: ['soft', 'normal', 'loud'],
-};
-function cleanReminders(v) {
-  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
-  const out = {};
-  for (const [key, options] of Object.entries(REMINDER_OPTIONS)) {
-    if (options.includes(v[key])) out[key] = v[key];
-  }
-  return out;
-}
-
 // Personal settings an account may keep. Anything else is ignored; each value is checked here.
 const PREFERENCE_RULES = {
   theme: (v) => ['system', 'light', 'dark'].includes(v),
@@ -336,10 +314,8 @@ const PREFERENCE_RULES = {
   haptics: (v) => typeof v === 'boolean',
   celebrations: (v) => typeof v === 'boolean',
   reminderSound: (v) => typeof v === 'boolean',
-  waterReminder: (v) => typeof v === 'boolean',
   features: (v) => cleanFeatures(v) !== null,
-  buddy: (v) => cleanBuddy(v) !== null,
-  reminders: (v) => cleanReminders(v) !== null,
+  notifications: (v) => cleanNotifPrefs(v) !== null,
 };
 
 // PUT /api/users/me/preferences — merge a few personal settings; they change the app for this account only
@@ -350,8 +326,7 @@ router.put('/me/preferences', authenticate, async (req, res, next) => {
       if (req.body[key] !== undefined && ok(req.body[key])) patch[key] = req.body[key];
     }
     if (patch.features) patch.features = cleanFeatures(patch.features);
-    if (patch.buddy) patch.buddy = cleanBuddy(patch.buddy);
-    if (patch.reminders) patch.reminders = cleanReminders(patch.reminders);
+    if (patch.notifications) patch.notifications = cleanNotifPrefs(patch.notifications);
     const result = await db.query(
       `UPDATE users SET preferences = preferences || $1::jsonb WHERE id = $2 RETURNING preferences`,
       [JSON.stringify(patch), req.user.id]

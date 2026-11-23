@@ -876,6 +876,20 @@ router.put('/:id(\\d+)', authenticate, async (req, res, next) => {
     const evt = { todoId: existing.id, userId: actor.id, subjectId: existing.assignee_id };
     if (scheduleChanged) {
       await logEvent({ ...evt, kind: 'due_changed', from: when(existing.due_date, existing.due_time), to: when(dueDate, dueTime) });
+      // Whoever is responsible for it (but not the person who just changed it) hears about the new date.
+      if (!existing.is_done) {
+        const people = existing.business_id
+          ? (existing.assignee_id ? [existing.assignee_id] : [])
+          : (await db.query('SELECT user_id FROM todo_members WHERE todo_id = $1 AND dumped_at IS NULL', [existing.id])).rows.map((m) => m.user_id);
+        await notify(people.filter((id) => id !== actor.id), {
+          type: 'todo_deadline_changed',
+          title: 'Deadline changed',
+          body: dueDate
+            ? `${actor.name} moved the deadline of '${title}' to ${when(dueDate, dueTime)}.`
+            : `${actor.name} removed the deadline of '${title}'.`,
+          data: { todoId: existing.id },
+        }, { eventKey: `dline:${existing.id}:${when(dueDate, dueTime) || 'none'}` });
+      }
     }
     if (deadline !== existing.deadline_date) {
       await logEvent({ ...evt, kind: 'deadline_changed', from: existing.deadline_date, to: deadline });

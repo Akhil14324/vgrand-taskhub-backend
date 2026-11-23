@@ -9,7 +9,8 @@ const {
   loadActor,
   actorLevelIn,
 } = require('../utils/org');
-const { APP_TIMEZONE } = require('../utils/recurrence');
+const { APP_TIMEZONE, todayInAppZone } = require('../utils/recurrence');
+const { resolvePeriod } = require('./monitorReport');
 const { openProcesses } = require('./processes');
 const { todoHealth } = require('../utils/timeline');
 
@@ -107,11 +108,21 @@ function parseDays(value) {
 
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 
-/** A period is a number of days back, or an inclusive day range { from, to } (YYYY-MM-DD, app timezone). */
+/**
+ * A period is a number of days back, a named preset (today, last_week, ...), or an inclusive day range { from, to }
+ * (YYYY-MM-DD, company timezone). A reversed or oversized range is a 400.
+ */
 function parsePeriod(query = {}) {
+  if (query.preset) {
+    const r = resolvePeriod({ preset: query.preset, from: query.from, to: query.to }, todayInAppZone());
+    return { from: r.from, to: r.to };
+  }
   const from = YMD.test(query.from || '') ? query.from : null;
   const to = YMD.test(query.to || '') ? query.to : null;
-  if (from || to) return { from: from || to, to: to || from };
+  if (from || to) {
+    const r = resolvePeriod({ preset: 'custom', from: from || to, to: to || from }, todayInAppZone());
+    return { from: r.from, to: r.to };
+  }
   return { days: parseDays(query.days) };
 }
 

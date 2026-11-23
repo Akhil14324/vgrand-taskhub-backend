@@ -105,6 +105,27 @@ router.delete('/read', authenticate, async (req, res, next) => {
   }
 });
 
+// DELETE /api/notifications/:id — delete one of your own notifications
+router.delete('/:id(\\d+)', authenticate, async (req, res, next) => {
+  try {
+    const result = await db.query('DELETE FROM notifications WHERE id = $1 AND user_id = $2 RETURNING id', [req.params.id, req.user.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Notification not found' });
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/notifications — clear all of your notifications
+router.delete('/', authenticate, async (req, res, next) => {
+  try {
+    await db.query('DELETE FROM notifications WHERE user_id = $1', [req.user.id]);
+    res.json({ message: 'Cleared' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/notifications/push-status — is server-side web push configured?
 router.get('/push-status', authenticate, async (req, res, next) => {
   try {

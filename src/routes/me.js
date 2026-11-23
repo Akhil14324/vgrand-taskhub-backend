@@ -3,7 +3,7 @@ const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { loadActor } = require('../utils/org');
 const { listTodos } = require('../services/todoQueries');
-const { todayInAppZone } = require('../utils/recurrence');
+const { todayInAppZone, APP_TIMEZONE } = require('../utils/recurrence');
 const { draftsFor } = require('../services/drafts');
 
 /**
@@ -13,18 +13,27 @@ const { draftsFor } = require('../services/drafts');
  *               rows as the To-do screen.
  */
 const router = express.Router();
+const { buildWork } = require('../services/myWork');
 
 router.get('/work', authenticate, async (req, res, next) => {
   try {
     const actor = await loadActor(req.user.id);
     const today = todayInAppZone();
     const mine = `(t.assignee_id = $5 OR (t.business_id IS NULL AND tm.user_id = $5 AND t.assignee_id IS NULL))`;
-    const [open, review, blockedOnMe, drafts] = await Promise.all([
+    const [open, doneToday, review, blockedOnMe, drafts] = await Promise.all([
+      // Everything open that is mine to do (to-dos I hold and business tasks given to me), not just what is near.
       listTodos(actor.id, {
         actor,
-        where: `NOT t.is_done AND ${mine} AND (t.due_date <= $6::date + 7 OR t.deadline_date <= $6::date + 7)`,
-        params: [actor.id, today],
-        tail: 'ORDER BY LEAST(t.due_date, t.deadline_date) NULLS LAST, t.priority, t.created_at',
+        where: `NOT t.is_done AND ${mine}`,
+        params: [actor.id],
+        tail: 'ORDER BY LEAST(t.due_date, t.deadline_date) NULLS LAST, t.priority, t.created_at LIMIT 500',
+      }),
+      // What I finished today (company timezone).
+      listTodos(actor.id, {
+        actor,
+        where: `t.is_done AND t.done_by = $5 AND (t.done_at AT TIME ZONE $7)::date = $6::date`,
+        params: [actor.id, today, APP_TIMEZONE],
+        tail: 'ORDER BY t.done_at DESC LIMIT 200',
       }),
       // Finished work waiting for my approval, and steps waiting for my "go ahead".
       listTodos(actor.id, {
@@ -44,10 +53,7 @@ router.get('/work', authenticate, async (req, res, next) => {
       draftsFor(actor.id),
     ]);
 
-    const earliest = (t) => [t.due_date, t.deadline_date].filter(Boolean).sort()[0] || null;
-    const overdue = open.filter((t) => earliest(t) && earliest(t) < today);
-    const dueToday = open.filter((t) => earliest(t) === today);
-    const upcoming = open.filter((t) => earliest(t) && earliest(t) > today);
+    const work = buildWork(open, doneToday, today);
     const waiting = [
       ...review.filter((t) => t.permissions.can_approve || (t.step_state === 'awaiting_review' && t.parent_created_by === actor.id)),
       ...blockedOnMe,
@@ -55,12 +61,28 @@ router.get('/work', authenticate, async (req, res, next) => {
 
     res.json({
       today,
-      overdue,
-      due_today: dueToday,
+      overdue: work.overdue,
+      due_today: work.dueToday,
+      in_progress: work.inProgress,
       waiting_on_me: waiting,
-      upcoming,
+      upcoming: work.upcoming,
+      later: work.later,
+      no_deadline: work.noDeadline,
+      completed_today: doneToday,
+      next: work.next,
+      tips: work.tips,
       drafts: { count: drafts.drafts.length, summary: drafts.summary },
-      counts: { overdue: overdue.length, due_today: dueToday.length, waiting_on_me: waiting.length, upcoming: upcoming.length },
+      counts: {
+        total: open.length + doneToday.length,
+        overdue: work.overdue.length,
+        due_today: work.dueToday.length,
+        in_progress: work.inProgress.length,
+        completed_today: doneToday.length,
+        waiting_on_me: waiting.length,
+        upcoming: work.upcoming.length,
+        later: work.later.length,
+        no_deadline: work.noDeadline.length,
+      },
     });
   } catch (err) {
     next(err);

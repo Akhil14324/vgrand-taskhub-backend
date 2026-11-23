@@ -48,3 +48,8 @@ test('an empty or broken sheet is one empty column', () => {
 test('sheet text joins the filled cells', () => {
   assert.equal(sheetText({ rows: [['Item', 'Cost'], ['', ''], ['Cement', '420']] }), 'Item  Cost\nCement  420');
 });
+
+test('sanitizeHtml keeps a divider and never writes a closing tag for it', () => {
+  assert.strictEqual(sanitizeHtml('<div>a</div><hr><div>b</div>'), '<div>a</div><hr><div>b</div>');
+  assert.strictEqual(sanitizeHtml('<hr onclick="x()"></hr>'), '<hr>');
+});

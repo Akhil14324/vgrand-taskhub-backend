@@ -21,7 +21,7 @@ test('daysBetween counts whole days across a month end', () => {
 });
 
 test('cleanFeatures keeps known boolean switches only', () => {
-  assert.deepStrictEqual(cleanFeatures({ water: false, roast: true, hacker: true, focus: 'yes' }), { water: false, roast: true });
+  assert.deepStrictEqual(cleanFeatures({ focus: false, roast: true, hacker: true, water: true, buddy: true, board: 'yes' }), { focus: false, roast: true });
   assert.deepStrictEqual(cleanFeatures({}), {});
   assert.strictEqual(cleanFeatures(null), null);
   assert.strictEqual(cleanFeatures([true]), null);
