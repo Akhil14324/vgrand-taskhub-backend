@@ -93,7 +93,7 @@ async function buildTimeline(todo, now = Date.now()) {
     ),
     db.query(
       `SELECT b.id, b.kind, b.note, b.mentions, b.raised_at, b.resolved_at, b.resolution_note,
-              b.blocked_by_user_id, bu.name AS blocked_by_user_name,
+              b.blocked_by_user_id, COALESCE(bu.name, b.blocked_by_name) AS blocked_by_user_name,
               b.blocked_by_todo_id, bt.title AS blocked_by_todo_title,
               b.raised_by, ru.name AS raised_by_name, b.resolved_by, vu.name AS resolved_by_name
        FROM todo_blockers b

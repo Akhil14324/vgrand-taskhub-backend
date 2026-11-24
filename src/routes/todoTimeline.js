@@ -292,6 +292,8 @@ router.post('/:id(\\d+)/blockers', authenticate, async (req, res, next) => {
     let blockedByTodo = null;
     let blockedByUser = null;
     const userId = parseInt(req.body.blocked_by_user_id, 10);
+    // Someone not on TaskHub (yet): just their name, so anyone can be named as what the task waits on.
+    const externalName = (kind === 'dependency' || kind === 'waiting_on') && !userId ? sanitizeText(req.body.blocked_by_name, 120) : '';
     if (kind === 'dependency' || kind === 'waiting_on') {
       blockedByUser = userId
         ? (await db.query(`SELECT id, name FROM users WHERE id = $1 AND status != 'inactive'`, [userId])).rows[0]
@@ -305,9 +307,9 @@ router.post('/:id(\\d+)/blockers', authenticate, async (req, res, next) => {
         if (blockedByTodo.id === todo.id) return res.status(400).json({ error: 'A to-do cannot wait on itself' });
         if (blockedByTodo.is_done) return res.status(400).json({ error: 'That to-do is already finished' });
       }
-      if (!blockedByTodo && !blockedByUser) return res.status(400).json({ error: 'Pick the to-do or the person it is waiting on' });
+      if (!blockedByTodo && !blockedByUser && !externalName) return res.status(400).json({ error: 'Pick the to-do or the person it is waiting on' });
     }
-    if (kind === 'waiting_on' && !blockedByUser && !note) {
+    if (kind === 'waiting_on' && !blockedByUser && !externalName && !note) {
       return res.status(400).json({ error: 'Say who needs to decide, or what is needed' });
     }
     if ((kind === 'issue' || kind === 'dead_stop') && !note) {
@@ -317,13 +319,13 @@ router.post('/:id(\\d+)/blockers', authenticate, async (req, res, next) => {
     const tags = await resolveTags(req.body.mentions, note, req.actor);
 
     const inserted = await db.query(
-      `INSERT INTO todo_blockers (todo_id, kind, note, blocked_by_user_id, blocked_by_todo_id, raised_by, mentions)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [todo.id, kind, note || '', blockedByUser ? blockedByUser.id : null, blockedByTodo ? blockedByTodo.id : null, req.actor.id, JSON.stringify(tags)]
+      `INSERT INTO todo_blockers (todo_id, kind, note, blocked_by_user_id, blocked_by_todo_id, raised_by, mentions, blocked_by_name)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+      [todo.id, kind, note || '', blockedByUser ? blockedByUser.id : null, blockedByTodo ? blockedByTodo.id : null, req.actor.id, JSON.stringify(tags), externalName || null]
     );
 
     const moved = await setStatus(todo.id, 'blocked');
-    const detail = [blockedByTodo?.title, blockedByUser?.name].filter(Boolean).join(' · ') || null;
+    const detail = [blockedByTodo?.title, blockedByUser?.name || externalName].filter(Boolean).join(' · ') || null;
     const tagged = tags.length ? `Tagged ${tags.map((t) => t.label).join(', ')}` : null;
     await logEvent({
       todoId: todo.id, userId: req.actor.id, subjectId: todo.assignee_id, kind: 'blocker_raised',

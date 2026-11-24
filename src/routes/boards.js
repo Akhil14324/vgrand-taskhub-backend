@@ -1096,7 +1096,7 @@ router.get('/:id(\\d+)/items/:todoId(\\d+)/process', authenticate, withActor, bo
         [todo.id]
       ),
       db.query(
-        `SELECT b.kind, b.note, b.raised_at, b.resolved_at, bu.name AS blocked_by_user_name, bt.title AS blocked_by_todo_title
+        `SELECT b.kind, b.note, b.raised_at, b.resolved_at, COALESCE(bu.name, b.blocked_by_name) AS blocked_by_user_name, bt.title AS blocked_by_todo_title
          FROM todo_blockers b LEFT JOIN users bu ON bu.id = b.blocked_by_user_id LEFT JOIN todos bt ON bt.id = b.blocked_by_todo_id
          WHERE b.todo_id = $1 ORDER BY b.raised_at`,
         [todo.id]
