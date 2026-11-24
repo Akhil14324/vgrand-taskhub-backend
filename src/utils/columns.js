@@ -105,11 +105,11 @@ const SYSTEM_COLUMNS = {
   item_id: { kind: 'auto_number', title: 'Item ID', field: 'id', edit: null, width: 90 },
   created: { kind: 'creation_log', title: 'Created', field: 'created_at', edit: null, width: 160 },
   updated: { kind: 'last_updated', title: 'Last updated', field: 'updated_at', edit: null, width: 160 },
-  entered: { kind: 'entered_date', title: 'Entered date', field: 'created_at', edit: null, width: 130 },
+  entered: { kind: 'entered_date', title: 'Entered date', field: 'created_at', edit: null, width: 175 },
 };
 
 // A new board shows only what most work needs (simplicity rule, F-DSN-05); the rest is one click away.
-const DEFAULT_COLUMNS = ['person', 'status', 'date', 'dependency', 'entered'];
+const DEFAULT_COLUMNS = ['person', 'status', 'entered', 'date', 'dependency'];
 // Plain columns every new board also gets (after the built-in ones above): { kind, title, width }.
 const DEFAULT_EXTRA_COLUMNS = [{ kind: 'long_text', title: 'Notes', width: 160 }, { kind: 'files', title: 'Files', width: 140 }];
 
