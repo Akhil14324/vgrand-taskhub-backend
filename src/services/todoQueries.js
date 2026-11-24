@@ -45,6 +45,9 @@ const TODO_SELECT = `
          (SELECT COUNT(*)::int FROM todos c WHERE c.parent_id = t.id) AS subtask_count,
          (SELECT COUNT(*)::int FROM todos c WHERE c.parent_id = t.id AND c.is_done) AS subtask_done_count,
          (SELECT COUNT(*)::int FROM todo_comments tc WHERE tc.todo_id = t.id) AS comment_count,
+         (SELECT json_build_object('body', LEFT(lc.body, 300), 'author', lu.name, 'at', lc.created_at)
+          FROM todo_comments lc LEFT JOIN users lu ON lu.id = lc.user_id
+          WHERE lc.todo_id = t.id ORDER BY lc.created_at DESC, lc.id DESC LIMIT 1) AS latest_comment,
          (SELECT json_agg(json_build_object('id', u.id, 'name', u.name, 'username', u.username,
                                             'profile_picture', u.profile_picture) ORDER BY m2.added_at)
           FROM todo_members m2 JOIN users u ON u.id = m2.user_id
