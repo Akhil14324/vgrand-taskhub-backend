@@ -1370,4 +1370,33 @@ router.delete('/:id(\\d+)/members/:userId(\\d+)', authenticate, withActor, board
   }
 });
 
+// DELETE /api/boards/:id — the whole board, for the super admin only. The tasks that live on it go with it, and
+// every deleted row is kept in deleted_rows (see migration 054), so nothing is lost for good.
+router.delete('/:id(\\d+)', authenticate, withActor, async (req, res, next) => {
+  try {
+    if (req.actor.global !== 0) return res.status(403).json({ error: 'Only the super admin can delete a board' });
+    const id = parseInt(req.params.id, 10);
+    const board = (await db.query('SELECT id, name, kind, scope FROM boards WHERE id = $1', [id])).rows[0];
+    if (!board) return res.status(404).json({ error: 'Board not found' });
+    if (board.kind === 'my_todos') return res.status(400).json({ error: 'A personal to-do board cannot be deleted' });
+    const audience = await boardAudience(board).catch(() => []);
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const tasks = await client.query('DELETE FROM todos WHERE board_id = $1 RETURNING id', [id]);
+      await client.query('DELETE FROM boards WHERE id = $1', [id]);
+      await client.query('COMMIT');
+      emitToUsers(audience, 'board:changed', { boardId: id, what: 'deleted' });
+      res.json({ deleted: true, tasks: tasks.rowCount });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

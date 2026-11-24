@@ -180,4 +180,32 @@ router.delete('/sites/:id(\\d+)/members/:userId(\\d+)', authenticate, withActor,
   }
 });
 
+// DELETE /api/org/businesses/:id — a whole business, for the super admin only. Its boards, tasks, memberships and
+// everything that hangs off it go with it; every deleted row is kept in deleted_rows (migration 054).
+router.delete('/businesses/:id(\\d+)', authenticate, withActor, async (req, res, next) => {
+  try {
+    if (req.actor.global !== 0) return res.status(403).json({ error: 'Only the super admin can delete a business' });
+    const id = parseInt(req.params.id, 10);
+    const biz = (await db.query('SELECT id, name FROM businesses WHERE id = $1', [id])).rows[0];
+    if (!biz) return res.status(404).json({ error: 'Business not found' });
+    if (req.body?.confirm !== biz.name && req.query.confirm !== biz.name) return res.status(400).json({ error: 'Type the business name to confirm' });
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('DELETE FROM todos WHERE business_id = $1', [id]);
+      await client.query('DELETE FROM boards WHERE business_id = $1', [id]);
+      await client.query('DELETE FROM businesses WHERE id = $1', [id]);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+    res.json({ deleted: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;
