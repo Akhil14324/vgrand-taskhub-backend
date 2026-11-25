@@ -339,7 +339,7 @@ router.patch('/todos/:id(\\d+)', authenticate, requireMonitor, async (req, res, 
       body: `${existing.title}: ${said.join('; ')}. Check it once again.`,
       data: { todoId },
     }, { exclude: [req.user.id] });
-    emitToUsers([...new Set([...members, req.user.id])], 'todo:changed', { todoId, action: 'updated' });
+    emitToUsers(members, 'todo:changed', { todoId, action: 'updated' });
     res.json({ todo: await getTodoFor(todoId, through), changed: said });
   } catch (err) {
     next(err);
@@ -367,7 +367,7 @@ router.post('/todos/:id(\\d+)/comments', authenticate, requireMonitor, async (re
       body: `${todo.title}: ${message.slice(0, 140)}`,
       data: { todoId },
     }, { exclude: [req.user.id] });
-    emitToUsers([...new Set([...members, req.user.id])], 'todo:changed', { todoId, action: 'commented' });
+    emitToUsers(members, 'todo:changed', { todoId, action: 'commented' });
     res.status(201).json({ id: inserted.rows[0].id });
   } catch (err) {
     next(err);
