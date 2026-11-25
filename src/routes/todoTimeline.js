@@ -192,7 +192,10 @@ router.post('/:id(\\d+)/status', authenticate, async (req, res, next) => {
     const todo = await openTodoFor(req, res);
     if (!todo) return;
     const status = req.body.status;
-    if (!['todo', 'in_progress', 'on_hold'].includes(status)) {
+    // In review is handed out by the reviewer flow (the tick) for business work; on a personal to-do there is no
+    // reviewer, so the person may put it there and take it out again themselves.
+    const personal = !todo.business_id;
+    if (!['todo', 'in_progress', 'on_hold', ...(personal ? ['in_review'] : [])].includes(status)) {
       return res.status(400).json({ error: 'Choose To do, In progress or On hold (use Blocker or the tick for the rest)' });
     }
     if (todo.review_state !== 'accepted') return res.status(400).json({ error: 'This is still waiting for review' });
@@ -203,7 +206,7 @@ router.post('/:id(\\d+)/status', authenticate, async (req, res, next) => {
     if (!allowed) return res.status(403).json({ error: 'You cannot update this one' });
     if (todo.is_done) return res.status(400).json({ error: 'Reopen it first' });
     if (todo.status === 'blocked') return res.status(400).json({ error: 'Clear the blockers first' });
-    if (todo.status === 'in_review') return res.status(400).json({ error: 'It is waiting for review' });
+    if (todo.status === 'in_review' && !personal) return res.status(400).json({ error: 'It is waiting for review' });
 
     const moved = await setStatus(todo.id, status);
     if (moved.changed) {
