@@ -2050,3 +2050,6 @@ router.delete('/labels/:name', authenticate, async (req, res, next) => {
 module.exports = router;
 module.exports.createTodoCore = createTodoCore;
 module.exports.announce = announce;
+module.exports.parseDate = parseDate;
+module.exports.parseTime = parseTime;
+module.exports.parsePriority = parsePriority;
