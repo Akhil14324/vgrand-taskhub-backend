@@ -37,6 +37,14 @@ test('open assignment does not loosen editing or deleting someone else\'s task',
   assert.strictEqual(p.can_delete, false);
 });
 
+test('the assignee can edit the task and tick it, but not delete it', () => {
+  const assignee = person(101, [[1, 'member']]);
+  const p = decorateTodo(task(), assignee).permissions;
+  assert.strictEqual(p.can_edit, true);
+  assert.strictEqual(p.can_change_status, true);
+  assert.strictEqual(p.can_delete, false);
+});
+
 test('worksIn: members and leadership add accepted tasks, outsiders propose', () => {
   assert.strictEqual(worksIn(person(200, [[1, 'member']]), 1), true);
   assert.strictEqual(worksIn(person(2, [], 1), 5), true);
