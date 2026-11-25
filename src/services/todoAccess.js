@@ -92,7 +92,7 @@ function businessPermissions(row, actor) {
   const outranksCreator = myLevel < creatorLevel;
   const rejected = row.review_state === 'rejected';
 
-  const canEdit = !rejected && (isCreator || outranksCreator);
+  const canEdit = !rejected && (isCreator || outranksCreator || isAssignee);
   // The leadership circle may tick off any business to-do, in any business.
   const canWork = !rejected && (
     isLeader(actor) || isAssignee || isCreator || outranksCreator
