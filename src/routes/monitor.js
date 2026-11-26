@@ -176,7 +176,7 @@ router.post('/todos/:id/questions', authenticate, requireMonitor, async (req, re
 // A person's whole board (read-only), and the few things a manager may change on it
 // ---------------------------------------------------------------------------
 
-const BOARD_COLUMNS = ['person', 'status', 'date', 'deadline', 'priority', 'labels', 'estimate', 'entered', 'finished'];
+const BOARD_COLUMNS = ['person', 'assigned_by', 'status', 'date', 'deadline', 'priority', 'labels', 'estimate', 'entered', 'finished'];
 // What the person sees of their own task stays theirs: for the manager every flag is off except commenting and adjusting.
 const WATCHER_PERMISSIONS = {
   can_edit: false, can_delete: false, can_leave: false, can_request_delete: false, can_change_status: false,

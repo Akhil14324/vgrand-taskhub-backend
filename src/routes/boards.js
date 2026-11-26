@@ -487,6 +487,18 @@ router.get('/:id(\\d+)', authenticate, withActor, boardParam('view'), async (req
         ? 'ORDER BY tm.list_id NULLS FIRST, COALESCE(bo.position, tm.sort_order, 2147483647), t.created_at, t.id'
         : 'ORDER BY t.business_section_id NULLS FIRST, COALESCE(bo.position, tm.sort_order, 2147483647), t.created_at, t.id',
     });
+    // On "My to-dos" the work I handed to someone else (I follow it, see todo_members.watching) is kept apart: the
+    // app shows it under the "Assigned by me" filter, never in the plain list.
+    let handed = [];
+    if (mine) {
+      handed = await listTodos(actor.id, {
+        actor, watching: 'only',
+        where: `t.business_id IS NULL AND $5::int > 0 AND (NOT t.is_done OR t.done_at > NOW() - INTERVAL '60 days')`,
+        params: [board.id],
+        tail: 'ORDER BY t.created_at, t.id LIMIT 500',
+      });
+      handed = handed.map((t) => (t.parent_id ? t : { ...t, business_section_id: t.list_id || null }));
+    }
     // On "My to-dos" a group is one of the person's lists.
     if (mine) items = items.map((t) => (t.parent_id ? t : { ...t, business_section_id: t.list_id || null }));
     const ids = items.map((t) => t.id);
@@ -521,6 +533,7 @@ router.get('/:id(\\d+)', authenticate, withActor, boardParam('view'), async (req
       groups: groups.rows,
       views: views.rows,
       items,
+      handed,
       values,
       attachments: extra.attachments,
       linked: extra.linked,

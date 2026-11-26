@@ -30,6 +30,7 @@ const TODO_SELECT = `
          cu.name AS created_by_name, cu.username AS created_by_username,
          du.name AS done_by_name,
          au.name AS assignee_name, au.username AS assignee_username, au.profile_picture AS assignee_picture,
+         COALESCE(ab.user_id, t.created_by) AS assigned_by_id, COALESCE(abu.name, cu.name) AS assigned_by_name,
          su.name AS submitted_by_name,
          apu.name AS approved_by_name,
          rvu.name AS reviewed_by_name,
@@ -71,7 +72,12 @@ const TODO_SELECT = `
   LEFT JOIN user_businesses sub ON sub.user_id = t.submitted_by AND sub.business_id = t.business_id
   LEFT JOIN LATERAL (
     SELECT message, created_at FROM warnings WHERE todo_id = t.id ORDER BY created_at DESC LIMIT 1
-  ) w ON true`;
+  ) w ON true
+  -- Who gave it to the person doing it: the last "assigned" entry, else whoever made it.
+  LEFT JOIN LATERAL (
+    SELECT e.user_id FROM todo_events e WHERE e.todo_id = t.id AND e.kind = 'assigned' AND e.user_id IS NOT NULL ORDER BY e.created_at DESC LIMIT 1
+  ) ab ON true
+  LEFT JOIN users abu ON abu.id = ab.user_id`;
 
 /**
  * What the viewer ($1..$4) may see: what is on their own list, plus business to-dos of businesses

@@ -75,6 +75,8 @@ const KINDS = {
   // The day a task was entered (its created_at). Filled by the server, never editable.
   entered_date: { label: 'Entered date', icon: 'calendar-number-outline', computed: true },
   // The day and time a task was ticked done (its done_at), for "what was finished when". Never editable.
+  // Who gave the task to the person doing it (the last assignment, else whoever made it). Filled by the server, never editable.
+  assigned_by: { label: 'Assigned by', icon: 'person-add-outline', computed: true },
   finished_date: { label: 'Finished', icon: 'checkmark-done-outline', computed: true },
   priority: { label: 'Priority', icon: 'flag-outline', system: true },
   dependency: { label: 'Dependency', icon: 'git-network-outline', system: true },
@@ -108,11 +110,12 @@ const SYSTEM_COLUMNS = {
   created: { kind: 'creation_log', title: 'Created', field: 'created_at', edit: null, width: 160 },
   updated: { kind: 'last_updated', title: 'Last updated', field: 'updated_at', edit: null, width: 160 },
   entered: { kind: 'entered_date', title: 'Entered date', field: 'created_at', edit: null, width: 175 },
+  assigned_by: { kind: 'assigned_by', title: 'Assigned by', field: 'assigned_by_id', edit: null, width: 150 },
   finished: { kind: 'finished_date', title: 'Finished', field: 'done_at', edit: null, width: 175 },
 };
 
 // A new board shows only what most work needs (simplicity rule, F-DSN-05); the rest is one click away.
-const DEFAULT_COLUMNS = ['person', 'status', 'entered', 'date', 'dependency'];
+const DEFAULT_COLUMNS = ['person', 'assigned_by', 'status', 'entered', 'date', 'dependency'];
 // Plain columns every new board also gets (after the built-in ones above): { kind, title, width }.
 const DEFAULT_EXTRA_COLUMNS = [{ kind: 'long_text', title: 'Notes', width: 160 }, { kind: 'files', title: 'Files', width: 140 }];
 
