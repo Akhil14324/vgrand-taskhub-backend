@@ -77,7 +77,8 @@ function personalPermissions(row) {
     can_comment: true,
     can_add_subtask: isMember,
     // Someone else gave it to me: I may decline it (back to them) or hand it to another person.
-    can_decline: isMember && !row.is_done && !!row.assigned_by_id && row.assignee_id === row._actor_id && row.assigned_by_id !== row._actor_id,
+    can_decline: isMember && !row.is_done && !!row.assigned_by_id && row.assignee_id === row._actor_id && row.assigned_by_id !== row._actor_id
+      && !(row.declined_at && row.declined_giver === row._actor_id), // a task that was just declined back to me is not sent on again
   };
 }
 
@@ -128,7 +129,8 @@ function businessPermissions(row, actor) {
     can_nudge: row.review_state === 'accepted' && !row.is_done && row.status !== 'on_hold' && !!row.assignee_id && !isAssignee,
     can_comment: true,
     can_add_subtask: canWork,
-    can_decline: isAssignee && !row.is_done && !rejected && row.review_state === 'accepted' && !!row.assigned_by_id && row.assigned_by_id !== actor.id,
+    can_decline: isAssignee && !row.is_done && !rejected && row.review_state === 'accepted' && !!row.assigned_by_id && row.assigned_by_id !== actor.id
+      && !(row.declined_at && row.declined_giver === actor.id),
   };
 }
 

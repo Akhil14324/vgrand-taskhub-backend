@@ -277,12 +277,18 @@ router.post('/:id(\\d+)/decline', authenticate, async (req, res, next) => {
       todoId: todo.id, userId: actor.id, subjectId: targetId, kind: transferTo ? 'transferred' : 'declined',
       from: actor.name, to: target.name, note: reason || 'Not on my plate', meta: { to_id: targetId, giver_id: giverId },
     });
-    await assignTodo({ id: todo.id, title: todo.title }, targetId, actor, { silent: true });
+    // Sent back to whoever gave it: that is not a new assignment by me, so "assigned by" stays with them.
+    await assignTodo({ id: todo.id, title: todo.title }, targetId, actor, { silent: true, meta: transferTo ? null : { declined_back: true } });
     if (!todo.business_id) {
       // The new owner is a plain member (a giver who was only following becomes one), and it leaves my list.
       await db.query('UPDATE todo_members SET watching = FALSE WHERE user_id = $1 AND todo_id = ANY($2::int[])', [targetId, all]);
       await db.query('DELETE FROM todo_members WHERE user_id = $1 AND todo_id = ANY($2::int[])', [actor.id, all]);
     }
+    // The notice the person who gave it will see (the task is theirs again, or sits with the new person).
+    await db.query(
+      'UPDATE todos SET declined_by = $2, declined_giver = $3, declined_at = NOW(), declined_reason = $4, declined_kind = $5 WHERE id = $1',
+      [todo.id, actor.id, giverId, reason || 'Not on my plate', transferTo ? 'transferred' : 'declined']
+    );
     const said = transferTo
       ? `Handed this to ${target.name}: ${reason || 'not on my plate'}.`
       : `Declined this task and sent it back to ${target.name}: ${reason}.`;
@@ -298,6 +304,20 @@ router.post('/:id(\\d+)/decline', authenticate, async (req, res, next) => {
     }
     emitToUsers([actor.id, ...(await audienceIds(todo.id)), targetId], 'todo:changed', { todoId: todo.id, action: 'updated' });
     res.json({ ok: true, to: { id: target.id, name: target.name }, transferred: !!transferTo });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/todos/:id/decline-seen — the person who gave the task dismisses the "declined" notice on it.
+router.post('/:id(\\d+)/decline-seen', authenticate, async (req, res, next) => {
+  try {
+    const todo = await openTodoFor(req, res);
+    if (!todo) return;
+    if (!todo.declined_at || todo.declined_giver !== req.actor.id) return res.status(403).json({ error: 'There is no declined notice for you on this one' });
+    await db.query('UPDATE todos SET declined_by = NULL, declined_giver = NULL, declined_at = NULL, declined_reason = NULL, declined_kind = NULL WHERE id = $1', [todo.id]);
+    await broadcast(todo.id);
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }

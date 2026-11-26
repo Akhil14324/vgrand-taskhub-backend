@@ -31,6 +31,7 @@ const TODO_SELECT = `
          du.name AS done_by_name,
          au.name AS assignee_name, au.username AS assignee_username, au.profile_picture AS assignee_picture,
          COALESCE(ab.user_id, t.created_by) AS assigned_by_id, COALESCE(abu.name, cu.name) AS assigned_by_name,
+         t.declined_by, t.declined_giver, t.declined_at, t.declined_reason, t.declined_kind, dcu.name AS declined_by_name,
          su.name AS submitted_by_name,
          apu.name AS approved_by_name,
          rvu.name AS reviewed_by_name,
@@ -75,9 +76,10 @@ const TODO_SELECT = `
   ) w ON true
   -- Who gave it to the person doing it: the last "assigned" entry, else whoever made it.
   LEFT JOIN LATERAL (
-    SELECT e.user_id FROM todo_events e WHERE e.todo_id = t.id AND e.kind = 'assigned' AND e.user_id IS NOT NULL ORDER BY e.created_at DESC LIMIT 1
+    SELECT e.user_id FROM todo_events e WHERE e.todo_id = t.id AND e.kind = 'assigned' AND e.user_id IS NOT NULL AND COALESCE(e.meta->>'declined_back', '') <> 'true' ORDER BY e.created_at DESC LIMIT 1
   ) ab ON true
-  LEFT JOIN users abu ON abu.id = ab.user_id`;
+  LEFT JOIN users abu ON abu.id = ab.user_id
+  LEFT JOIN users dcu ON dcu.id = t.declined_by`;
 
 /**
  * What the viewer ($1..$4) may see: what is on their own list, plus business to-dos of businesses

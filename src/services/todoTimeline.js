@@ -124,7 +124,7 @@ async function buildTimeline(todo, now = Date.now()) {
  * Make someone the accountable assignee (adding them to the to-do and its sub-tasks if needed).
  * Restarts the response clock for the new person. Returns false when nothing changed.
  */
-async function assignTodo(todo, userId, actor, { silent = false } = {}) {
+async function assignTodo(todo, userId, actor, { silent = false, meta = null } = {}) {
   const cur = (await db.query('SELECT assignee_id, status, business_id FROM todos WHERE id = $1', [todo.id])).rows[0];
   if (!cur || cur.assignee_id === userId) return false;
   const names = await db.query('SELECT id, name FROM users WHERE id = ANY($1::int[])', [[userId, cur.assignee_id].filter(Boolean)]);
@@ -139,10 +139,14 @@ async function assignTodo(todo, userId, actor, { silent = false } = {}) {
      SELECT d, $2::int, NULL::int, $3::int FROM unnest($1::int[]) AS d ON CONFLICT DO NOTHING`,
     [await descendantIds(todo.id), userId, actor.id]
   );
-  await db.query('UPDATE todos SET assignee_id = $2, assigned_at = NOW(), started_at = NULL WHERE id = $1', [todo.id, userId]);
+  // A fresh assignment closes any "declined" notice (the decline route writes its own after this).
+  await db.query(
+    'UPDATE todos SET assignee_id = $2, assigned_at = NOW(), started_at = NULL, declined_by = NULL, declined_giver = NULL, declined_at = NULL, declined_reason = NULL, declined_kind = NULL WHERE id = $1',
+    [todo.id, userId]
+  );
   await logEvent({
     todoId: todo.id, userId: actor.id, subjectId: userId, kind: 'assigned',
-    from: nameOf(cur.assignee_id), to: nameOf(userId), meta: { from_id: cur.assignee_id, to_id: userId },
+    from: nameOf(cur.assignee_id), to: nameOf(userId), meta: { from_id: cur.assignee_id, to_id: userId, ...(meta || {}) },
   });
   // New person, fresh start: work that was under way goes back to the queue.
   if (cur.status === 'in_progress') {

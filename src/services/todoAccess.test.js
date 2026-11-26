@@ -54,6 +54,12 @@ test('the assignee can decline a business task someone else gave them, nobody el
   assert.strictEqual(decorateTodo(task({ assigned_by_id: 100 }), person(200, [[1, 'member']])).permissions.can_decline, false);
 });
 
+test('a task that was declined back to me cannot be declined again until I deal with it', () => {
+  const me = person(101, [[1, 'member']]);
+  const back = task({ assigned_by_id: 100, declined_at: '2026-11-26T10:00:00Z', declined_giver: 101 });
+  assert.strictEqual(decorateTodo(back, me).permissions.can_decline, false);
+});
+
 test('worksIn: members and leadership add accepted tasks, outsiders propose', () => {
   assert.strictEqual(worksIn(person(200, [[1, 'member']]), 1), true);
   assert.strictEqual(worksIn(person(2, [], 1), 5), true);
