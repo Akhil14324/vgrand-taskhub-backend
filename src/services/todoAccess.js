@@ -76,6 +76,8 @@ function personalPermissions(row) {
     can_nudge: isMember && !row.is_done && (row.members || []).some((m) => m.id !== row._actor_id),
     can_comment: true,
     can_add_subtask: isMember,
+    // Someone else gave it to me: I may decline it (back to them) or hand it to another person.
+    can_decline: isMember && !row.is_done && !!row.assigned_by_id && row.assignee_id === row._actor_id && row.assigned_by_id !== row._actor_id,
   };
 }
 
@@ -126,6 +128,7 @@ function businessPermissions(row, actor) {
     can_nudge: row.review_state === 'accepted' && !row.is_done && row.status !== 'on_hold' && !!row.assignee_id && !isAssignee,
     can_comment: true,
     can_add_subtask: canWork,
+    can_decline: isAssignee && !row.is_done && !rejected && row.review_state === 'accepted' && !!row.assigned_by_id && row.assigned_by_id !== actor.id,
   };
 }
 

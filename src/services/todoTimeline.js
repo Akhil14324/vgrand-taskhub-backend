@@ -124,7 +124,7 @@ async function buildTimeline(todo, now = Date.now()) {
  * Make someone the accountable assignee (adding them to the to-do and its sub-tasks if needed).
  * Restarts the response clock for the new person. Returns false when nothing changed.
  */
-async function assignTodo(todo, userId, actor) {
+async function assignTodo(todo, userId, actor, { silent = false } = {}) {
   const cur = (await db.query('SELECT assignee_id, status, business_id FROM todos WHERE id = $1', [todo.id])).rows[0];
   if (!cur || cur.assignee_id === userId) return false;
   const names = await db.query('SELECT id, name FROM users WHERE id = ANY($1::int[])', [[userId, cur.assignee_id].filter(Boolean)]);
@@ -149,7 +149,7 @@ async function assignTodo(todo, userId, actor) {
     await setStatus(todo.id, 'todo');
     await logEvent({ todoId: todo.id, userId: actor.id, subjectId: userId, kind: 'status', from: 'in_progress', to: 'todo', note: 'Reassigned' });
   }
-  if (userId !== actor.id) {
+  if (userId !== actor.id && !silent) {
     await notify([userId], {
       type: 'todo_assigned',
       title: `${actor.name} assigned you a ${cur.business_id ? 'task' : 'to-do'}`,

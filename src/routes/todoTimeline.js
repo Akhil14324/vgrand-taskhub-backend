@@ -9,6 +9,7 @@ const { getTodoFor, listTodos, memberIds, audienceIds } = require('../services/t
 const { buildSegments } = require('../utils/segments');
 const { todayInAppZone } = require('../utils/recurrence');
 const { isAssignable } = require('../services/todoGovernance');
+const { descendantIds } = require('../services/todoQueries');
 const {
   BLOCKER_KINDS,
   BLOCKER_LABELS,
@@ -240,6 +241,63 @@ router.post('/:id(\\d+)/assign', authenticate, async (req, res, next) => {
     await assignTodo({ id: todo.id, title: todo.title }, userId, req.actor);
     await broadcast(todo.id);
     res.json({ todo: await getTodoFor(todo.id, req.actor.id, req.actor) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/todos/:id/decline — { reason, transfer_to? } "This was not on my plate."
+// Without transfer_to the task goes back to the person who gave it to me and a reason is needed; with it, it goes to
+// that person instead. Either way the task is no longer mine (a personal one leaves my list) and the person who gave
+// it to me is told, the activity records it and a comment says why.
+router.post('/:id(\\d+)/decline', authenticate, async (req, res, next) => {
+  try {
+    const todo = await openTodoFor(req, res);
+    if (!todo) return;
+    if (!todo.permissions.can_decline) return res.status(403).json({ error: 'This was not given to you by someone else, so there is nothing to decline' });
+    const actor = req.actor;
+    const reason = sanitizeText(req.body.reason, 500);
+    const transferTo = parseInt(req.body.transfer_to, 10) || null;
+    if (!transferTo && !reason) return res.status(400).json({ error: 'Say why you are declining it' });
+
+    const giverId = todo.assigned_by_id;
+    const targetId = transferTo || giverId;
+    if (targetId === actor.id) return res.status(400).json({ error: 'Choose someone else' });
+    const target = (await db.query(`SELECT id, name FROM users WHERE id = $1 AND status != 'inactive'`, [targetId])).rows[0];
+    if (!target) return res.status(400).json({ error: transferTo ? 'Person not found' : 'The person who gave it to you is no longer here. Transfer it to someone instead.' });
+    if (todo.business_id && !(await isAssignable(targetId, todo.business_id))) {
+      return res.status(400).json({ error: 'That person is not part of this business' });
+    }
+    const giver = giverId ? (await db.query('SELECT id, name FROM users WHERE id = $1', [giverId])).rows[0] : null;
+
+    const below = await descendantIds(todo.id);
+    const all = [todo.id, ...below];
+    // The record first, while it still says who held it.
+    await logEvent({
+      todoId: todo.id, userId: actor.id, subjectId: targetId, kind: transferTo ? 'transferred' : 'declined',
+      from: actor.name, to: target.name, note: reason || 'Not on my plate', meta: { to_id: targetId, giver_id: giverId },
+    });
+    await assignTodo({ id: todo.id, title: todo.title }, targetId, actor, { silent: true });
+    if (!todo.business_id) {
+      // The new owner is a plain member (a giver who was only following becomes one), and it leaves my list.
+      await db.query('UPDATE todo_members SET watching = FALSE WHERE user_id = $1 AND todo_id = ANY($2::int[])', [targetId, all]);
+      await db.query('DELETE FROM todo_members WHERE user_id = $1 AND todo_id = ANY($2::int[])', [actor.id, all]);
+    }
+    const said = transferTo
+      ? `Handed this to ${target.name}: ${reason || 'not on my plate'}.`
+      : `Declined this task and sent it back to ${target.name}: ${reason}.`;
+    await db.query(`INSERT INTO todo_comments (todo_id, user_id, body, kind) VALUES ($1, $2, $3, 'comment')`, [todo.id, actor.id, said]);
+
+    if (transferTo) {
+      await notify([transferTo], { type: 'todo_assigned', title: `${actor.name} handed you a ${todo.business_id ? 'task' : 'to-do'}`, body: `${todo.title}${reason ? `: ${reason}` : ''}`, data: { todoId: todo.id } });
+      if (giver && giver.id !== transferTo && giver.id !== actor.id) {
+        await notify([giver.id], { type: 'todo_transferred', title: `${actor.name} handed on a task`, body: `${todo.title} is now with ${target.name}${reason ? `: ${reason}` : ''}`, data: { todoId: todo.id } });
+      }
+    } else {
+      await notify([targetId], { type: 'todo_declined', title: `${actor.name} declined a task`, body: `${todo.title}: ${reason}`, data: { todoId: todo.id } });
+    }
+    emitToUsers([actor.id, ...(await audienceIds(todo.id)), targetId], 'todo:changed', { todoId: todo.id, action: 'updated' });
+    res.json({ ok: true, to: { id: target.id, name: target.name }, transferred: !!transferTo });
   } catch (err) {
     next(err);
   }

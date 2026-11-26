@@ -45,6 +45,15 @@ test('the assignee can edit the task and tick it, but not delete it', () => {
   assert.strictEqual(p.can_delete, false);
 });
 
+test('the assignee can decline a business task someone else gave them, nobody else can', () => {
+  const assignee = person(101, [[1, 'member']]);
+  assert.strictEqual(decorateTodo(task({ assigned_by_id: 100 }), assignee).permissions.can_decline, true);
+  // Their own task (they gave it to themselves), a finished one, and a person who is not the assignee: nothing to decline.
+  assert.strictEqual(decorateTodo(task({ assigned_by_id: 101 }), assignee).permissions.can_decline, false);
+  assert.strictEqual(decorateTodo(task({ assigned_by_id: 100, is_done: true }), assignee).permissions.can_decline, false);
+  assert.strictEqual(decorateTodo(task({ assigned_by_id: 100 }), person(200, [[1, 'member']])).permissions.can_decline, false);
+});
+
 test('worksIn: members and leadership add accepted tasks, outsiders propose', () => {
   assert.strictEqual(worksIn(person(200, [[1, 'member']]), 1), true);
   assert.strictEqual(worksIn(person(2, [], 1), 5), true);
