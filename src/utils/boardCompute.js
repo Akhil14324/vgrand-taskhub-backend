@@ -14,7 +14,7 @@ const STATUS_NAMES = {
 
 const SYSTEM_FIELD = {
   status: 'status', person: 'assignee_id', date: 'due_date', deadline: 'deadline_date', priority: 'priority',
-  estimate: 'duration_minutes', labels: 'labels', points: 'story_points', item_id: 'id', created: 'created_at', updated: 'updated_at', entered: 'created_at',
+  estimate: 'duration_minutes', labels: 'labels', points: 'story_points', item_id: 'id', created: 'created_at', updated: 'updated_at', entered: 'created_at', finished: 'done_at',
 };
 
 /** The plain value of one cell, as a formula or a mirror sees it (numbers stay numbers, labels become text). */

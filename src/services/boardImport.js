@@ -94,7 +94,7 @@ function planImport(input, ctx, { manage, defaultGroupId }) {
         notes.push(`${col.title} fills itself, so that sheet column is left out`);
         return null;
       }
-      if (!col.system_key && ['files', 'board_relation', 'vote', 'formula', 'mirror', 'button', 'auto_number', 'creation_log', 'last_updated', 'entered_date'].includes(col.kind)) {
+      if (!col.system_key && ['files', 'board_relation', 'vote', 'formula', 'mirror', 'button', 'auto_number', 'creation_log', 'last_updated', 'entered_date', 'finished_date'].includes(col.kind)) {
         notes.push(`${col.title} cannot be filled from a sheet, so that sheet column is left out`);
         return null;
       }

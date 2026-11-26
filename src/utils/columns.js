@@ -74,6 +74,8 @@ const KINDS = {
   last_updated: { label: 'Last updated', icon: 'refresh-outline', computed: true },
   // The day a task was entered (its created_at). Filled by the server, never editable.
   entered_date: { label: 'Entered date', icon: 'calendar-number-outline', computed: true },
+  // The day and time a task was ticked done (its done_at), for "what was finished when". Never editable.
+  finished_date: { label: 'Finished', icon: 'checkmark-done-outline', computed: true },
   priority: { label: 'Priority', icon: 'flag-outline', system: true },
   dependency: { label: 'Dependency', icon: 'git-network-outline', system: true },
   time_tracking: { label: 'Time tracking', icon: 'stopwatch-outline', system: true },
@@ -106,6 +108,7 @@ const SYSTEM_COLUMNS = {
   created: { kind: 'creation_log', title: 'Created', field: 'created_at', edit: null, width: 160 },
   updated: { kind: 'last_updated', title: 'Last updated', field: 'updated_at', edit: null, width: 160 },
   entered: { kind: 'entered_date', title: 'Entered date', field: 'created_at', edit: null, width: 175 },
+  finished: { kind: 'finished_date', title: 'Finished', field: 'done_at', edit: null, width: 175 },
 };
 
 // A new board shows only what most work needs (simplicity rule, F-DSN-05); the rest is one click away.
