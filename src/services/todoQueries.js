@@ -41,6 +41,8 @@ const TODO_SELECT = `
          (SELECT apr.id FROM approvals apr
            WHERE apr.todo_id = t.id AND apr.kind IN ('todo_deletion', 'task_deletion') AND apr.status = 'pending'
            LIMIT 1) AS pending_delete_request_id,
+         (SELECT tr.reviewer_id FROM task_reviews tr
+           WHERE tr.todo_id = t.id AND tr.status = 'pending' AND t.status = 'in_review' AND tr.submitted_at >= t.submitted_at) AS review_reviewer_id,
          (SELECT COUNT(*)::int FROM todo_blockers bl WHERE bl.todo_id = t.id AND bl.resolved_at IS NULL) AS open_blocker_count,
          (SELECT json_agg(json_build_object('id', dp.id, 'title', dp.title, 'due_date', dp.due_date, 'is_done', dp.is_done) ORDER BY dp.id)
           FROM todo_dependencies td JOIN todos dp ON dp.id = td.depends_on_id WHERE td.todo_id = t.id) AS depends_on,
