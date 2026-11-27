@@ -102,7 +102,7 @@ router.get('/recycle', authenticate, withActor, async (req, res, next) => {
 });
 
 // Tables restored with a to-do, in the order their references need (a to-do before what points at it).
-const WITH_TODO = ['todos', 'todo_members', 'todo_comments', 'todo_attachments', 'todo_blockers', 'item_values', 'todo_step_reviews', 'todo_meetings', 'time_logs'];
+const WITH_TODO = ['todos', 'todo_members', 'todo_comments', 'todo_attachments', 'todo_blockers', 'item_values', 'todo_step_reviews', 'todo_meetings', 'time_logs', 'task_reviews'];
 
 router.post('/recycle/:id(\\d+)/restore', authenticate, withActor, async (req, res, next) => {
   const client = await db.pool.connect();

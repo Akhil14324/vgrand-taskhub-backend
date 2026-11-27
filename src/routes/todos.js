@@ -2053,3 +2053,4 @@ module.exports.announce = announce;
 module.exports.parseDate = parseDate;
 module.exports.parseTime = parseTime;
 module.exports.parsePriority = parsePriority;
+module.exports.finishTodo = finishTodo; // approving a review finishes the task the normal way (routes/reviews.js)

@@ -33,6 +33,7 @@ const workRoutes = require('./routes/work');
 const dashboardRoutes = require('./routes/dashboards');
 const timeboxRoutes = require('./routes/timebox');
 const approvalRoutes = require('./routes/approvals');
+const reviewRoutes = require('./routes/reviews');
 const accessRoutes = require('./routes/access');
 const erpRoutes = require('./routes/erp');
 const db = require('./db');
@@ -223,6 +224,7 @@ app.use('/api/work', workRoutes);
 app.use('/api/dashboards', dashboardRoutes);
 app.use('/api/timebox', timeboxRoutes);
 app.use('/api/approvals', approvalRoutes);
+app.use('/api/reviews', reviewRoutes);
 app.use('/api/access', accessRoutes);
 app.use('/api/erp', erpRoutes);
 
