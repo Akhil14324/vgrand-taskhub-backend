@@ -265,7 +265,7 @@ async function audienceOf(todo, members, actorId) {
 }
 
 // PATCH /api/monitor/todos/:id — { due_date, due_time, deadline_date, deadline_time, remind_date, remind_time, remind_repeat,
-// priority, note }. Only these; the person's own work (title, owner, status) stays theirs. Everything changed is written
+// priority, title, notes, note }. Only these; the owner and status stay the person's own. Everything changed is written
 // to the activity, an automatic comment asks them to check again, and they get a notification.
 router.patch('/todos/:id(\\d+)', authenticate, requireMonitor, async (req, res, next) => {
   try {
@@ -292,7 +292,12 @@ router.patch('/todos/:id(\\d+)', authenticate, requireMonitor, async (req, res, 
     const deadlineChanged = deadlineDate !== (existing.deadline_date || null) || deadlineTime !== (existing.deadline_time || null);
     const priorityChanged = priority !== existing.priority;
     const remindChanged = rDate !== (existing.remind_date || null) || rTime !== (existing.remind_time || null) || rRepeat !== (existing.remind_repeat || null);
-    if (!scheduleChanged && !deadlineChanged && !priorityChanged && !remindChanged) return res.json({ todo: existing, changed: [] });
+    const title = b.title !== undefined ? sanitizeText(b.title, 500) : existing.title;
+    if (!title) return res.status(400).json({ error: 'The name cannot be empty' });
+    const notes = b.notes !== undefined ? sanitizeText(b.notes, 5000) : (existing.notes || '');
+    const titleChanged = title !== existing.title;
+    const notesChanged = notes !== (existing.notes || '');
+    if (!scheduleChanged && !deadlineChanged && !priorityChanged && !remindChanged && !titleChanged && !notesChanged) return res.json({ todo: existing, changed: [] });
 
     await db.query(
       `UPDATE todos SET due_date = $1, due_time = $2, deadline_date = $3, deadline_time = $4, priority = $5,
@@ -304,6 +309,7 @@ router.patch('/todos/:id(\\d+)', authenticate, requireMonitor, async (req, res, 
        WHERE id = $11`,
       [dueDate, dueTime, deadlineDate, deadlineTime, priority, rDate, rTime, rRepeat, scheduleChanged, remindChanged, todoId]
     );
+    if (titleChanged || notesChanged) await db.query('UPDATE todos SET title = $1, notes = $2 WHERE id = $3', [title, notes, todoId]);
     if (dueDate !== (existing.due_date || null)) await followDueChange(existing, existing.due_date, dueDate, req.user.id);
 
     const evt = { todoId, userId: req.user.id, subjectId: existing.assignee_id, meta: { via: 'monitor' } };
@@ -327,6 +333,15 @@ router.patch('/todos/:id(\\d+)', authenticate, requireMonitor, async (req, res, 
       said.push(`reminder ${was} to ${now}`);
     }
 
+    if (titleChanged) {
+      await logEvent({ ...evt, kind: 'edited', note: `Name "${existing.title}" to "${title}"` });
+      said.push(`name "${existing.title}" to "${title}"`);
+    }
+    if (notesChanged) {
+      await logEvent({ ...evt, kind: 'edited', note: 'Description changed' });
+      said.push('description');
+    }
+
     const who = (await db.query('SELECT name FROM users WHERE id = $1', [req.user.id])).rows[0]?.name || 'A manager';
     const extra = sanitizeText(b.note, 500);
     const body = `Updated ${said.join('; ')}. The task was updated, please check it once again.${extra ? ` ${extra}` : ''}`;
@@ -341,6 +356,39 @@ router.patch('/todos/:id(\\d+)', authenticate, requireMonitor, async (req, res, 
     }, { exclude: [req.user.id] });
     emitToUsers(members, 'todo:changed', { todoId, action: 'updated' });
     res.json({ todo: await getTodoFor(todoId, through), changed: said });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/monitor/todos/:id/subtasks — { title, due_date?, priority? } a manager adds a step under a task of someone below them.
+// It is made on that person's list (the step is theirs to do), the manager is its creator, and they are told.
+router.post('/todos/:id(\\d+)/subtasks', authenticate, requireMonitor, async (req, res, next) => {
+  try {
+    const { createTodoCore } = require('./todos');
+    const parentId = parseInt(req.params.id, 10);
+    const members = await memberIds(parentId);
+    const through = monitoredMember(req, members);
+    if (!through) return res.status(404).json({ error: 'To-do not found' });
+    const parent = await getTodoFor(parentId, through);
+    if (!parent) return res.status(404).json({ error: 'To-do not found' });
+    const title = sanitizeText(req.body.title, 500);
+    if (!title) return res.status(400).json({ error: 'What needs to be done?' });
+    const person = await loadActor(through);
+    const out = await createTodoCore(person, {
+      title, parent_id: parentId, due_date: req.body.due_date, priority: req.body.priority, notes: req.body.notes, mention_ids: [],
+    }, { quiet: true });
+    if (out.error) return res.status(out.status || 400).json({ error: out.error });
+    const stepId = out.todo?.id || out.id;
+    await db.query('UPDATE todos SET created_by = $1 WHERE id = $2', [req.user.id, stepId]);
+    const who = (await db.query('SELECT name FROM users WHERE id = $1', [req.user.id])).rows[0]?.name || 'A manager';
+    await logEvent({ todoId: parentId, userId: req.user.id, subjectId: through, kind: 'edited', note: `Added the step "${title}"`, meta: { via: 'monitor' } });
+    await db.query(`INSERT INTO todo_comments (todo_id, user_id, body, kind) VALUES ($1, $2, $3, 'comment')`, [parentId, req.user.id, `Added the step "${title}". Please check it.`]);
+    await notify(await audienceOf(parent, members, req.user.id), {
+      type: 'todo_adjusted', title: `${who} added a step`, body: `${parent.title}: ${title}`, data: { todoId: stepId },
+    }, { exclude: [req.user.id] });
+    emitToUsers(members, 'todo:changed', { todoId: parentId, action: 'updated' });
+    res.status(201).json({ id: stepId });
   } catch (err) {
     next(err);
   }
