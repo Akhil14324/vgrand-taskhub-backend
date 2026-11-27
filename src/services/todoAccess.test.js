@@ -65,3 +65,14 @@ test('worksIn: members and leadership add accepted tasks, outsiders propose', ()
   assert.strictEqual(worksIn(person(2, [], 1), 5), true);
   assert.strictEqual(worksIn(person(300, [[2, 'head']]), 1), false);
 });
+
+test('the person who handed a personal to-do over can still correct it and give it to someone else; the doer cannot delete it', () => {
+  const row = { id: 1, business_id: null, created_by: 7, assigned_by_id: 7, assignee_id: 9, is_member: true, watching: true, members: [] };
+  const giver = decorateTodo(row, person(7, [])).permissions;
+  assert.strictEqual(giver.can_edit, true);
+  assert.strictEqual(giver.can_assign, true);
+  assert.strictEqual(giver.can_change_status, false);
+  const follower = decorateTodo({ ...row, created_by: 3, assigned_by_id: 3 }, person(7, [])).permissions;
+  assert.strictEqual(follower.can_edit, false);
+  assert.strictEqual(follower.can_assign, false);
+});

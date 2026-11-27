@@ -55,9 +55,12 @@ function personalPermissions(row) {
   if (isMember && row.watching) {
     // Following a to-do I gave away: see it and its sub-tasks, add sub-tasks, comment, and take it back by deleting
     // it if I made it. The person it was given to does the work.
+    // The person who gave it away (made it or handed it on) may still correct it: fix the title, dates, notes, or give it
+    // to someone else when they picked the wrong person. The person doing the work ticks it off.
+    const isGiver = isCreator || (!!row.assigned_by_id && row.assigned_by_id === row._actor_id);
     return {
-      can_edit: false, can_delete: isCreator, can_leave: !isCreator, can_request_delete: false, can_change_status: false,
-      can_hold: false, can_assign: false, can_approve: false, can_review: false, can_warn: false, can_nudge: !row.is_done,
+      can_edit: isGiver, can_delete: isCreator, can_leave: !isCreator, can_request_delete: false, can_change_status: false,
+      can_hold: false, can_assign: isGiver, can_approve: false, can_review: false, can_warn: false, can_nudge: !row.is_done,
       can_comment: true, can_add_subtask: true,
     };
   }
