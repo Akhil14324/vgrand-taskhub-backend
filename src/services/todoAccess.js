@@ -146,6 +146,8 @@ function decorateTodo(row, actor) {
   for (const [key, value] of Object.entries(row)) {
     if (!key.startsWith('_')) todo[key] = value;
   }
+  // With a chosen reviewer (task_reviews), only that person decides, on the Review page: the other approve buttons go.
+  if (row.review_reviewer_id) permissions.can_approve = false;
   todo.permissions = permissions;
   todo.my_level = row.business_id == null ? null : actorLevelIn(actor, row.business_id);
   return todo;
