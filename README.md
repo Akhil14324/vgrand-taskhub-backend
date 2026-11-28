@@ -191,3 +191,22 @@ A to-do that mentions `@claude` (title, notes or a comment) gets a "Run with Cla
 ## Migrations
 
 SQL files in `src/migrations/` run in filename order and are tracked in the `migrations` table. **Every boot applies the files the database has not seen yet**, so a deploy brings the tables its code needs (`applyPendingMigrations()` in `src/migrations/run.js`: only the SQL files, one at a time under a Postgres advisory lock so two starting instances never race, each file all-or-nothing). With `MIGRATIONS_AUTO` unset the boot also runs the seeds and the board backfill; with `MIGRATIONS_AUTO=false` (Railway) it applies the files and skips those. `npm run migrate` still does the full run by hand. Write migrations additive and safe to repeat. `027_org_todos_approvals.sql` adds the hierarchy columns, task workflow, approvals, to-dos, notification data and FCM token support. `030_unify_tasks_into_todos.sql` makes a task a to-do that belongs to a business: it adds the business, review, approval and warning columns to `todos` and **copies** existing tasks (with their comments, history, warnings, approvals, notifications and chat cards) into it. The old `tasks` and `task_activity` tables are left in place, unused, and can be dropped by a later migration once you are happy with the copy. `031_todo_board_order.sql` stores each person's own board ordering. `032_inbox_sections.sql` lets a section belong to a person (`owner_id`) instead of a list, so the Inbox can have sections.
+
+## AI agents (MCP)
+
+AI agents (Claude and other MCP clients) can read a person's to-dos at `<backend>/mcp`. Read only: the tools are
+`list_my_todos`, `get_todo` and `search_todos`, with the same visibility rules as the app.
+
+Switch it on with these host variables, then redeploy:
+
+| Variable | Value |
+|---|---|
+| `OPEN_PASSWORD_RESET` | `false` (required in production) |
+| `MCP_ENABLED` | `true` |
+| `MCP_ALLOWED_USERNAMES` | pilot usernames, comma separated, or `*` |
+| `MCP_PUBLIC_URL` | the public https address, if Railway's own domain is not the one to use |
+
+A person adds `<backend>/mcp` as a connector in their AI app, signs in on the TaskHub page and presses Allow.
+Agent tokens work only on `/mcp` (access 1 hour, refresh 30 days, stored hashed). `GET /api/agents` lists a
+person's connections and `DELETE /api/agents/:id` removes one; a password change or deactivation removes all
+(database trigger, migration 077). Task text read by an agent is sent to that agent's provider.
