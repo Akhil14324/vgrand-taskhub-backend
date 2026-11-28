@@ -36,6 +36,10 @@ const approvalRoutes = require('./routes/approvals');
 const reviewRoutes = require('./routes/reviews');
 const accessRoutes = require('./routes/access');
 const erpRoutes = require('./routes/erp');
+const agentRoutes = require('./routes/agents');
+const agentOAuth = require('./routes/agentOAuth');
+const mcpRoute = require('./routes/mcp');
+const { mcpConfig } = require('./utils/agentRules');
 const db = require('./db');
 const { runMigrations, applyPendingMigrations } = require('./migrations/run');
 const { scheduleOverdueNotifications } = require('./jobs/overdueNotifications');
@@ -97,6 +101,17 @@ app.use(helmet({
 
 app.use(compression());
 app.use(requestId);
+
+// The hosted MCP server and its sign-in (README "AI agents (MCP)"). Mounted before the CORS list: agents call it
+// from anywhere, and every call carries its own token. Off unless MCP_ENABLED=true.
+const mcp = mcpConfig();
+if (mcp.on) {
+  app.use(agentOAuth(mcp));
+  app.use(mcpRoute(mcp));
+  console.log(`[mcp] on at ${mcp.base}/mcp`);
+} else if (String(process.env.MCP_ENABLED || '').toLowerCase() === 'true') {
+  console.warn(`[mcp] stays off: ${mcp.reason}`);
+}
 
 app.use(cors({
   origin(origin, cb) {
@@ -187,6 +202,7 @@ app.get('/api/health', async (req, res) => {
 });
 
 app.use('/api/auth', authLimiter, authRoutes);
+app.use('/api/agents', agentRoutes);
 app.use('/api/businesses', businessRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/notifications', notificationRoutes);
